@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Cursor
+.cursor/
+
+# Node (prettier cache)
+node_modules/
+
+# mypy
+.mypy_cache/
+
+# pytest
+.pytest_cache/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# EasyTransfer runtime data
+storage/
+.etransfer/
+*.log
+
+# Environment
+.env
+.env.*
+
+# Deployment configuration (secrets, local overrides)
+config/*
+!config/README.md
+
+# Temporary test files
+test_upload_*.bin
+test_download_*/
+
+# Private / non-public directories
+server-*/
+cursor_docs/

@@ -1,0 +1,159 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etransfer"
+version = "0.1.0"
+description = "A TUS-based file transfer tool with chunked upload/download support"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [
+    {name = "ETransfer Team"}
+]
+keywords = ["tus", "file-transfer", "upload", "download", "chunked"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    # Server
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "aiofiles>=23.0.0",
+    "psutil>=5.9.0",
+    "pyyaml>=6.0",
+    # Client
+    "tuspy>=1.0.0",
+    "httpx>=0.25.0",
+    "typer[all]>=0.9.0",
+    "rich>=13.0.0",
+    # ORM / Database
+    "sqlmodel>=0.0.16",
+    "aiosqlite>=0.20.0",
+    # Common
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.optional-dependencies]
+redis = [
+    "redis>=5.0.0",
+]
+mysql = [
+    "aiomysql>=0.2.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "isort>=5.13.0",
+    "flake8>=7.0.0",
+    "Flake8-pyproject>=1.2.0",
+    "mypy>=1.8.0",
+    "bandit[toml]>=1.7.0",
+    "pre-commit>=3.5.0",
+    "build>=1.0.0",
+    "twine>=4.0.0",
+    "bump-my-version>=0.28.0",
+]
+all = [
+    "etransfer[redis,mysql,dev]",
+]
+
+[project.scripts]
+etransfer = "etransfer.client.cli:app"
+et = "etransfer.client.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/ZGCA-Forge/ETransfer"
+Documentation = "https://github.com/ZGCA-Forge/ETransfer#readme"
+Repository = "https://github.com/ZGCA-Forge/ETransfer"
+Issues = "https://github.com/ZGCA-Forge/ETransfer/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["etransfer*"]
+
+# ── Formatting ────────────────────────────────────────────────
+
+[tool.black]
+line-length = 120
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+multi_line_output = 3
+
+# ── Linting ───────────────────────────────────────────────────
+
+[tool.flake8]
+max-line-length = 200
+extend-ignore = ["E203", "W503", "W291", "W293", "W391", "F401", "E402"]
+exclude = ["build", "dist", "__pycache__", ".mypy_cache", ".pytest_cache", "htmlcov", ".vscode"]
+
+# ── Type checking ─────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = false
+warn_redundant_casts = true
+warn_unused_ignores = false
+strict_equality = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "etransfer.client.gui"
+disable_error_code = ["arg-type", "call-overload", "list-item", "attr-defined"]
+
+# ── Testing ───────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short --strict-markers --strict-config -ra --color=yes"
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# ── Security ──────────────────────────────────────────────────
+
+[tool.bandit]
+exclude_dirs = ["tests", "scripts", "build", "dist"]
+skips = ["B101", "B110"]
+
+# ── Version management ────────────────────────────────────────
+
+[tool.bumpversion]
+current_version = "0.1.0"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+message = "release: bump version {current_version} → {new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'
+
+[[tool.bumpversion.files]]
+filename = "etransfer/__init__.py"
+search = '__version__ = "{current_version}"'
+replace = '__version__ = "{new_version}"'

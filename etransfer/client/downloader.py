@@ -1,0 +1,654 @@
+"""Chunked file downloader with HTTP Range support."""
+
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Callable, Optional
+
+import httpx
+
+from etransfer.client.cache import LocalCache
+from etransfer.common.constants import AUTH_HEADER, DEFAULT_CHUNK_SIZE
+from etransfer.common.models import DownloadInfo
+
+
+class ChunkDownloader:
+    """Download files in chunks with resume support.
+
+    Uses HTTP Range requests to download files in parallel chunks.
+    Supports resume through local chunk cache.
+
+    When *endpoints* is provided, download requests are distributed
+    evenly across all endpoints (round-robin per worker).
+    """
+
+    def __init__(
+        self,
+        server_url: str,
+        token: Optional[str] = None,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        max_concurrent: int = 5,
+        cache: Optional[LocalCache] = None,
+        timeout: float = 120.0,
+        endpoints: Optional[list[str]] = None,
+        use_pwrite: bool = False,
+    ) -> None:
+        self.server_url = server_url.rstrip("/")
+        self.token = token
+        self.chunk_size = chunk_size
+        self.max_concurrent = max_concurrent
+        self._global_cache = cache  # only used as fallback
+        self.timeout = timeout
+        self.use_pwrite = use_pwrite
+        self.endpoints = [u.rstrip("/") for u in endpoints] if endpoints else []
+
+        self._headers: dict[str, str] = {}
+        if token:
+            self._headers[AUTH_HEADER] = token
+            self._headers["Authorization"] = f"Bearer {token}"
+
+        # Build per-endpoint HTTP clients for parallel downloads
+        self._clients = self._build_clients()
+
+        # Primary client for metadata queries (always first endpoint)
+        self._client = self._clients[0]
+
+    @staticmethod
+    def _local_cache_for(output_path: Path) -> LocalCache:
+        """Create a ``LocalCache`` rooted next to *output_path*.
+
+        For ``/data/movie.mp4`` the cache dir is ``/data/.movie.mp4.parts/``.
+        This keeps partial chunks visible alongside the target file and
+        avoids polluting a global ``~/.etransfer/cache`` directory.
+        """
+        parent = output_path.parent
+        name = output_path.name
+        cache_dir = parent / f".{name}.parts"
+        return LocalCache(cache_dir=cache_dir)
+
+    def _write_at(self, fd_or_path: "int | str", data: bytes, offset: int) -> None:
+        """Write *data* at *offset* using pwrite (fd) or seek+write (path).
+
+        When ``self.use_pwrite`` is True, *fd_or_path* must be an open fd.
+        Otherwise it is a file path string opened briefly for each write.
+        """
+        if self.use_pwrite:
+            os.pwrite(fd_or_path, data, offset)  # type: ignore[arg-type]
+        else:
+            with open(fd_or_path, "r+b") as f:  # type: ignore[arg-type]
+                f.seek(offset)
+                f.write(data)
+
+    def _build_clients(self) -> list[httpx.Client]:
+        urls = self.endpoints or [self.server_url]
+        conns_per = max(2, self.max_concurrent // len(urls) + 1)
+        clients: list[httpx.Client] = []
+        for url in urls:
+            clients.append(
+                httpx.Client(
+                    base_url=url,
+                    timeout=self.timeout,
+                    limits=httpx.Limits(
+                        max_connections=conns_per + 1,
+                        max_keepalive_connections=conns_per + 1,
+                    ),
+                    headers=self._headers,
+                )
+            )
+        return clients
+
+    def close(self) -> None:
+        """Close all HTTP clients."""
+        for c in self._clients:
+            c.close()
+
+    def _get_download_url(self, file_id: str) -> str:
+        """Get download URL for a file."""
+        return f"{self.server_url}/api/files/{file_id}/download"
+
+    def get_file_info(self, file_id: str) -> DownloadInfo:
+        """Get file information for download.
+
+        Args:
+            file_id: File identifier
+
+        Returns:
+            DownloadInfo object
+        """
+        with httpx.Client(timeout=self.timeout) as client:
+            response = client.get(
+                f"{self.server_url}/api/files/{file_id}/info/download",
+                headers=self._headers,
+            )
+            response.raise_for_status()
+            return DownloadInfo(**response.json())
+
+    def download_chunk(
+        self,
+        file_id: str,
+        chunk_index: int,
+        chunk_size: Optional[int] = None,
+        total_size: Optional[int] = None,
+        client: Optional[httpx.Client] = None,
+        *,
+        chunked_mode: bool = False,
+    ) -> bytes:
+        """Download a single chunk.
+
+        Args:
+            file_id: File identifier
+            chunk_index: Chunk index
+            chunk_size: Chunk size (uses default if not specified)
+            total_size: Total file size (for last chunk calculation)
+            client: HTTP client to use (defaults to primary)
+            chunked_mode: If True, use ?chunk=N instead of Range header
+
+        Returns:
+            Chunk data
+        """
+        http = client or self._client
+
+        if chunked_mode:
+            # Chunk-index mode: server stores individual chunk files
+            response = http.get(
+                f"/api/files/{file_id}/download",
+                params={"chunk": chunk_index},
+            )
+            response.raise_for_status()
+            return response.content
+
+        # Range mode: server has a single file
+        chunk_size = chunk_size or self.chunk_size
+        start = chunk_index * chunk_size
+        end = start + chunk_size - 1
+        if total_size and end >= total_size:
+            end = total_size - 1
+
+        headers = {"Range": f"bytes={start}-{end}"}
+        response = http.get(f"/api/files/{file_id}/download", headers=headers)
+        response.raise_for_status()
+        return response.content
+
+    def download_file(
+        self,
+        file_id: str,
+        output_path: Path,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        use_cache: bool = True,
+    ) -> bool:
+        """Download a file with chunked transfer.
+
+        Automatically detects chunked_storage mode from server and uses
+        chunk-index downloads (?chunk=N) instead of Range headers.
+
+        Args:
+            file_id: File identifier
+            output_path: Output file path
+            progress_callback: Progress callback (downloaded_bytes, total_bytes)
+            use_cache: Use local chunk cache
+
+        Returns:
+            True if download successful
+        """
+        # Get file info
+        info = self.get_file_info(file_id)
+        total_size = info.size
+        chunked_mode = info.chunked_storage
+
+        if chunked_mode:
+            # Chunk-index mode: server stores individual chunk files
+            chunk_size = info.chunk_size or self.chunk_size
+            total_chunks = info.total_chunks or ((total_size + chunk_size - 1) // chunk_size)
+            return self._download_chunked(
+                file_id,
+                output_path,
+                total_size,
+                chunk_size,
+                total_chunks,
+                progress_callback,
+                use_cache,
+            )
+
+        # Range mode: standard download
+        available_size = info.available_size
+        total_chunks = (available_size + self.chunk_size - 1) // self.chunk_size
+
+        if use_cache:
+            cache = self._local_cache_for(Path(output_path))
+            cache.set_file_meta(file_id, info.filename, available_size, self.chunk_size)
+            cached_chunks = set(cache.get_cached_chunks(file_id))
+
+            downloaded_bytes = len(cached_chunks) * self.chunk_size
+            if progress_callback and cached_chunks:
+                progress_callback(downloaded_bytes, available_size)
+
+            with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                futures = {}
+                for i in range(total_chunks):
+                    if i in cached_chunks:
+                        continue
+                    future = executor.submit(
+                        self._download_and_cache_chunk,
+                        file_id,
+                        i,
+                        available_size,
+                        cache,
+                    )
+                    futures[future] = i
+
+                for future in futures:
+                    try:
+                        chunk_data = future.result()
+                        downloaded_bytes += len(chunk_data)
+                        if progress_callback:
+                            progress_callback(downloaded_bytes, available_size)
+                    except Exception as e:
+                        print(f"Error downloading chunk {futures[future]}: {e}")
+                        return False
+
+            success = cache.assemble_file(file_id, output_path)
+            if success:
+                cache.clear_file(file_id)
+            return success
+
+        # Direct-write download: pre-allocate file and write chunks at their offsets
+        return self._download_range_direct(
+            file_id,
+            output_path,
+            available_size,
+            total_chunks,
+            progress_callback,
+        )
+
+    def _download_chunked(
+        self,
+        file_id: str,
+        output_path: Path,
+        total_size: int,
+        chunk_size: int,
+        total_chunks: int,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        use_cache: bool = True,
+    ) -> bool:
+        """Download a file using chunk-index mode (?chunk=N).
+
+        Each chunk is requested by index; server deletes download_once
+        chunks after serving them.
+        """
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        path_str = str(output_path)
+
+        # Pre-allocate sparse file
+        with open(output_path, "wb") as f:
+            if total_size > 0:
+                f.seek(total_size - 1)
+                f.write(b"\0")
+
+        downloaded_bytes = 0
+        _lock = threading.Lock()
+        _chunk_iter = iter(range(total_chunks))
+        _iter_lock = threading.Lock()
+
+        fd = os.open(path_str, os.O_WRONLY) if self.use_pwrite else -1
+        # For pwrite: fd is shared (pwrite is thread-safe)
+        # For seek+write: each worker opens its own handle via _write_at
+
+        def _download_worker(http: httpx.Client) -> bool:
+            nonlocal downloaded_bytes
+            while True:
+                with _iter_lock:
+                    idx = next(_chunk_iter, None)
+                if idx is None:
+                    return True
+                try:
+                    data = self.download_chunk(
+                        file_id,
+                        idx,
+                        client=http,
+                        chunked_mode=True,
+                    )
+                    self._write_at(fd if self.use_pwrite else path_str, data, idx * chunk_size)
+                    with _lock:
+                        downloaded_bytes += len(data)
+                        if progress_callback:
+                            progress_callback(downloaded_bytes, total_size)
+                except Exception as e:
+                    print(f"Error downloading chunk {idx}: {e}")
+                    return False
+            return True
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                futures = [
+                    executor.submit(_download_worker, self._clients[i % len(self._clients)])
+                    for i in range(self.max_concurrent)
+                ]
+                for fut in futures:
+                    if not fut.result():
+                        return False
+        finally:
+            if self.use_pwrite and fd != -1:
+                os.close(fd)
+
+        return True
+
+    def _download_range_direct(
+        self,
+        file_id: str,
+        output_path: Path,
+        total_size: int,
+        total_chunks: int,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        """Direct-write Range-based download (non-chunked files)."""
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        path_str = str(output_path)
+
+        # Pre-allocate sparse file
+        with open(output_path, "wb") as f:
+            f.seek(total_size - 1)
+            f.write(b"\0")
+
+        downloaded_bytes = 0
+        _lock = threading.Lock()
+        _chunk_iter = iter(range(total_chunks))
+        _iter_lock = threading.Lock()
+
+        fd = os.open(path_str, os.O_WRONLY) if self.use_pwrite else -1
+
+        def _download_worker(http: httpx.Client) -> bool:
+            nonlocal downloaded_bytes
+            while True:
+                with _iter_lock:
+                    idx = next(_chunk_iter, None)
+                if idx is None:
+                    return True
+                try:
+                    data = self.download_chunk(
+                        file_id,
+                        idx,
+                        total_size=total_size,
+                        client=http,
+                    )
+                    self._write_at(fd if self.use_pwrite else path_str, data, idx * self.chunk_size)
+                    with _lock:
+                        downloaded_bytes += len(data)
+                        if progress_callback:
+                            progress_callback(downloaded_bytes, total_size)
+                except Exception as e:
+                    print(f"Error downloading chunk {idx}: {e}")
+                    return False
+            return True
+
+        try:
+            # Assign workers round-robin across endpoint clients
+            with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                futures = [
+                    executor.submit(
+                        _download_worker,
+                        self._clients[i % len(self._clients)],
+                    )
+                    for i in range(self.max_concurrent)
+                ]
+                for future in futures:
+                    if not future.result():
+                        return False
+        finally:
+            if self.use_pwrite and fd != -1:
+                os.close(fd)
+
+        return True
+
+    def _download_and_cache_chunk(
+        self,
+        file_id: str,
+        chunk_index: int,
+        total_size: int,
+        cache: Optional[LocalCache] = None,
+    ) -> bytes:
+        """Download a chunk and optionally cache it.
+
+        Args:
+            file_id: File identifier
+            chunk_index: Chunk index
+            total_size: Total file size
+            cache: LocalCache instance to store the chunk (None = no caching)
+
+        Returns:
+            Chunk data
+        """
+        data = self.download_chunk(file_id, chunk_index, total_size=total_size)
+
+        if cache is not None:
+            cache.put_chunk(file_id, chunk_index, data)
+
+        return data
+
+    def download_file_follow(
+        self,
+        file_id: str,
+        output_path: Path,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        poll_interval: float = 2.0,
+        use_cache: bool = True,
+    ) -> bool:
+        """Download a file that may still be uploading.
+
+        Polls for new data and downloads chunks as they become available.
+        For chunked_storage files, polls available_chunks from server.
+        Finishes when the upload is complete and all data is downloaded.
+
+        Args:
+            file_id: File identifier
+            output_path: Output file path
+            progress_callback: Progress callback (downloaded_bytes, total_bytes)
+            poll_interval: Seconds between polling for new data
+            use_cache: Use local chunk cache
+
+        Returns:
+            True if download successful
+        """
+        import time
+
+        info = self.get_file_info(file_id)
+        chunked_mode = info.chunked_storage
+
+        if chunked_mode:
+            return self._download_file_follow_chunked(
+                file_id,
+                output_path,
+                progress_callback,
+                poll_interval,
+            )
+
+        # Range-based follow download (non-chunked)
+        downloaded_chunks: set[int] = set()
+        downloaded_bytes = 0
+        last_available = 0
+        total_size = 0
+        fd: int = -1
+        cache: Optional[LocalCache] = None
+        path_str = str(Path(output_path))
+
+        try:
+            while True:
+                info = self.get_file_info(file_id)
+                total_size = info.size
+                available = info.available_size
+                is_complete = available >= total_size
+
+                if available > last_available:
+                    last_available = available
+                    total_chunks = (available + self.chunk_size - 1) // self.chunk_size
+
+                    if use_cache and cache is None:
+                        cache = self._local_cache_for(Path(output_path))
+                        cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
+
+                    # Pre-allocate file and open fd on first data
+                    if fd == -1 and total_size > 0:
+                        output_path = Path(output_path)
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(output_path, "wb") as f:
+                            f.seek(total_size - 1)
+                            f.write(b"\0")
+                        if not use_cache:
+                            if self.use_pwrite:
+                                fd = os.open(path_str, os.O_WRONLY)
+                            else:
+                                fd = 0  # sentinel: file created
+
+                    # Download newly available chunks
+                    new_indices = [i for i in range(total_chunks) if i not in downloaded_chunks]
+                    if new_indices:
+                        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                            if use_cache:
+                                futures = {
+                                    executor.submit(
+                                        self._download_and_cache_chunk,
+                                        file_id,
+                                        i,
+                                        available,
+                                        cache,
+                                    ): i
+                                    for i in new_indices
+                                }
+                            else:
+                                _path = path_str  # capture for closure
+
+                                def _dl_write(idx: int) -> bytes:
+                                    data = self.download_chunk(file_id, idx, total_size=available)
+                                    self._write_at(fd if self.use_pwrite else _path, data, idx * self.chunk_size)
+                                    return data
+
+                                futures = {executor.submit(_dl_write, i): i for i in new_indices}
+
+                            for future in futures:
+                                try:
+                                    chunk_data = future.result()
+                                    downloaded_chunks.add(futures[future])
+                                    downloaded_bytes += len(chunk_data)
+                                    if progress_callback:
+                                        progress_callback(downloaded_bytes, total_size)
+                                except Exception as e:
+                                    print(f"Error downloading chunk {futures[future]}: {e}")
+                                    return False
+
+                if is_complete and downloaded_bytes >= total_size:
+                    break
+
+                if not is_complete:
+                    time.sleep(poll_interval)
+        finally:
+            if self.use_pwrite and fd > 0:
+                os.close(fd)
+
+        # Assemble file from cache
+        if use_cache and cache is not None:
+            cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
+            success = cache.assemble_file(file_id, output_path)
+            if success:
+                cache.clear_file(file_id)
+            return success
+
+        return True
+
+    def _download_file_follow_chunked(
+        self,
+        file_id: str,
+        output_path: Path,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        poll_interval: float = 2.0,
+    ) -> bool:
+        """Follow-mode download for chunked_storage files.
+
+        Polls available_chunks from server, downloads newly available
+        chunks by index, writes to output file at correct offset.
+        Handles download_once files where metadata is deleted after
+        all chunks are consumed.
+        """
+        import time
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        downloaded_chunks: set[int] = set()
+        downloaded_bytes = 0
+        total_size = 0
+        chunk_size = self.chunk_size
+        total_chunks = 0
+        fd: int = -1
+        path_str = str(output_path)
+
+        try:
+            while True:
+                try:
+                    info = self.get_file_info(file_id)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404 and downloaded_chunks:
+                        # download_once: server deleted metadata after all chunks consumed
+                        break
+                    raise
+
+                total_size = info.size
+                chunk_size = info.chunk_size or self.chunk_size
+                total_chunks = info.total_chunks or ((total_size + chunk_size - 1) // chunk_size)
+                available = info.available_chunks or []
+                is_upload_complete = info.available_size >= total_size
+
+                # Pre-allocate file on first iteration
+                if fd == -1 and total_size > 0:
+                    with open(output_path, "wb") as f:
+                        f.seek(total_size - 1)
+                        f.write(b"\0")
+                    if self.use_pwrite:
+                        fd = os.open(path_str, os.O_WRONLY)
+                    else:
+                        fd = 0  # sentinel: file created but no fd needed
+
+                # Find new chunks to download
+                new_chunks = [c for c in available if c not in downloaded_chunks]
+
+                if new_chunks:
+                    _lock = threading.Lock()
+
+                    def _write_chunk(idx: int) -> int:
+                        http = self._clients[idx % len(self._clients)]
+                        data = self.download_chunk(
+                            file_id,
+                            idx,
+                            client=http,
+                            chunked_mode=True,
+                        )
+                        self._write_at(fd if self.use_pwrite else path_str, data, idx * chunk_size)
+                        return len(data)
+
+                    with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                        futures = {executor.submit(_write_chunk, idx): idx for idx in new_chunks}
+
+                        for future in futures:
+                            try:
+                                size = future.result()
+                                idx = futures[future]
+                                downloaded_chunks.add(idx)
+                                with _lock:
+                                    downloaded_bytes += size
+                                    if progress_callback:
+                                        progress_callback(downloaded_bytes, total_size)
+                            except Exception as e:
+                                print(f"Error downloading chunk {futures[future]}: {e}")
+                                return False
+
+                # Done when all chunks downloaded
+                if len(downloaded_chunks) >= total_chunks and is_upload_complete:
+                    break
+
+                time.sleep(poll_interval)
+        finally:
+            if self.use_pwrite and fd > 0:
+                os.close(fd)
+
+        return True
