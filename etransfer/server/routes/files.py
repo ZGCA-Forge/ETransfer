@@ -1,6 +1,7 @@
 """File management API routes."""
 
 import asyncio
+import logging
 import os
 from typing import Any, AsyncIterator, Optional
 
@@ -10,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from etransfer.common.fileutil import pread
 from etransfer.common.models import DownloadInfo, ErrorResponse, FileInfo, FileListResponse, FileStatus
 from etransfer.server.tus.storage import TusStorage
+
+logger = logging.getLogger("etransfer.server.files")
 
 
 def create_files_router(storage: TusStorage) -> APIRouter:
@@ -113,6 +116,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                 page_size=page_size,
             )
         except Exception as e:
+            logger.exception("Failed to list files")
             raise HTTPException(500, f"Failed to list files: {e}")
 
     @router.get(

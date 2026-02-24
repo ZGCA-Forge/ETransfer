@@ -329,28 +329,32 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
 
 def run_server(
-    host: str = "0.0.0.0",  # nosec B104
-    port: int = 8765,
-    workers: int = 1,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    workers: Optional[int] = None,
     config_path: Optional[Path] = None,
     storage_path: Optional[Path] = None,
     state_backend: Optional[str] = None,
     redis_url: Optional[str] = None,
 ) -> None:
-    """Run the server."""
+    """Run the server.
+
+    Config file values are used as defaults. CLI flags (non-None) override them.
+    """
     settings = load_server_settings(config_path)
 
-    if host:
+    # Only override settings when explicitly provided (not None)
+    if host is not None:
         settings.host = host
-    if port:
+    if port is not None:
         settings.port = port
-    if workers:
+    if workers is not None:
         settings.workers = workers
-    if storage_path:
+    if storage_path is not None:
         settings.storage_path = storage_path
-    if state_backend:
+    if state_backend is not None:
         settings.state_backend = state_backend  # type: ignore[assignment]
-    if redis_url:
+    if redis_url is not None:
         settings.redis_url = redis_url
 
     settings.storage_path.mkdir(parents=True, exist_ok=True)

@@ -945,25 +945,18 @@ def gui() -> None:
 
 @server_app.command("start")
 def server_start(
-    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Bind host"),  # nosec B104
-    port: int = typer.Option(DEFAULT_SERVER_PORT, "--port", "-p", help="Bind port"),
-    workers: int = typer.Option(1, "--workers", "-w", help="Number of workers"),
-    storage: Path = typer.Option(
-        Path("./storage"),
-        "--storage",
-        help="Storage directory",
+    host: Optional[str] = typer.Option(None, "--host", "-h", help="Bind host (default: from config or 0.0.0.0)"),
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Bind port (default: from config or 8765)"),
+    workers: Optional[int] = typer.Option(
+        None, "--workers", "-w", help="Number of workers (default: from config or 1)"
     ),
-    backend: str = typer.Option(
-        "file",
-        "--backend",
-        "-b",
-        help="State backend (memory, file, redis)",
+    storage: Optional[Path] = typer.Option(
+        None, "--storage", help="Storage directory (default: from config or ./storage)"
     ),
-    redis: str = typer.Option(
-        "redis://localhost:6379/0",
-        "--redis",
-        help="Redis URL (if using redis backend)",
+    backend: Optional[str] = typer.Option(
+        None, "--backend", "-b", help="State backend: memory, file, redis (default: from config or file)"
     ),
+    redis: Optional[str] = typer.Option(None, "--redis", help="Redis URL (if using redis backend)"),
     config: Optional[Path] = typer.Option(
         None,
         "--config",
@@ -971,13 +964,15 @@ def server_start(
         help="Config file path (auto-discovered if not set)",
     ),
 ) -> None:
-    """Start the EasyTransfer server.
+    """Start the ETransfer server.
 
     If --config is not provided, the config file is auto-discovered from:
       1. $ETRANSFER_CONFIG env var
       2. ./config.yaml
       3. ./config/config.yaml
       4. ~/.etransfer/server.yaml
+
+    All options default to the value in the config file. CLI flags override config.
     """
     try:
         from etransfer.server.config import discover_config_path
@@ -990,12 +985,40 @@ def server_start(
     if resolved_config is None:
         resolved_config = discover_config_path()
 
+    # Read config for display (before run_server loads it again)
+    display_vals: dict = {}
+    if resolved_config and resolved_config.exists():
+        try:
+            import yaml
+
+            with open(resolved_config, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            server_cfg = cfg.get("server", {})
+            display_vals = {
+                "host": host or server_cfg.get("host", "0.0.0.0"),  # nosec B104
+                "port": port or server_cfg.get("port", DEFAULT_SERVER_PORT),
+                "storage": storage or cfg.get("storage", {}).get("path", "./storage"),
+                "backend": backend or cfg.get("state", {}).get("backend", "file"),
+                "workers": workers or server_cfg.get("workers", 1),
+            }
+        except Exception:
+            pass
+
+    if not display_vals:
+        display_vals = {
+            "host": host or "0.0.0.0",  # nosec B104
+            "port": port or DEFAULT_SERVER_PORT,
+            "storage": storage or "./storage",
+            "backend": backend or "file",
+            "workers": workers or 1,
+        }
+
     console.print()
     info_lines = (
-        f"[bold]Host:[/bold] {host}:{port}\n"
-        f"[bold]Storage:[/bold] {storage}\n"
-        f"[bold]Backend:[/bold] {backend}\n"
-        f"[bold]Workers:[/bold] {workers}\n"
+        f"[bold]Host:[/bold] {display_vals['host']}:{display_vals['port']}\n"
+        f"[bold]Storage:[/bold] {display_vals['storage']}\n"
+        f"[bold]Backend:[/bold] {display_vals['backend']}\n"
+        f"[bold]Workers:[/bold] {display_vals['workers']}\n"
     )
     if resolved_config:
         info_lines += f"[bold]Config:[/bold] {resolved_config.resolve()}"
