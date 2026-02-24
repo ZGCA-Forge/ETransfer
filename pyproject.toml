@@ -85,6 +85,9 @@ Issues = "https://github.com/ZGCA-Forge/ETransfer/issues"
 where = ["."]
 include = ["etransfer*"]
 
+[tool.setuptools.package-data]
+"etransfer" = ["**/*.html"]
+
 # ── Formatting ────────────────────────────────────────────────
 
 [tool.black]
