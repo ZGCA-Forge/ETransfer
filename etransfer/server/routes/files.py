@@ -63,6 +63,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                         filename=f["filename"],
                         size=f["size"],
                         uploaded_size=f["size"],
+                        status=FileStatus.COMPLETE,
                         mime_type=f.get("mime_type"),
                         checksum=f.get("checksum"),
                         created_at=f.get("created_at", ""),
@@ -100,8 +101,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     )
                 )
 
-            # Sort by created_at descending (handle None gracefully)
-            all_files.sort(key=lambda f: f.created_at or "", reverse=True)
+            # Sort by created_at ascending (oldest first, newest at bottom)
+            all_files.sort(key=lambda f: f.created_at or "")
 
             # Paginate
             total = len(all_files)

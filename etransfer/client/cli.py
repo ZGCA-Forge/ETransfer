@@ -28,12 +28,13 @@ app = typer.Typer(
     name="etransfer",
     help="EasyTransfer - Fast TUS-based file transfer tool",
     no_args_is_help=True,
+    add_completion=False,
 )
 
 console = Console()
 
 # Server subcommand
-server_app = typer.Typer(help="Server management commands")
+server_app = typer.Typer(help="Server management commands", add_completion=False)
 app.add_typer(server_app, name="server")
 
 # ---------------------------------------------------------------------------
@@ -223,7 +224,7 @@ def setup(
 
 @app.command()
 def upload(
-    file_path: Path = typer.Argument(..., help="Path to file to upload"),
+    file_path: Optional[Path] = typer.Argument(None, help="Path to file to upload"),
     token: Optional[str] = typer.Option(
         None,
         "--token",
@@ -238,10 +239,10 @@ def upload(
         help="Chunk size in bytes",
     ),
     retention: Optional[str] = typer.Option(
-        None,
+        "download_once",
         "--retention",
         "-r",
-        help="Retention policy: permanent, download_once, ttl (default: server decides)",
+        help="Retention: download_once (default), permanent, ttl",
     ),
     retention_ttl: Optional[int] = typer.Option(
         None,
@@ -263,6 +264,27 @@ def upload(
     ),
 ) -> None:
     """Upload a file to the server."""
+    if file_path is None:
+        console.print()
+        console.print("[bold cyan]et upload[/bold cyan] — Upload a file to the server\n")
+        console.print("[bold]Usage:[/bold]  et upload <FILE> [OPTIONS]\n")
+        console.print("[bold]Options:[/bold]")
+        console.print("  -r, --retention TEXT     Retention policy [default: download_once]")
+        console.print("                           [dim]download_once — auto-delete after first download[/dim]")
+        console.print("                           [dim]permanent    — keep forever[/dim]")
+        console.print("                           [dim]ttl          — auto-expire after N seconds[/dim]")
+        console.print("      --retention-ttl INT  TTL in seconds (only for --retention ttl)")
+        console.print("  -c, --chunk-size INT     Chunk size in bytes [default: 10MB]")
+        console.print("  -j, --threads INT        Parallel upload threads [default: 4]")
+        console.print("  -t, --token TEXT         API token (overrides saved session)")
+        console.print()
+        console.print("[bold]Examples:[/bold]")
+        console.print("  [dim]et upload myfile.zip[/dim]                              # download once (default)")
+        console.print("  [dim]et upload myfile.zip -r permanent[/dim]                 # keep forever")
+        console.print("  [dim]et upload myfile.zip -r ttl --retention-ttl 3600[/dim]  # expire in 1h")
+        console.print("  [dim]et upload largefile.iso -j 8[/dim]                      # 8 threads")
+        return
+
     server = _get_server_url()
     token = token or _get_token()
 
@@ -362,10 +384,15 @@ def upload(
         if location:
             file_id = location.split("/")[-1]
             console.print(f"   [dim]File ID: [bold]{file_id}[/bold][/dim]")
+            console.print(f"   [dim]Download: [bold]et download {file_id[:8]}[/bold][/dim]")
         if retention == "download_once":
             print_warning("File will be deleted after first download")
+            console.print("   [dim]Keep file: use [bold]--retention permanent[/bold][/dim]")
+            console.print("   [dim]Auto-expire: use [bold]--retention ttl --retention-ttl 3600[/bold][/dim]")
         elif retention == "ttl":
             print_info(f"File will expire in {retention_ttl}s after upload completes")
+        elif retention == "permanent":
+            console.print("   [dim]Retention: permanent (file won't auto-delete)[/dim]")
 
     except KeyboardInterrupt:
         console.print()
@@ -409,7 +436,7 @@ def _resolve_file_id(prefix: str, server: str, token: Optional[str]) -> str:
 
 @app.command()
 def download(
-    file_id: str = typer.Argument(..., help="File ID to download"),
+    file_id: Optional[str] = typer.Argument(None, help="File ID (or short prefix) to download"),
     token: Optional[str] = typer.Option(
         None,
         "--token",
@@ -430,6 +457,23 @@ def download(
     ),
 ) -> None:
     """Download a file from the server."""
+    if file_id is None:
+        console.print()
+        console.print("[bold cyan]et download[/bold cyan] — Download a file from the server\n")
+        console.print("[bold]Usage:[/bold]  et download <FILE_ID> [OPTIONS]\n")
+        console.print("[bold]Arguments:[/bold]")
+        console.print("  FILE_ID                  File ID or short prefix (e.g. 6a9111db)\n")
+        console.print("[bold]Options:[/bold]")
+        console.print("  -o, --output PATH        Output directory or file path [default: current dir]")
+        console.print("      --no-cache/--cache   Direct-write (faster) vs chunk cache [default: no-cache]")
+        console.print("  -t, --token TEXT         API token (overrides saved session)")
+        console.print()
+        console.print("[bold]Examples:[/bold]")
+        console.print("  [dim]et download 6a9111db[/dim]                  # download to current dir")
+        console.print("  [dim]et download 6a9111db -o ~/Downloads[/dim]   # download to specific dir")
+        console.print("  [dim]et download 6a91 -o myfile.zip[/dim]        # short prefix + rename")
+        return
+
     server = _get_server_url()
     token = token or _get_token()
 
@@ -562,19 +606,29 @@ def list_files(
         table.add_column("Filename", style="white")
         table.add_column("Size", justify="right", style="green")
         table.add_column("Time", style="dim", width=17)
-        table.add_column("Progress", justify="right")
+        table.add_column("Progress", justify="left")
         table.add_column("Status", justify="center")
         table.add_column("Retention", justify="center", style="dim")
 
+        total_size = 0
+        total_uploaded = 0
         for f in files:
-            # Progress bar in text
-            progress_pct = f.get("progress", 0)
+            file_size = f.get("size", 0)
+            uploaded_size = f.get("uploaded_size", file_size)
+            total_size += file_size
+            total_uploaded += uploaded_size
+
+            # Compute progress from uploaded_size / size
+            if file_size > 0:
+                progress_pct = (uploaded_size / file_size) * 100
+            else:
+                progress_pct = 100.0
             bar_width = 10
             filled = int(bar_width * progress_pct / 100)
             bar = "█" * filled + "░" * (bar_width - filled)
 
             file_status = f.get("status", "complete")
-            if file_status == "complete":
+            if file_status == "complete" or progress_pct >= 100:
                 status = "[green]● Complete[/green]"
                 progress_str = f"[green]{bar}[/green] 100%"
             else:
@@ -620,7 +674,10 @@ def list_files(
             )
 
         console.print(table)
-        console.print(f"[dim]Page {page} | Showing {len(files)} files[/dim]")
+        size_info = f"Actual: {format_size(total_uploaded)}"
+        if total_uploaded != total_size:
+            size_info += f" / Expected: {format_size(total_size)}"
+        console.print(f"[dim]Page {page} | {len(files)} files | {size_info}[/dim]")
 
     except Exception as e:
         print_error(f"Failed to list files: {e}")
@@ -672,6 +729,71 @@ def delete(
         raise typer.Exit(1)
 
 
+@app.command("delete-all")
+def delete_all(
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Skip confirmation prompt",
+    ),
+) -> None:
+    """Delete ALL files from the server. Use with caution."""
+    server = _get_server_url()
+    token = token or _get_token()
+
+    try:
+        from etransfer.client.tus_client import EasyTransferClient
+
+        with EasyTransferClient(server, token=token) as client:
+            files = client.list_files(page=1, page_size=1000, include_partial=True)
+
+        if not files:
+            print_info("No files to delete")
+            return
+
+        total_size = sum(f.get("size", 0) for f in files)
+        console.print(f"\n[bold red]⚠ About to delete {len(files)} file(s) " f"({format_size(total_size)})[/bold red]")
+
+        if not force:
+            confirm = typer.confirm("Delete ALL files? This cannot be undone")
+            if not confirm:
+                print_warning("Cancelled.")
+                raise typer.Exit(0)
+
+        deleted = 0
+        failed = 0
+        with console.status("[bold cyan]Deleting files...", spinner="dots") as status:
+            with EasyTransferClient(server, token=token) as client:
+                for f in files:
+                    fid = f.get("file_id", "")
+                    fname = f.get("filename", "unknown")
+                    status.update(f"[bold cyan]Deleting {fname} ({fid[:8]})..")
+                    try:
+                        client.delete_file(fid)
+                        deleted += 1
+                    except Exception as e:
+                        console.print(f"  [red]✗[/red] {fid[:8]}.. {fname}: {e}")
+                        failed += 1
+
+        print_success(f"Deleted {deleted} file(s)")
+        if failed:
+            print_warning(f"Failed to delete {failed} file(s)")
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        print_error(f"Failed: {e}")
+        raise typer.Exit(1)
+
+
 @app.command()
 def info(
     token: Optional[str] = typer.Option(
@@ -682,20 +804,56 @@ def info(
         envvar="ETRANSFER_TOKEN",
     ),
 ) -> None:
-    """Get server information."""
-    server = _get_server_url()
+    """Show client status, server info, user profile and quota."""
+    import httpx
+
+    from etransfer import __version__
+
+    cfg = _load_client_config()
+    server = cfg.get("server")
     token = token or _get_token()
 
+    console.print()
+
+    # ── Client & Version ──────────────────────────────────────
+    client_lines = f"[bold]EasyTransfer:[/bold] v{__version__}"
+    client_lines += f"\n[bold]Config:[/bold] {CLIENT_CONFIG_FILE}"
+    if server:
+        client_lines += f"\n[bold]Server:[/bold] {server}"
+    else:
+        client_lines += "\n[bold]Server:[/bold] [dim]not configured — run [bold]et setup <address>[/bold][/dim]"
+        console.print(Panel(client_lines, title="[bold cyan]📋 Client[/bold cyan]", border_style="cyan"))
+        return
+
+    if cfg.get("token"):
+        # Fetch display name from server if possible
+        display_name = cfg.get("username", "?")
+        role = cfg.get("role", "?")
+        try:
+            headers = {"Authorization": f"Bearer {token}"}
+            r = httpx.get(f"{server}/api/users/me", headers=headers, timeout=5)
+            if r.status_code == 200:
+                me = r.json()
+                display_name = me.get("display_name") or me.get("username", display_name)
+                role = me.get("role", role)
+        except Exception:
+            pass
+        client_lines += f"\n[bold]User:[/bold] {display_name} ({role})"
+        if cfg.get("expires_at"):
+            client_lines += f"\n[bold]Session expires:[/bold] {cfg['expires_at']}"
+    else:
+        client_lines += "\n[bold]Session:[/bold] [dim]not logged in[/dim]"
+
+    console.print(Panel(client_lines, title="[bold cyan]📋 Client[/bold cyan]", border_style="cyan"))
+
+    # ── Server Info ───────────────────────────────────────────
     try:
         from etransfer.client.tus_client import EasyTransferClient
 
-        console.print()
-        with console.status("[bold cyan]Connecting to server...", spinner="dots"):
-            with EasyTransferClient(server, token=token) as client:
-                server_info = client.get_server_info()
+        with EasyTransferClient(server, token=token) as client:
+            server_info = client.get_server_info()
 
-        # Server info panel
-        info_text = (
+        srv_text = (
             f"[bold]Version:[/bold] {server_info.version}\n"
             f"[bold]TUS Version:[/bold] {server_info.tus_version}\n"
             f"[bold]Chunk Size:[/bold] {format_size(server_info.chunk_size)}\n"
@@ -703,19 +861,13 @@ def info(
             f"[bold]Total Storage:[/bold] {format_size(server_info.total_size)}"
         )
         if server_info.max_upload_size:
-            info_text += f"\n[bold]Max Upload:[/bold] {format_size(server_info.max_upload_size)}"
+            srv_text += f"\n[bold]Max Upload:[/bold] {format_size(server_info.max_upload_size)}"
 
-        panel = Panel(
-            info_text,
-            title="[bold cyan]🖥️  Server Information[/bold cyan]",
-            border_style="cyan",
-        )
-        console.print(panel)
+        console.print(Panel(srv_text, title="[bold cyan]🖥️  Server[/bold cyan]", border_style="cyan"))
 
-        # Network interfaces table
         if server_info.interfaces:
             table = Table(
-                title="[bold cyan]🌐 Network Interfaces[/bold cyan]",
+                title="[bold cyan]🌐 Network[/bold cyan]",
                 show_header=True,
                 header_style="bold magenta",
                 border_style="cyan",
@@ -734,12 +886,46 @@ def info(
                     format_rate(iface.upload_rate),
                     format_rate(iface.download_rate),
                 )
-
             console.print(table)
 
-    except Exception as e:
-        print_error(f"Failed to get server info: {e}")
-        raise typer.Exit(1)
+    except Exception:
+        print_warning("Could not reach server")
+
+    # ── Quota ─────────────────────────────────────────────────
+    if not token:
+        return
+
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+
+        rq = httpx.get(f"{server}/api/users/me/quota", headers=headers, timeout=10)
+        if rq.status_code == 200:
+            qdata = rq.json()
+            used = qdata.get("storage_used", 0)
+            q = qdata.get("quota", {})
+            max_storage = q.get("max_storage_size")
+            pct = qdata.get("usage_percent")
+
+            quota_text = f"[bold]Storage:[/bold] {format_size(used)}"
+            if max_storage:
+                quota_text += f" / {format_size(max_storage)}"
+            if pct is not None:
+                color = "green" if pct < 80 else ("yellow" if pct < 95 else "red")
+                bar_w = 20
+                filled = int(bar_w * pct / 100)
+                bar = "█" * filled + "░" * (bar_w - filled)
+                quota_text += f"\n[{color}]{bar}[/{color}] {pct:.1f}%"
+            if qdata.get("is_over_quota"):
+                quota_text += "\n[bold red]⚠ Over quota![/bold red]"
+            if q.get("max_upload_size"):
+                quota_text += f"\n[bold]Max Upload:[/bold] {format_size(q['max_upload_size'])}"
+
+            console.print(Panel(quota_text, title="[bold cyan]📊 Quota[/bold cyan]", border_style="cyan"))
+
+    except Exception:
+        pass  # User info is optional
+
+    console.print("\n[dim]⭐ Like EasyTransfer? Star us → [bold]https://github.com/ZGCA-Forge/ETransfer[/bold][/dim]")
 
 
 @app.command()
@@ -934,85 +1120,6 @@ def login(
 
 
 @app.command()
-def whoami(
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        help="Session token (overrides saved session)",
-        envvar="ETRANSFER_TOKEN",
-    ),
-) -> None:
-    """Show current user info and quota."""
-    import httpx
-
-    server = _get_server_url()
-    token = token or _get_token()
-
-    if not token:
-        print_error("Not logged in. Run [bold]etransfer login[/bold] first.")
-        raise typer.Exit(1)
-
-    console.print()
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        r = httpx.get(f"{server}/api/users/me", headers=headers, timeout=10)
-        if r.status_code == 401:
-            print_error("Session expired. Run [bold]etransfer login[/bold] again.")
-            raise typer.Exit(1)
-        r.raise_for_status()
-        user = r.json()
-
-        r2 = httpx.get(f"{server}/api/users/me/quota", headers=headers, timeout=10)
-        quota = r2.json() if r2.status_code == 200 else {}
-
-        info_text = (
-            f"[bold]Username:[/bold] {user.get('username', '?')}\n"
-            f"[bold]Display Name:[/bold] {user.get('display_name', 'N/A')}\n"
-            f"[bold]Email:[/bold] {user.get('email', 'N/A')}\n"
-            f"[bold]Role:[/bold] {user.get('role', '?')}\n"
-            f"[bold]Admin:[/bold] {'Yes' if user.get('is_admin') else 'No'}\n"
-            f"[bold]Groups:[/bold] {', '.join(user.get('groups', [])) or 'None'}"
-        )
-
-        if quota:
-            q = quota.get("quota", {})
-            max_storage = q.get("max_storage_size")
-            storage_used = quota.get("storage_used", 0)
-            usage_pct = quota.get("usage_percent")
-
-            info_text += "\n\n[bold underline]Quota:[/bold underline]\n"
-            info_text += f"  Storage Used: {format_size(storage_used)}"
-            if max_storage:
-                info_text += f" / {format_size(max_storage)}"
-                if usage_pct is not None:
-                    info_text += f" ({usage_pct}%)"
-            else:
-                info_text += " (unlimited)"
-            if q.get("max_upload_size"):
-                info_text += f"\n  Max Upload: {format_size(q['max_upload_size'])}"
-            if q.get("upload_speed_limit"):
-                info_text += f"\n  Upload Speed: {format_size(q['upload_speed_limit'])}/s"
-            if q.get("download_speed_limit"):
-                info_text += f"\n  Download Speed: {format_size(q['download_speed_limit'])}/s"
-
-        console.print(
-            Panel(
-                info_text,
-                title="[bold cyan]User Profile[/bold cyan]",
-                border_style="cyan",
-            )
-        )
-
-    except httpx.ConnectError:
-        print_error(f"Cannot connect to server: {server}")
-        raise typer.Exit(1)
-    except Exception as e:
-        print_error(f"Failed: {e}")
-        raise typer.Exit(1)
-
-
-@app.command()
 def logout() -> None:
     """Logout and invalidate session."""
     import httpx
@@ -1044,72 +1151,7 @@ def logout() -> None:
     print_success("Logged out")
 
 
-@app.command()
-def quota(
-    token: Optional[str] = typer.Option(
-        None,
-        "--token",
-        "-t",
-        help="API token (overrides saved session)",
-        envvar="ETRANSFER_TOKEN",
-    ),
-) -> None:
-    """Show current user's storage quota and usage."""
-    import httpx
-
-    server = _get_server_url()
-    token = token or _get_token()
-    if not token:
-        print_error("Not logged in. Run [bold]etransfer login[/bold] first.")
-        raise typer.Exit(1)
-
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        with console.status("[bold cyan]Fetching quota...", spinner="dots"):
-            r = httpx.get(f"{server}/api/users/me/quota", headers=headers, timeout=10)
-            r.raise_for_status()
-
-        data = r.json()
-        used = data.get("storage_used", 0)
-        q = data.get("quota", {})
-        max_storage = q.get("max_storage_size")
-        pct = data.get("usage_percent")
-
-        info_text = f"[bold]Used:[/bold] {format_size(used)}"
-        if max_storage:
-            info_text += f" / {format_size(max_storage)}"
-        if pct is not None:
-            color = "green" if pct < 80 else ("yellow" if pct < 95 else "red")
-            bar_width = 20
-            filled = int(bar_width * pct / 100)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            info_text += f"\n[{color}]{bar}[/{color}] {pct:.1f}%"
-        else:
-            info_text += "\n[dim]No storage limit[/dim]"
-
-        if data.get("is_over_quota"):
-            info_text += "\n[bold red]⚠ Over quota![/bold red]"
-
-        console.print(
-            Panel(
-                info_text,
-                title="[bold cyan]📊 Storage Quota[/bold cyan]",
-                border_style="cyan",
-            )
-        )
-
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            print_error("Session expired. Run [bold]etransfer login[/bold].")
-        else:
-            print_error(f"Failed: {e}")
-        raise typer.Exit(1)
-    except Exception as e:
-        print_error(f"Failed: {e}")
-        raise typer.Exit(1)
-
-
-@app.command("recalculate-quota")
+@server_app.command("recalculate-quota")
 def recalculate_quota(
     token: Optional[str] = typer.Option(
         None,
@@ -1187,37 +1229,7 @@ def recalculate_quota(
         raise typer.Exit(1)
 
 
-@app.command("status")
-def client_status() -> None:
-    """Show current client configuration and session status."""
-    cfg = _load_client_config()
-
-    if not cfg.get("server"):
-        print_warning("Not configured. Run [bold]etransfer setup <address>[/bold] first.")
-        return
-
-    console.print()
-    lines = f"[bold]Server:[/bold] {cfg['server']}"
-    if cfg.get("token"):
-        username = cfg.get("username", "?")
-        role = cfg.get("role", "?")
-        lines += f"\n[bold]Logged in as:[/bold] {username} (role: {role})"
-        if cfg.get("expires_at"):
-            lines += f"\n[bold]Session expires:[/bold] {cfg['expires_at']}"
-    else:
-        lines += "\n[bold]Session:[/bold] [dim]not logged in[/dim]"
-    lines += f"\n[bold]Config file:[/bold] {CLIENT_CONFIG_FILE}"
-
-    console.print(
-        Panel(
-            lines,
-            title="[bold cyan]Client Status[/bold cyan]",
-            border_style="cyan",
-        )
-    )
-
-
-@app.command()
+@server_app.command("gui")
 def gui() -> None:
     """Launch the graphical user interface."""
     console.print()
@@ -1624,27 +1636,6 @@ cors:
         print_success(f"Config written to {output}")
     else:
         console.print(Panel(config_content, title="[bold cyan]Sample Config[/bold cyan]", border_style="cyan"))
-
-
-@app.command()
-def version() -> None:
-    """Show version information."""
-    from etransfer import __version__
-
-    console.print()
-    text = Text()
-    text.append("╭─────────────────────────────────────────╮\n", style="cyan")
-    text.append("│", style="cyan")
-    text.append("  EasyTransfer                           ", style="bold white")
-    text.append("│\n", style="cyan")
-    text.append("│", style="cyan")
-    text.append(f"  Version: {__version__:<29}", style="dim white")
-    text.append("│\n", style="cyan")
-    text.append("│", style="cyan")
-    text.append("  TUS Protocol Based File Transfer       ", style="dim white")
-    text.append("│\n", style="cyan")
-    text.append("╰─────────────────────────────────────────╯", style="cyan")
-    console.print(text)
 
 
 if __name__ == "__main__":
