@@ -3,6 +3,7 @@
 import base64
 import os
 import queue
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -161,6 +162,14 @@ class ParallelUploader:
             )
             clients.append((c, self._patch_url_for_endpoint(ep)))
 
+        # ── Install SIGINT handler to set cancel flag ─────────
+        _prev_handler = signal.getsignal(signal.SIGINT)
+
+        def _sigint_handler(signum: int, frame: Any) -> None:
+            self._cancelled.set()
+
+        signal.signal(signal.SIGINT, _sigint_handler)
+
         # ── Prefetch thread ──────────────────────────────────
         def _prefetch() -> None:
             try:
@@ -168,7 +177,6 @@ class ParallelUploader:
                     if self._cancelled.is_set():
                         break
                     data = pread(fd, length, offset)
-                    # Use timeout on put so we can check cancel flag
                     while not self._cancelled.is_set():
                         try:
                             chunk_queue.put((offset, length, data), timeout=0.5)
@@ -209,31 +217,17 @@ class ParallelUploader:
                     )
                     for i in range(self.max_concurrent)
                 ]
-                # Wait with short timeout so KeyboardInterrupt is delivered
-                done: set[Any] = set()
-                while len(done) < len(futures):
-                    for f in futures:
-                        if f in done:
-                            continue
-                        try:
-                            f.result(timeout=0.5)
-                            done.add(f)
-                        except TimeoutError:
-                            pass
+                for future in as_completed(futures):
+                    future.result()
             prefetch_thread.join(timeout=2)
-        except KeyboardInterrupt:
-            self._cancelled.set()
-            # Drain the queue so threads can exit
-            while True:
-                try:
-                    chunk_queue.get_nowait()
-                except queue.Empty:
-                    break
-            raise
         finally:
+            signal.signal(signal.SIGINT, _prev_handler)
             os.close(fd)
             for c, _ in clients:
                 c.close()
+
+        if self._cancelled.is_set():
+            raise KeyboardInterrupt()
 
         return self.url
 
