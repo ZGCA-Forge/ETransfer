@@ -18,6 +18,14 @@
 pip install etransfer
 ```
 
+如需部署服务端（含 SQLAlchemy async 依赖）：
+
+```bash
+pip install "etransfer[server]" --only-binary greenlet
+```
+
+> `--only-binary greenlet` 确保只安装预编译 wheel，避免 Windows 等平台上的 C 编译问题。
+
 ## 快速开始
 
 ```bash

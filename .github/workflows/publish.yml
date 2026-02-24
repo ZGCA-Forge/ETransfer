@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev]
+          pip install -e ".[dev]" --only-binary greenlet
           pip install build twine
 
       - name: Run pre-commit hooks

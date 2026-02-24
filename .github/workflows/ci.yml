@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev]
+          pip install -e ".[dev]" --only-binary greenlet
 
       - name: Run pre-commit hooks
         uses: pre-commit/action@v3.0.1
@@ -70,7 +70,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev]
+          pip install -e ".[dev]" --only-binary greenlet
 
       - name: Test with pytest
         run: pytest
@@ -118,7 +118,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev]
+          pip install -e ".[dev]" --only-binary greenlet
 
       - name: Test with pytest
         run: pytest
