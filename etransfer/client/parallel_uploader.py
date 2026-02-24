@@ -22,9 +22,9 @@ class ParallelUploader:
 
     Splits a file into ranges and uploads them concurrently via TUS PATCH
     requests.  The server must support out-of-order PATCH (non-standard TUS
-    extension implemented by EasyTransfer).
+    extension implemented by ETransfer).
 
-    A background prefetch thread reads chunks from disk using ``os.pread``
+    A background prefetch thread reads chunks from disk using positional read
     into a bounded queue so that upload workers are never blocked on I/O.
 
     When *endpoints* is provided, workers are distributed round-robin
@@ -61,6 +61,7 @@ class ParallelUploader:
         self.wait_on_quota = wait_on_quota
         self.quota_poll_interval = quota_poll_interval
         self.quota_max_wait = quota_max_wait
+        self._cancelled = threading.Event()  # Ctrl+C / cancel signal
 
     # ── helpers ────────────────────────────────────────────────
 
@@ -164,22 +165,38 @@ class ParallelUploader:
         def _prefetch() -> None:
             try:
                 for offset, length in chunks:
+                    if self._cancelled.is_set():
+                        break
                     data = pread(fd, length, offset)
-                    chunk_queue.put((offset, length, data))
+                    # Use timeout on put so we can check cancel flag
+                    while not self._cancelled.is_set():
+                        try:
+                            chunk_queue.put((offset, length, data), timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
             finally:
                 for _ in range(self.max_concurrent):
-                    chunk_queue.put(_SENTINEL)
+                    try:
+                        chunk_queue.put(_SENTINEL, timeout=1)
+                    except queue.Full:
+                        pass
 
         prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
         prefetch_thread.start()
 
         # ── Upload worker (each bound to one endpoint) ───────
         def _upload_worker(http: httpx.Client, patch_url: str) -> None:
-            while True:
-                item = chunk_queue.get()
+            while not self._cancelled.is_set():
+                try:
+                    item = chunk_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
                 if item is _SENTINEL:
                     return
                 offset, length, data = item
+                if self._cancelled.is_set():
+                    return
                 self._upload_chunk_with_retry(http, offset, data, patch_url)
 
         try:
@@ -192,9 +209,27 @@ class ParallelUploader:
                     )
                     for i in range(self.max_concurrent)
                 ]
-                for future in as_completed(futures):
-                    future.result()
-            prefetch_thread.join()
+                # Wait with short timeout so KeyboardInterrupt is delivered
+                done: set[Any] = set()
+                while len(done) < len(futures):
+                    for f in futures:
+                        if f in done:
+                            continue
+                        try:
+                            f.result(timeout=0.5)
+                            done.add(f)
+                        except TimeoutError:
+                            pass
+            prefetch_thread.join(timeout=2)
+        except KeyboardInterrupt:
+            self._cancelled.set()
+            # Drain the queue so threads can exit
+            while True:
+                try:
+                    chunk_queue.get_nowait()
+                except queue.Empty:
+                    break
+            raise
         finally:
             os.close(fd)
             for c, _ in clients:
@@ -223,6 +258,8 @@ class ParallelUploader:
         last_exc: Optional[Exception] = None
         quota_waited = 0.0
         for attempt in range(self.retries):
+            if self._cancelled.is_set():
+                return
             try:
                 resp = http.patch(url, content=data, headers=headers)  # type: ignore[arg-type]
                 if resp.status_code in (204, 200, 409):
@@ -234,6 +271,8 @@ class ParallelUploader:
                 if resp.status_code == 507 and self.wait_on_quota:
                     # Quota exceeded — wait and retry (don't count as a retry attempt)
                     while quota_waited < self.quota_max_wait:
+                        if self._cancelled.is_set():
+                            return
                         time.sleep(self.quota_poll_interval)
                         quota_waited += self.quota_poll_interval
                         retry_resp = http.patch(url, content=data, headers=headers)  # type: ignore[arg-type]

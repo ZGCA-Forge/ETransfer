@@ -324,6 +324,10 @@ def upload(
         elif retention == "ttl":
             print_info(f"File will expire in {retention_ttl}s after upload completes")
 
+    except KeyboardInterrupt:
+        console.print()
+        print_warning("Upload cancelled by user.")
+        raise typer.Exit(130)
     except Exception as e:
         console.print()
         print_error(f"Upload failed: {e}")
@@ -425,6 +429,10 @@ def download(
             print_error("Download failed")
             raise typer.Exit(1)
 
+    except KeyboardInterrupt:
+        console.print()
+        print_warning("Download cancelled by user.")
+        raise typer.Exit(130)
     except Exception as e:
         console.print()
         print_error(f"Download failed: {e}")
