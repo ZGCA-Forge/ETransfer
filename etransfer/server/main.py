@@ -79,7 +79,11 @@ async def _reconcile_storage_quotas(storage: TusStorage, user_db: Any) -> None:
 
     Runs once at startup. Scans completed files, groups sizes by owner_id,
     and corrects any drift in the users table.
+    Also clears stale quota reservations in Redis that may have been left
+    behind by interrupted uploads or unclean shutdowns.
     """
+    from etransfer.common.constants import RedisKeys
+
     try:
         files = await storage.list_files()
         owner_sizes: dict[int, int] = {}
@@ -88,23 +92,59 @@ async def _reconcile_storage_quotas(storage: TusStorage, user_db: Any) -> None:
             if oid is not None:
                 owner_sizes[oid] = owner_sizes.get(oid, 0) + f.get("size", 0)
 
+        # Also account for in-flight (non-finalized) uploads — reservation
+        # equals actual bytes received (offset), not the full file size.
+        in_flight_reserved: dict[int, int] = {}
+        uploads = await storage.list_uploads(include_completed=False, include_partial=True)
+        for u in uploads:
+            if u.owner_id is not None and not u.is_final:
+                in_flight_reserved[u.owner_id] = in_flight_reserved.get(u.owner_id, 0) + u.offset
+
         users = await user_db.list_users()
-        fixed = 0
+        fixed_db = 0
+        fixed_redis = 0
         for u in users:
-            actual = owner_sizes.get(u.id, 0)
+            uid = u.id
+            actual = owner_sizes.get(uid, 0)
+
+            # Fix SQL storage_used
             if u.storage_used != actual:
                 logger.info(
                     "Quota drift: user %s (%s) DB=%d actual=%d, correcting",
-                    u.id,
+                    uid,
                     u.username,
                     u.storage_used,
                     actual,
                 )
-                await user_db.recalculate_storage(u.id, actual)
-                fixed += 1
+                await user_db.recalculate_storage(uid, actual)
+                fixed_db += 1
 
-        if fixed:
-            logger.info("Reconciled storage_used for %d user(s)", fixed)
+            # Fix Redis reservation — should equal sum of in-flight upload offsets
+            expected_reserved = in_flight_reserved.get(uid, 0)
+            quota_key = f"{RedisKeys.QUOTA_PREFIX}{uid}"
+            current_reserved_str = await storage.state.get(quota_key)
+            current_reserved = int(current_reserved_str) if current_reserved_str else 0
+
+            if current_reserved != expected_reserved:
+                logger.info(
+                    "Reservation drift: user %s (%s) redis=%d expected=%d, correcting",
+                    uid,
+                    u.username,
+                    current_reserved,
+                    expected_reserved,
+                )
+                if expected_reserved == 0:
+                    await storage.state.delete(quota_key)
+                else:
+                    await storage.state.set(quota_key, str(expected_reserved))
+                fixed_redis += 1
+
+        if fixed_db or fixed_redis:
+            logger.info(
+                "Reconciled: %d user(s) storage_used, %d user(s) reservations",
+                fixed_db,
+                fixed_redis,
+            )
         else:
             logger.info("Storage quotas consistent — no corrections needed")
     except Exception:

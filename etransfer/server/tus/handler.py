@@ -115,14 +115,23 @@ def create_tus_router(
                     reserved = await quota_svc.get_reserved(owner_id)
                     total_used = user.storage_used + reserved
                     if total_used + upload_length > effective.max_storage_size:
+                        logger.debug(
+                            "TUS CREATE REJECTED %s: owner_id=%d storage_used=%d " "reserved=%d upload=%d limit=%d",
+                            "quota",
+                            owner_id,
+                            user.storage_used,
+                            reserved,
+                            upload_length,
+                            effective.max_storage_size,
+                        )
                         raise HTTPException(
                             507,
                             f"Storage quota exceeded (used={user.storage_used}, "
                             f"reserved={reserved}, limit={effective.max_storage_size})",
                         )
 
-                # Reserve quota in Redis (atomic)
-                await quota_svc.reserve(owner_id, upload_length)
+                # No upfront reservation — quota is reserved incrementally
+                # per PATCH as bytes are actually written to disk.
 
         # Parse metadata
         metadata_header = request.headers.get(TusHeaders.UPLOAD_METADATA, "")
@@ -317,25 +326,66 @@ def create_tus_router(
                 headers={**get_tus_headers(), "Retry-After": "5"},
             )
 
+        # ── Per-user quota: reserve before writing to disk ────
+        upload_record = await storage.get_upload(file_id)
+        patch_owner_id = upload_record.owner_id if upload_record else None
+        if patch_owner_id:
+            user_db = getattr(request.app.state, "user_db", None)
+            if user_db:
+                user = await user_db.get_user(patch_owner_id)
+                if user:
+                    role_quotas = getattr(request.app.state, "parsed_role_quotas", {})
+                    effective = await user_db.get_effective_quota(user, role_quotas)
+                    if effective.max_storage_size:
+                        reserved = await quota_svc.get_reserved(patch_owner_id)
+                        total_after = user.storage_used + reserved + content_length
+                        if total_after > effective.max_storage_size:
+                            logger.debug(
+                                "TUS PATCH REJECTED %s: owner_id=%d used=%d reserved=%d " "chunk=%d limit=%d",
+                                file_id[:8],
+                                patch_owner_id,
+                                user.storage_used,
+                                reserved,
+                                content_length,
+                                effective.max_storage_size,
+                            )
+                            raise HTTPException(
+                                507,
+                                f"Storage quota exceeded (used={user.storage_used}, "
+                                f"reserved={reserved}, chunk={content_length}, "
+                                f"limit={effective.max_storage_size})",
+                            )
+            # Reserve upfront — will release on write failure
+            await quota_svc.reserve(patch_owner_id, content_length)
+
         # ── Stream body → disk (no full-body buffering) ──────
         # For chunked storage: compute chunk index and write to chunk file
-        upload_record = await storage.get_upload(file_id)
-        if upload_record and upload_record.chunked_storage:
-            chunk_index = offset // upload_record.chunk_size
-            written = await storage.write_chunk_file_streaming(
-                file_id,
-                chunk_index,
-                request._receive,
-                content_length,
-            )
-            await storage.mark_chunk_available(file_id, chunk_index)
-        else:
-            written = await storage.write_chunk_streaming(
-                file_id,
-                request._receive,
-                offset,
-                content_length,
-            )
+        try:
+            if upload_record and upload_record.chunked_storage:
+                chunk_index = offset // upload_record.chunk_size
+                written = await storage.write_chunk_file_streaming(
+                    file_id,
+                    chunk_index,
+                    request._receive,
+                    content_length,
+                )
+                await storage.mark_chunk_available(file_id, chunk_index)
+            else:
+                written = await storage.write_chunk_streaming(
+                    file_id,
+                    request._receive,
+                    offset,
+                    content_length,
+                )
+        except Exception:
+            # Write failed — release the reservation we just made
+            if patch_owner_id:
+                await quota_svc.release(patch_owner_id, content_length)
+            raise
+
+        # Adjust reservation if fewer bytes were actually written
+        if patch_owner_id and written < content_length:
+            await quota_svc.release(patch_owner_id, content_length - written)
 
         # ── Merge range under local asyncio lock (2 Redis calls) ──
         upload, completed = await storage.merge_range_atomic(
@@ -395,13 +445,13 @@ def create_tus_router(
                     upload.size,
                 )
             else:
-                # Still in-flight — release the reservation
-                await quota_svc.release(upload.owner_id, upload.size)
+                # Still in-flight — release reservation for bytes actually received
+                await quota_svc.release(upload.owner_id, upload.offset)
                 logger.debug(
-                    "TUS DELETE %s: released reservation for owner_id=%d size=%d",
+                    "TUS DELETE %s: released reservation for owner_id=%d offset=%d",
                     file_id[:8],
                     upload.owner_id,
-                    upload.size,
+                    upload.offset,
                 )
         else:
             logger.debug(
