@@ -67,12 +67,19 @@ def _save_client_config(config: dict) -> None:
 def _normalise_server_url(address: str) -> str:
     """Normalise a user-provided address into a full URL.
 
-    Accepts: ``host:port``, ``http://host:port``, ``https://host:port``.
+    Accepts: ``host``, ``host:port``, ``http://host:port``, ``https://host:port``.
+    When no scheme is given and no port is specified, defaults to :8765.
+    If the user provides a full URL (http/https), it is kept as-is.
     """
+    from etransfer.common.constants import DEFAULT_SERVER_PORT
+
     address = address.strip().rstrip("/")
-    if not address.startswith(("http://", "https://")):
-        address = f"http://{address}"
-    return address
+    if address.startswith(("http://", "https://")):
+        return address
+    # No scheme — treat as host or host:port
+    if ":" not in address:
+        address = f"{address}:{DEFAULT_SERVER_PORT}"
+    return f"http://{address}"
 
 
 def _get_server_url() -> str:
@@ -689,16 +696,14 @@ def login(
     console.print()
 
     # Use a non-blocking input loop so we can check done_event
-    import select
     import sys
 
     console.print("[bold cyan]Token (press Enter after paste): [/bold cyan]", end="")
     sys.stdout.flush()
 
-    while not done_event.is_set():
-        # Check if stdin has data (non-blocking, 0.5s timeout)
-        ready, _, _ = select.select([sys.stdin], [], [], 0.5)
-        if ready:
+    def _stdin_reader() -> None:
+        """Read stdin in a separate thread (works on Windows too)."""
+        try:
             line = sys.stdin.readline()
             if line:
                 manual_token = line.strip()
@@ -706,7 +711,14 @@ def login(
                     result["source"] = "manual"
                     result["manual_token"] = manual_token
                     done_event.set()
-                    break
+        except Exception:
+            pass
+
+    stdin_thread = threading.Thread(target=_stdin_reader, daemon=True)
+    stdin_thread.start()
+
+    # Wait until either poll or manual input completes
+    done_event.wait(timeout=timeout)
 
     poll_thread.join(timeout=2)
 
@@ -967,7 +979,11 @@ def server_start(
       3. ./config/config.yaml
       4. ~/.etransfer/server.yaml
     """
-    from etransfer.server.config import discover_config_path
+    try:
+        from etransfer.server.config import discover_config_path
+    except ImportError:
+        print_error("Server dependencies not installed. Run: pip install 'etransfer[server]'")
+        raise typer.Exit(1)
 
     # Resolve config path for display
     resolved_config = config
@@ -996,7 +1012,11 @@ def server_start(
 
     try:
         from etransfer.server.main import run_server
+    except ImportError:
+        print_error("Server dependencies not installed. Run: pip install 'etransfer[server]'")
+        raise typer.Exit(1)
 
+    try:
         run_server(
             host=host,
             port=port,

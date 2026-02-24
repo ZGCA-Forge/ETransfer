@@ -3,14 +3,17 @@
 ## 安装
 
 ```bash
-# 基础安装
-pip install etransfer
+# 服务端
+pip install "etransfer[server]"
 
-# Redis 后端（多 Worker 生产环境）
-pip install "etransfer[redis]"
+# 服务端 + Redis（多 Worker 生产环境）
+pip install "etransfer[server,redis]"
 
-# MySQL 用户数据库
-pip install "etransfer[mysql]"
+# 服务端 + MySQL 用户数据库
+pip install "etransfer[server,mysql]"
+
+# 全部
+pip install "etransfer[server,mysql,redis]"
 
 # 开发依赖
 pip install "etransfer[dev]"
