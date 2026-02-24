@@ -292,7 +292,7 @@ class ChunkDownloader:
         _chunk_iter = iter(range(total_chunks))
         _iter_lock = threading.Lock()
 
-        fd = os.open(path_str, os.O_WRONLY) if self.use_pwrite else -1
+        fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0)) if self.use_pwrite else -1
         # For pwrite: fd is shared (pwrite is thread-safe)
         # For seek+write: each worker opens its own handle via _write_at
 
@@ -358,7 +358,7 @@ class ChunkDownloader:
         _chunk_iter = iter(range(total_chunks))
         _iter_lock = threading.Lock()
 
-        fd = os.open(path_str, os.O_WRONLY) if self.use_pwrite else -1
+        fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0)) if self.use_pwrite else -1
 
         def _download_worker(http: httpx.Client) -> bool:
             nonlocal downloaded_bytes
@@ -498,7 +498,7 @@ class ChunkDownloader:
                             f.write(b"\0")
                         if not use_cache:
                             if self.use_pwrite:
-                                fd = os.open(path_str, os.O_WRONLY)
+                                fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0))
                             else:
                                 fd = 0  # sentinel: file created
 
@@ -606,7 +606,7 @@ class ChunkDownloader:
                         f.seek(total_size - 1)
                         f.write(b"\0")
                     if self.use_pwrite:
-                        fd = os.open(path_str, os.O_WRONLY)
+                        fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0))
                     else:
                         fd = 0  # sentinel: file created but no fd needed
 

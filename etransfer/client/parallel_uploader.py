@@ -146,7 +146,7 @@ class ParallelUploader:
         prefetch_depth = max(4, self.max_concurrent * 2)
         chunk_queue: queue.Queue[Optional[tuple[int, int, bytes]]] = queue.Queue(maxsize=prefetch_depth)
 
-        fd = os.open(self.file_path, os.O_RDONLY)
+        fd = os.open(self.file_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
 
         # One HTTP client per endpoint
         clients: list[tuple[httpx.Client, str]] = []

@@ -288,7 +288,11 @@ def upload(
     )
     console.print(panel)
 
+    console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
+
     try:
+        import sys
+
         from etransfer.client.tus_client import EasyTransferClient
 
         with create_transfer_progress() as progress:
@@ -307,6 +311,36 @@ def upload(
                     retention_ttl=retention_ttl,
                     wait_on_quota=wait_on_quota,
                 )
+
+                # Interactive input listener thread
+                def _input_listener() -> None:
+                    while not uploader._cancelled.is_set():
+                        try:
+                            line = sys.stdin.readline()
+                            if not line:
+                                continue
+                            cmd = line.strip().lower()
+                            if cmd in ("q", "quit", "cancel"):
+                                uploader._cancelled.set()
+                                return
+                            elif cmd in ("s", "status"):
+                                elapsed_now = time.time() - start_time
+                                uploaded = uploader._uploaded_bytes
+                                pct = (uploaded / file_size * 100) if file_size else 100
+                                spd = uploaded / elapsed_now if elapsed_now > 0 else 0
+                                console.print(
+                                    f"\n[bold cyan]Status:[/bold cyan] "
+                                    f"{format_size(uploaded)}/{format_size(file_size)} "
+                                    f"({pct:.1f}%) | "
+                                    f"{format_size(int(spd))}/s | "
+                                    f"{elapsed_now:.0f}s elapsed"
+                                )
+                        except Exception:
+                            return
+
+                input_thread = threading.Thread(target=_input_listener, daemon=True)
+                input_thread.start()
+
                 location = uploader.upload()
 
         elapsed = time.time() - start_time

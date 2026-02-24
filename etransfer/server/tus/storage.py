@@ -363,7 +363,7 @@ class TusStorage:
         file_path = self.get_file_path(file_id)
         await self._ensure_sparse_file(file_id, file_path)
 
-        fd = os.open(str(file_path), os.O_WRONLY)
+        fd = os.open(str(file_path), os.O_WRONLY | getattr(os, "O_BINARY", 0))
         total_written = 0
         try:
             while total_written < content_length:
@@ -384,7 +384,7 @@ class TusStorage:
         if not file_path.exists():
             upload = await self.get_upload(file_id)
             if upload:
-                fd = os.open(str(file_path), os.O_CREAT | os.O_WRONLY, 0o644)
+                fd = os.open(str(file_path), os.O_CREAT | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o644)
                 try:
                     ftruncate(fd, upload.size)
                 finally:
@@ -393,7 +393,7 @@ class TusStorage:
     @staticmethod
     def _sync_pwrite(path: str, data: bytes, offset: int) -> int:
         """Synchronous pwrite — runs in thread pool."""
-        fd = os.open(path, os.O_WRONLY)
+        fd = os.open(path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
         try:
             return pwrite(fd, data, offset)
         finally:
@@ -450,7 +450,7 @@ class TusStorage:
         chunk_path = self.get_chunk_path(file_id, chunk_index)
         chunk_path.parent.mkdir(parents=True, exist_ok=True)
 
-        fd = os.open(str(chunk_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        fd = os.open(str(chunk_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o644)
         total_written = 0
         try:
             while total_written < content_length:

@@ -315,7 +315,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             loop = asyncio.get_running_loop()
 
             def _sync_pread() -> bytes:
-                fd = os.open(file_path_str, os.O_RDONLY)
+                fd = os.open(file_path_str, os.O_RDONLY | getattr(os, "O_BINARY", 0))
                 try:
                     return pread(fd, content_length, start)
                 finally:
@@ -336,7 +336,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
 
         async def generate_fast() -> AsyncIterator[bytes]:
             loop = asyncio.get_running_loop()
-            fd = os.open(file_path_str, os.O_RDONLY)
+            fd = os.open(file_path_str, os.O_RDONLY | getattr(os, "O_BINARY", 0))
             try:
                 offset = start
                 remaining = content_length
