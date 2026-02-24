@@ -245,7 +245,7 @@ def test_discover_config_subfolder(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     result = discover_config_path()
     assert result is not None
-    assert str(result).endswith("config/config.yaml")
+    assert result.parts[-2:] == ("config", "config.yaml")
 
 
 def test_discover_priority_cwd_over_subfolder(monkeypatch, tmp_path):

@@ -4,10 +4,37 @@ import asyncio
 import json
 import os
 import shutil
+import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+
+# ------------------------------------------------------------------
+# Cross-platform shims for os.pwrite / os.ftruncate (missing on Windows)
+# ------------------------------------------------------------------
+if sys.platform == "win32":
+
+    def _pwrite(fd: int, data: bytes, offset: int) -> int:
+        """Emulate os.pwrite on Windows using seek + write."""
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.write(fd, data)
+
+    def _ftruncate(fd: int, length: int) -> None:
+        """Emulate os.ftruncate on Windows using _chsize."""
+        import msvcrt  # noqa: F811
+        import ctypes
+
+        c_fd = fd
+        # msvcrt._chsize_s supports 64-bit sizes
+        ucrt = ctypes.cdll.msvcrt
+        ret = ucrt._chsize_s(c_fd, ctypes.c_int64(length))
+        if ret != 0:
+            raise OSError(f"_chsize_s failed with errno {ret}")
+
+else:
+    _pwrite = os.pwrite
+    _ftruncate = os.ftruncate
 
 import aiofiles  # type: ignore[import-untyped]
 import aiofiles.os  # type: ignore[import-untyped]
@@ -370,7 +397,7 @@ class TusStorage:
                 body = message.get("body", b"")
                 if body:
                     loop = asyncio.get_running_loop()
-                    n = await loop.run_in_executor(io_pool, os.pwrite, fd, body, offset + total_written)
+                    n = await loop.run_in_executor(io_pool, _pwrite, fd, body, offset + total_written)
                     total_written += n
                 if not message.get("more_body", False):
                     break
@@ -385,7 +412,7 @@ class TusStorage:
             if upload:
                 fd = os.open(str(file_path), os.O_CREAT | os.O_WRONLY, 0o644)
                 try:
-                    os.ftruncate(fd, upload.size)
+                    _ftruncate(fd, upload.size)
                 finally:
                     os.close(fd)
 
@@ -394,7 +421,7 @@ class TusStorage:
         """Synchronous pwrite — runs in thread pool."""
         fd = os.open(path, os.O_WRONLY)
         try:
-            return os.pwrite(fd, data, offset)
+            return _pwrite(fd, data, offset)
         finally:
             os.close(fd)
 
