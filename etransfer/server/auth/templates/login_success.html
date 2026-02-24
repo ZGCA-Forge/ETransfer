@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>EasyTransfer - Login</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            display: flex; justify-content: center; align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+            color: #e0e0e0;
+        }
+        .lang-switch {
+            position: fixed; top: 16px; right: 20px;
+            display: flex; gap: 6px; z-index: 10;
+        }
+        .lang-switch button {
+            background: rgba(255,255,255,0.12); border: 1px solid rgba(255,255,255,0.2);
+            color: #ccc; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+            font-size: 13px; transition: all .2s;
+        }
+        .lang-switch button:hover { background: rgba(255,255,255,0.2); color: #fff; }
+        .lang-switch button.active {
+            background: rgba(255,255,255,0.25); color: #fff;
+            border-color: rgba(255,255,255,0.4);
+        }
+        .card {
+            background: rgba(255,255,255,0.08); backdrop-filter: blur(12px);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px; padding: 36px 40px; text-align: center;
+            max-width: 500px; width: 90%;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+        }
+        h2 { color: #fff; margin-bottom: 6px; font-size: 22px; }
+        .welcome { color: #b0bec5; margin: 8px 0 18px; font-size: 15px; }
+        .token-label { color: #90a4ae; font-size: 13px; margin-bottom: 8px; }
+        .token-box {
+            position: relative;
+            background: rgba(0,0,0,0.35); padding: 14px 40px 14px 14px;
+            border-radius: 8px; border: 1px solid rgba(255,255,255,0.08);
+            font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px;
+            word-break: break-all; color: #80cbc4;
+            text-align: left; line-height: 1.5;
+            cursor: pointer; user-select: all;
+            transition: border-color .2s;
+        }
+        .token-box:hover { border-color: rgba(255,255,255,0.2); }
+        .copy-btn {
+            position: absolute; top: 8px; right: 8px;
+            background: rgba(255,255,255,0.1); border: none; color: #aaa;
+            padding: 4px 8px; border-radius: 4px; cursor: pointer;
+            font-size: 12px; transition: all .2s;
+        }
+        .copy-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
+        .copy-btn.copied { color: #66bb6a; }
+        .hint { color: #78909c; font-size: 13px; margin-top: 18px; line-height: 1.6; }
+        .check { font-size: 36px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="lang-switch">
+        <button id="btn-zh" onclick="setLang('zh')">中文</button>
+        <button id="btn-en" onclick="setLang('en')">EN</button>
+    </div>
+    <div class="card">
+        <div class="check">✓</div>
+        <h2>
+            <span class="i18n" data-zh="登录成功" data-en="Login Successful"></span>
+        </h2>
+        <p class="welcome">
+            <span class="i18n" data-zh="欢迎，" data-en="Welcome, "></span><strong>{username}</strong>
+        </p>
+        <p class="token-label">
+            <span class="i18n" data-zh="会话令牌（点击复制）：" data-en="Session token (click to copy):"></span>
+        </p>
+        <div class="token-box" onclick="copyToken()">
+            {token}
+            <button class="copy-btn" id="copyBtn">
+                <span class="i18n" data-zh="复制" data-en="Copy"></span>
+            </button>
+        </div>
+        <p class="hint">
+            <span class="i18n"
+                data-zh="如果通过 CLI 登录，此窗口可以关闭。<br>CLI 会自动获取会话。如未自动获取，请复制上方令牌手动粘贴。"
+                data-en="If you logged in via CLI, this window can be closed.<br>The CLI will pick up your session automatically. If not, copy the token above and paste it manually.">
+            </span>
+        </p>
+    </div>
+    <script>
+        function copyToken() {
+            var t = '{token}';
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(t).then(function() { showCopied(); });
+            } else {
+                var a = document.createElement('textarea');
+                a.value = t; document.body.appendChild(a);
+                a.select(); document.execCommand('copy');
+                document.body.removeChild(a); showCopied();
+            }
+        }
+        function showCopied() {
+            var b = document.getElementById('copyBtn');
+            b.classList.add('copied');
+            setI18n(b, currentLang === 'zh' ? '已复制' : 'Copied');
+            setTimeout(function() {
+                b.classList.remove('copied');
+                setI18n(b, currentLang === 'zh' ? '复制' : 'Copy');
+            }, 2000);
+        }
+        function setI18n(el, text) { el.textContent = text; }
+        var currentLang = (navigator.language || '').startsWith('zh') ? 'zh' : 'en';
+        function setLang(lang) {
+            currentLang = lang;
+            document.querySelectorAll('.i18n').forEach(function(el) {
+                var t = el.getAttribute('data-' + lang);
+                if (t !== null) el.innerHTML = t;
+            });
+            document.getElementById('btn-zh').className = lang === 'zh' ? 'active' : '';
+            document.getElementById('btn-en').className = lang === 'en' ? 'active' : '';
+        }
+        setLang(currentLang);
+    </script>
+</body>
+</html>

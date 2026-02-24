@@ -1,0 +1,106 @@
+# ETransfer Server Configuration — Template
+# Copy to config/config.yaml and customize for your deployment:
+#   cp config.example.yaml config/config.yaml
+#   vim config/config.yaml
+# The config/ folder is git-ignored, so your secrets stay local.
+# See config/README.md for the full setup guide.
+
+server:
+  host: 0.0.0.0
+  port: 8765
+  workers: 1
+  # config_watch: true        # Auto-reload config on file change
+  # config_watch_interval: 30 # Check interval in seconds
+
+# Storage settings
+storage:
+  path: ./storage
+  # max_storage_size: 10737418240  # 10 GB total quota (null = unlimited)
+
+# State backend: memory (testing), file (default), redis (multi-worker)
+state:
+  backend: file
+  redis_url: redis://localhost:6379/0
+
+# Authentication
+auth:
+  enabled: true
+  tokens:
+    - "your-api-token-here"
+
+# File retention policies
+retention:
+  default: permanent # permanent / download_once / ttl
+  # default_ttl: 86400  # Default TTL in seconds (for ttl policy)
+  # token_policies:
+  #   guest-token:
+  #     default_retention: download_once
+  #   temp-token:
+  #     default_retention: ttl
+  #     default_ttl: 3600
+
+# Network
+network:
+  interfaces: [] # Empty = auto-detect
+  prefer_ipv4: true
+  advertised_endpoints: [] # Explicit IPs for clients
+
+# ── User System ─────────────────────────────────────────────
+# Integrates with any OIDC provider (Casdoor, Keycloak, Auth0, etc.) for authentication.
+# Groups from the OIDC provider drive permission and quota management.
+user_system:
+  enabled: false
+
+  # OIDC configuration (works with any standard OIDC provider)
+  # Endpoints are auto-discovered from {issuer_url}/.well-known/openid-configuration
+  oidc:
+    issuer_url: "https://your-oidc-provider.example.com"
+    client_id: "your-client-id"
+    client_secret: "" # Keep secret! Use env ETRANSFER_OIDC_CLIENT_SECRET
+    # callback_url: Leave empty or set to your public URL.
+    # When empty/localhost, ETransfer auto-derives the callback from the
+    # incoming request's Host header (works for SSH remote access).
+    # Example: "https://transfer.example.com/api/users/callback"
+    callback_url: ""
+    scope: "openid profile email"
+
+  # Database backend for user/group/session storage
+  database:
+    backend: sqlite # sqlite (default) or mysql
+    path: "" # SQLite file path (default: <storage>/users.db)
+
+    # MySQL settings (when backend=mysql)
+    # mysql:
+    #   host: 127.0.0.1
+    #   port: 3306
+    #   user: etransfer
+    #   password: ""      # Use env ETRANSFER_MYSQL_PASSWORD
+    #   database: etransfer
+
+  # Per-role quota defaults
+  # Users get the most permissive quota from their role AND groups
+  role_quotas:
+    admin:
+      max_storage_size: null # unlimited
+      max_upload_size: null
+      upload_speed_limit: null
+      download_speed_limit: null
+    user:
+      max_storage_size: 10737418240 # 10 GB
+      max_upload_size: 5368709120 # 5 GB
+      upload_speed_limit: null
+      download_speed_limit: null
+    guest:
+      max_storage_size: 1073741824 # 1 GB
+      max_upload_size: 536870912 # 512 MB
+      upload_speed_limit: 10485760 # 10 MB/s
+      download_speed_limit: 10485760 # 10 MB/s
+
+# CORS
+cors:
+  origins:
+    - "*"
+
+# Cleanup
+# cleanup_interval: 3600
+# upload_expiration_hours: 24
