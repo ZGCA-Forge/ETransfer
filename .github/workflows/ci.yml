@@ -1,4 +1,4 @@
-# EasyTransfer CI Workflow
+# ETransfer CI Workflow
 
 name: CI
 
@@ -38,11 +38,15 @@ jobs:
         with:
           extra_args: --all-files
 
-  # Step 2: Build and test (Python 3.13, Ubuntu)
+  # Step 2: Build and test (Python 3.13, Ubuntu + macOS + Windows)
   build:
-    name: Build & Test (Python 3.13, Ubuntu)
-    runs-on: ubuntu-latest
+    name: Build & Test (Python 3.13, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     needs: [code-format]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -55,10 +59,13 @@ jobs:
       - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
-          key: ubuntu-pip-3.13-${{ hashFiles('**/pyproject.toml') }}
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+            ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-3.13-${{ hashFiles('**/pyproject.toml') }}
           restore-keys: |
-            ubuntu-pip-3.13-
+            ${{ runner.os }}-pip-3.13-
 
       - name: Install dependencies
         run: |
@@ -77,10 +84,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         exclude:
+          # Already covered by the build job
           - os: ubuntu-latest
+            python-version: "3.13"
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
             python-version: "3.13"
 
     steps:
@@ -94,7 +106,10 @@ jobs:
       - name: Cache pip dependencies
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
+          path: |
+            ~/.cache/pip
+            ~/Library/Caches/pip
+            ~\AppData\Local\pip\Cache
           key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
           restore-keys: |
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
