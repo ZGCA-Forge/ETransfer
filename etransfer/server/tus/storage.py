@@ -22,8 +22,8 @@ if sys.platform == "win32":
 
     def _ftruncate(fd: int, length: int) -> None:
         """Emulate os.ftruncate on Windows using _chsize."""
-        import msvcrt  # noqa: F811
         import ctypes
+        import msvcrt  # noqa: F811
 
         c_fd = fd
         # msvcrt._chsize_s supports 64-bit sizes
