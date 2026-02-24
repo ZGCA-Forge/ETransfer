@@ -29,7 +29,7 @@ dependencies = [
     # Client
     "tuspy>=1.0.0",
     "httpx>=0.25.0",
-    "typer[all]>=0.9.0",
+    "typer>=0.12.0",
     "rich>=13.0.0",
     # Common (shared models & constants)
     "pydantic>=2.0.0",

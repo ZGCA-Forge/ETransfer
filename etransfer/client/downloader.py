@@ -10,6 +10,7 @@ import httpx
 
 from etransfer.client.cache import LocalCache
 from etransfer.common.constants import AUTH_HEADER, DEFAULT_CHUNK_SIZE
+from etransfer.common.fileutil import pwrite
 from etransfer.common.models import DownloadInfo
 
 
@@ -74,7 +75,7 @@ class ChunkDownloader:
         Otherwise it is a file path string opened briefly for each write.
         """
         if self.use_pwrite:
-            os.pwrite(fd_or_path, data, offset)  # type: ignore[arg-type]
+            pwrite(fd_or_path, data, offset)  # type: ignore[arg-type]
         else:
             with open(fd_or_path, "r+b") as f:  # type: ignore[arg-type]
                 f.seek(offset)

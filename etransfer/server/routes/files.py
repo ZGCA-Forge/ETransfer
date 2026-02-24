@@ -7,6 +7,7 @@ from typing import Any, AsyncIterator, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
+from etransfer.common.fileutil import pread
 from etransfer.common.models import DownloadInfo, ErrorResponse, FileInfo, FileListResponse, FileStatus
 from etransfer.server.tus.storage import TusStorage
 
@@ -96,8 +97,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     )
                 )
 
-            # Sort by created_at descending
-            all_files.sort(key=lambda f: f.created_at, reverse=True)
+            # Sort by created_at descending (handle None gracefully)
+            all_files.sort(key=lambda f: f.created_at or "", reverse=True)
 
             # Paginate
             total = len(all_files)
@@ -312,7 +313,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             def _sync_pread() -> bytes:
                 fd = os.open(file_path_str, os.O_RDONLY)
                 try:
-                    return os.pread(fd, content_length, start)
+                    return pread(fd, content_length, start)
                 finally:
                     os.close(fd)
 
@@ -337,7 +338,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                 remaining = content_length
                 while remaining > 0:
                     to_read = min(_BUF_SIZE, remaining)
-                    buf = await loop.run_in_executor(_io_pool, os.pread, fd, to_read, offset)
+                    buf = await loop.run_in_executor(_io_pool, pread, fd, to_read, offset)
                     if not buf:
                         break
                     yield buf

@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import httpx
 
 from etransfer.common.constants import DEFAULT_CHUNK_SIZE, TUS_VERSION
+from etransfer.common.fileutil import pread
 
 _SENTINEL = None  # marks end of prefetch queue
 
@@ -163,7 +164,7 @@ class ParallelUploader:
         def _prefetch() -> None:
             try:
                 for offset, length in chunks:
-                    data = os.pread(fd, length, offset)
+                    data = pread(fd, length, offset)
                     chunk_queue.put((offset, length, data))
             finally:
                 for _ in range(self.max_concurrent):
