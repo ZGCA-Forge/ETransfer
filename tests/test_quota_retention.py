@@ -10,6 +10,8 @@ Tests:
 3. quota full → 507 → consume frees space → upload resumes
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import tempfile
@@ -100,9 +102,14 @@ async def _create_test_app(
     app = create_app(settings)
 
     # Trigger startup manually
-    async with asyncio.timeout(10):
+    try:
+        async with asyncio.timeout(10):
+            for handler in app.router.on_startup:
+                await handler()
+    except AttributeError:
+        # Python < 3.11: asyncio.timeout not available
         for handler in app.router.on_startup:
-            await handler()
+            await asyncio.wait_for(handler(), timeout=10)
 
     # Inject user_db into app.state (may already be set by startup if user_system_enabled)
     if user_db is not None:
