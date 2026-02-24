@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -21,6 +22,8 @@ from etransfer.server.auth.models import RoleQuota
 from etransfer.server.tus.models import TusCapabilities, TusErrors, TusMetadata, TusUpload
 from etransfer.server.tus.quota import QuotaService
 from etransfer.server.tus.storage import TusStorage
+
+logger = logging.getLogger("etransfer.server.tus")
 
 
 def create_tus_router(
@@ -196,6 +199,15 @@ def create_tus_router(
         # Build location URL
         location = str(request.url).rstrip("/") + f"/{file_id}"
 
+        logger.debug(
+            "TUS CREATE %s: filename=%s size=%d owner_id=%r retention=%s",
+            file_id[:8],
+            tus_metadata.filename,
+            upload_length,
+            owner_id,
+            retention,
+        )
+
         # Check for creation-with-upload extension
         body = await request.body()
         if body and "creation-with-upload" in capabilities.extensions:
@@ -340,6 +352,20 @@ def create_tus_router(
             if user_db and upload.owner_id:
                 await user_db.update_storage_used(upload.owner_id, upload.size)
                 await quota_svc.release(upload.owner_id, upload.size)
+                logger.debug(
+                    "TUS FINALIZE %s: owner_id=%d size=%d quota +%d",
+                    file_id[:8],
+                    upload.owner_id,
+                    upload.size,
+                    upload.size,
+                )
+            else:
+                logger.debug(
+                    "TUS FINALIZE %s: no quota update (owner_id=%r user_db=%s)",
+                    file_id[:8],
+                    upload.owner_id,
+                    "yes" if user_db else "no",
+                )
             await storage.finalize_upload(file_id)
 
         # ── Response ─────────────────────────────────────────
@@ -362,9 +388,29 @@ def create_tus_router(
             if upload.is_final:
                 # Already committed to DB — revert storage_used
                 await user_db.update_storage_used(upload.owner_id, -upload.size)
+                logger.debug(
+                    "TUS DELETE %s: reverted quota for owner_id=%d size=%d",
+                    file_id[:8],
+                    upload.owner_id,
+                    upload.size,
+                )
             else:
                 # Still in-flight — release the reservation
                 await quota_svc.release(upload.owner_id, upload.size)
+                logger.debug(
+                    "TUS DELETE %s: released reservation for owner_id=%d size=%d",
+                    file_id[:8],
+                    upload.owner_id,
+                    upload.size,
+                )
+        else:
+            logger.debug(
+                "TUS DELETE %s: no quota update (owner_id=%r user_db=%s is_final=%s)",
+                file_id[:8],
+                upload.owner_id,
+                "yes" if user_db else "no",
+                upload.is_final,
+            )
 
         await storage.delete_upload(file_id)
 

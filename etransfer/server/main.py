@@ -74,6 +74,43 @@ def _propagate_hot_changes(
         app.state.parsed_role_quotas = parsed
 
 
+async def _reconcile_storage_quotas(storage: TusStorage, user_db: Any) -> None:
+    """Reconcile SQL storage_used with actual files in state backend.
+
+    Runs once at startup. Scans completed files, groups sizes by owner_id,
+    and corrects any drift in the users table.
+    """
+    try:
+        files = await storage.list_files()
+        owner_sizes: dict[int, int] = {}
+        for f in files:
+            oid = f.get("owner_id")
+            if oid is not None:
+                owner_sizes[oid] = owner_sizes.get(oid, 0) + f.get("size", 0)
+
+        users = await user_db.list_users()
+        fixed = 0
+        for u in users:
+            actual = owner_sizes.get(u.id, 0)
+            if u.storage_used != actual:
+                logger.info(
+                    "Quota drift: user %s (%s) DB=%d actual=%d, correcting",
+                    u.id,
+                    u.username,
+                    u.storage_used,
+                    actual,
+                )
+                await user_db.recalculate_storage(u.id, actual)
+                fixed += 1
+
+        if fixed:
+            logger.info("Reconciled storage_used for %d user(s)", fixed)
+        else:
+            logger.info("Storage quotas consistent — no corrections needed")
+    except Exception:
+        logger.exception("Failed to reconcile storage quotas (non-fatal)")
+
+
 # ── Lazy proxies ─────────────────────────────────────────────
 # Proxies allow routers to be registered at import time while the
 # actual service instances are created during the startup event.
@@ -123,6 +160,14 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
     if settings is None:
         settings = load_server_settings()
+
+    # ── Configure logging level ──────────────────────────────
+    log_level = getattr(settings, "log_level", "INFO").upper()
+    numeric_level = getattr(logging, log_level, logging.INFO)
+    logging.getLogger("etransfer").setLevel(numeric_level)
+    # Also set root handler if none configured
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=numeric_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     app = FastAPI(
         title="ETransfer",
@@ -234,6 +279,9 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             app.state.user_db = _user_db
             logger.info("User system enabled (OIDC + %s)", settings.user_db_backend)
 
+            # Reconcile storage_used with actual files on disk / state backend
+            await _reconcile_storage_quotas(_storage, _user_db)
+
         # Background tasks
         asyncio.create_task(cleanup_loop(settings.cleanup_interval, lambda: _storage, lambda: _user_db))
         if settings.config_watch:
@@ -268,6 +316,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
     # ── Proxies ──────────────────────────────────────────────
     storage_proxy = _StorageProxy()
+    app.state.storage = storage_proxy
 
     # ── Register routes ──────────────────────────────────────
     tus_handler = TusHandler(storage_proxy, settings.max_upload_size)  # type: ignore[arg-type]

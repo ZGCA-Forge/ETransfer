@@ -182,6 +182,15 @@ def create_files_router(storage: TusStorage) -> APIRouter:
 
         filename = info["filename"]
         mime_type = info.get("mime_type", "application/octet-stream")
+
+        logger.debug(
+            "DOWNLOAD %s: filename=%s size=%d owner_id=%r retention=%s",
+            file_id[:8],
+            filename,
+            info.get("size", 0),
+            info.get("owner_id"),
+            info.get("retention", "permanent"),
+        )
         retention = info.get("retention", "permanent")
         is_chunked = info.get("chunked_storage", False)
 
@@ -304,6 +313,12 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     user_db = getattr(request.app.state, "user_db", None)
                     if user_db and owner_id:
                         await user_db.update_storage_used(owner_id, -file_size)
+                    logger.debug(
+                        "AUTO-DELETE %s after download: owner_id=%r size=%d",
+                        file_id[:8],
+                        owner_id,
+                        file_size,
+                    )
                     await storage.delete_upload(file_id)
 
             background_tasks.add_task(_after_download)
@@ -418,8 +433,22 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         owner_id = info.get("owner_id")
         file_size = info.get("size", 0)
         user_db = getattr(request.app.state, "user_db", None)
+        logger.debug(
+            "DELETE %s: filename=%s size=%d owner_id=%r user_db=%s",
+            file_id[:8],
+            info.get("filename"),
+            file_size,
+            owner_id,
+            "yes" if user_db else "no",
+        )
         if user_db and owner_id:
             await user_db.update_storage_used(owner_id, -file_size)
+            logger.debug(
+                "DELETE %s: quota -%d for owner_id=%r",
+                file_id[:8],
+                file_size,
+                owner_id,
+            )
 
         await storage.delete_upload(file_id)
         return {"status": "deleted", "file_id": file_id}

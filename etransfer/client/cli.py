@@ -248,6 +248,14 @@ def upload(
         "--retention-ttl",
         help="TTL in seconds (only for --retention ttl)",
     ),
+    threads: int = typer.Option(
+        4,
+        "--threads",
+        "-j",
+        help="Number of concurrent upload threads",
+        min=1,
+        max=32,
+    ),
     wait_on_quota: bool = typer.Option(
         True,
         "--wait-on-quota/--no-wait-on-quota",
@@ -274,7 +282,7 @@ def upload(
 
     # Build info text
     info_lines = f"[bold]{file_path.name}[/bold]\n"
-    info_lines += f"[dim]Size: {format_size(file_size)} | Chunk: {format_size(chunk_size)}[/dim]"
+    info_lines += f"[dim]Size: {format_size(file_size)} | Chunk: {format_size(chunk_size)} | Threads: {threads}[/dim]"
     if retention:
         label = {"permanent": "Permanent", "download_once": "Download Once", "ttl": f"TTL {retention_ttl}s"}
         info_lines += f"\n[dim]Retention: {label.get(retention, retention)}[/dim]"
@@ -306,6 +314,7 @@ def upload(
                 uploader = client.create_parallel_uploader(
                     str(file_path),
                     chunk_size=chunk_size,
+                    max_concurrent=threads,
                     progress_callback=update_progress,
                     retention=retention,
                     retention_ttl=retention_ttl,
@@ -615,6 +624,51 @@ def list_files(
 
     except Exception as e:
         print_error(f"Failed to list files: {e}")
+        raise typer.Exit(1)
+
+
+@app.command()
+def delete(
+    file_id: str = typer.Argument(..., help="File ID (or short prefix) to delete"),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Skip confirmation prompt",
+    ),
+) -> None:
+    """Delete a file from the server."""
+    server = _get_server_url()
+    token = token or _get_token()
+
+    try:
+        from etransfer.client.tus_client import EasyTransferClient
+
+        resolved_id = _resolve_file_id(file_id, server, token)
+
+        if not force:
+            confirm = typer.confirm(f"Delete file {resolved_id[:8]}..? This cannot be undone")
+            if not confirm:
+                print_warning("Cancelled.")
+                raise typer.Exit(0)
+
+        with console.status("[bold cyan]Deleting file...", spinner="dots"):
+            with EasyTransferClient(server, token=token) as client:
+                client.delete_file(resolved_id)
+
+        print_success(f"File [bold]{resolved_id[:8]}[/bold].. deleted")
+
+    except typer.Exit:
+        raise
+    except Exception as e:
+        print_error(f"Failed to delete file: {e}")
         raise typer.Exit(1)
 
 
@@ -988,6 +1042,149 @@ def logout() -> None:
         legacy_session.unlink()
 
     print_success("Logged out")
+
+
+@app.command()
+def quota(
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Show current user's storage quota and usage."""
+    import httpx
+
+    server = _get_server_url()
+    token = token or _get_token()
+    if not token:
+        print_error("Not logged in. Run [bold]etransfer login[/bold] first.")
+        raise typer.Exit(1)
+
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        with console.status("[bold cyan]Fetching quota...", spinner="dots"):
+            r = httpx.get(f"{server}/api/users/me/quota", headers=headers, timeout=10)
+            r.raise_for_status()
+
+        data = r.json()
+        used = data.get("storage_used", 0)
+        q = data.get("quota", {})
+        max_storage = q.get("max_storage_size")
+        pct = data.get("usage_percent")
+
+        info_text = f"[bold]Used:[/bold] {format_size(used)}"
+        if max_storage:
+            info_text += f" / {format_size(max_storage)}"
+        if pct is not None:
+            color = "green" if pct < 80 else ("yellow" if pct < 95 else "red")
+            bar_width = 20
+            filled = int(bar_width * pct / 100)
+            bar = "█" * filled + "░" * (bar_width - filled)
+            info_text += f"\n[{color}]{bar}[/{color}] {pct:.1f}%"
+        else:
+            info_text += "\n[dim]No storage limit[/dim]"
+
+        if data.get("is_over_quota"):
+            info_text += "\n[bold red]⚠ Over quota![/bold red]"
+
+        console.print(
+            Panel(
+                info_text,
+                title="[bold cyan]📊 Storage Quota[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            print_error("Session expired. Run [bold]etransfer login[/bold].")
+        else:
+            print_error(f"Failed: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Failed: {e}")
+        raise typer.Exit(1)
+
+
+@app.command("recalculate-quota")
+def recalculate_quota(
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Recalculate storage quota for all users (admin only).
+
+    Scans actual files on the server and updates each user's
+    storage_used in the database.
+    """
+    import httpx
+
+    server = _get_server_url()
+    token = token or _get_token()
+    if not token:
+        print_error("Not logged in. Run [bold]etransfer login[/bold] first.")
+        raise typer.Exit(1)
+
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        with console.status("[bold cyan]Recalculating storage...", spinner="dots"):
+            r = httpx.post(
+                f"{server}/api/admin/recalculate-storage",
+                headers=headers,
+                timeout=30,
+            )
+            r.raise_for_status()
+
+        data = r.json()
+        updated = data.get("updated", [])
+        total_files = data.get("total_files", 0)
+        orphan = data.get("orphan_bytes", 0)
+
+        if updated:
+            from rich.table import Table
+
+            table = Table(
+                title="[bold cyan]Updated Users[/bold cyan]",
+                show_header=True,
+                header_style="bold magenta",
+                border_style="cyan",
+            )
+            table.add_column("User", style="white")
+            table.add_column("Before", justify="right", style="red")
+            table.add_column("After", justify="right", style="green")
+
+            for u in updated:
+                table.add_row(
+                    u.get("username", str(u.get("user_id"))),
+                    format_size(u.get("old", 0)),
+                    format_size(u.get("new", 0)),
+                )
+            console.print(table)
+        else:
+            print_info("All users already have correct storage_used values")
+
+        print_success(f"Scanned {total_files} files, updated {len(updated)} users")
+        if orphan:
+            print_warning(f"Orphan files (no owner): {format_size(orphan)}")
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            print_error("Session expired. Run [bold]etransfer login[/bold].")
+        elif e.response.status_code == 403:
+            print_error("Admin access required.")
+        else:
+            print_error(f"Failed: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Failed: {e}")
+        raise typer.Exit(1)
 
 
 @app.command("status")

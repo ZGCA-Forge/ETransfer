@@ -194,6 +194,14 @@ class ServerSettings(BaseSettings):
     cleanup_interval: int = Field(3600, description="Cleanup interval in seconds")
     upload_expiration_hours: int = Field(24, description="Hours before incomplete uploads expire")
 
+    # Logging
+    log_level: str = Field(
+        "INFO",
+        description="Log level: DEBUG, INFO, WARNING, ERROR. "
+        "DEBUG prints detailed upload/download/delete operations. "
+        "Env: ETRANSFER_LOG_LEVEL",
+    )
+
     # Config file watching (hot-reload)
     config_watch: bool = Field(
         False,
@@ -301,6 +309,14 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
         for key in ("host", "port", "user", "password", "database"):
             if key in mysql:
                 d[f"mysql_{key}"] = mysql[key]
+
+    # Logging — accept `logging.level` or top-level `log_level`
+    if "logging" in config:
+        lg = config["logging"]
+        if "level" in lg:
+            d["log_level"] = lg["level"]
+    if "log_level" in config:
+        d["log_level"] = config["log_level"]
 
     return d
 

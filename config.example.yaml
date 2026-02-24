@@ -101,6 +101,12 @@ cors:
   origins:
     - "*"
 
+# Logging
+# level: DEBUG prints upload/download/delete details with owner_id and quota changes
+# level: INFO (default) prints startup info and quota reconciliation
+logging:
+  level: INFO
+
 # Cleanup
 # cleanup_interval: 3600
 # upload_expiration_hours: 24

@@ -459,6 +459,57 @@ def create_user_router(
         await user_db.remove_user_from_group(user_id, group_id)
         return {"message": "User removed from group"}
 
+    # ── Admin: recalculate storage ─────────────────────────────
+
+    @router.post("/api/admin/recalculate-storage")
+    async def recalculate_all_storage(request: Request) -> dict[str, Any]:
+        """Recalculate storage_used for all users based on actual files.
+
+        Scans all files in storage, groups by owner_id, and updates
+        each user's storage_used in the database. Admin only.
+        """
+        await _require_admin(request)
+
+        storage = getattr(request.app.state, "storage", None)
+        if not storage:
+            raise HTTPException(500, "Storage not available")
+
+        # Gather actual file sizes per owner — completed files
+        files = await storage.list_files()
+        owner_sizes: dict[int, int] = {}
+        orphan_size = 0
+        for f in files:
+            oid = f.get("owner_id")
+            size = f.get("size", 0)
+            if oid is not None:
+                owner_sizes[oid] = owner_sizes.get(oid, 0) + size
+            else:
+                orphan_size += size
+
+        # Update each user
+        updated = []
+        users = await user_db.list_users()
+        for u in users:
+            actual = owner_sizes.get(u.id, 0)  # type: ignore[arg-type]
+            if u.storage_used != actual:
+                old = u.storage_used
+                await user_db.recalculate_storage(u.id, actual)  # type: ignore[arg-type]
+                updated.append(
+                    {
+                        "user_id": u.id,
+                        "username": u.username,
+                        "old": old,
+                        "new": actual,
+                    }
+                )
+
+        return {
+            "message": f"Recalculated {len(updated)} users",
+            "updated": updated,
+            "orphan_bytes": orphan_size,
+            "total_files": len(files),
+        }
+
     # ── Quota check endpoint ───────────────────────────────────
 
     @router.get("/api/users/me/quota")

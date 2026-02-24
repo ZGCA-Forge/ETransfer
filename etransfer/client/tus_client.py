@@ -94,7 +94,8 @@ class EasyTransferClient(TusClient):
     def delete_file(self, file_id: str) -> bool:
         """Delete a file."""
         resp = self._http.delete(f"/api/files/{file_id}")
-        return resp.status_code == 204
+        resp.raise_for_status()
+        return resp.status_code in (200, 204)
 
     def get_download_url(self, file_id: str) -> str:
         """Get the download URL for a file."""
