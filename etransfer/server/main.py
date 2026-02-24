@@ -367,14 +367,39 @@ def run_server(
         )
         raise SystemExit(1)
 
-    app = create_app(settings)
+    if settings.workers > 1:
+        # Multi-worker mode: uvicorn needs an import string to fork workers.
+        # Pass CLI overrides via env vars so each worker's create_app() picks
+        # them up through load_server_settings() / pydantic env_prefix.
+        import os
 
-    uvicorn.run(
-        app,
-        host=settings.host,
-        port=settings.port,
-        workers=settings.workers,
-    )
+        if config_path is not None:
+            os.environ["ETRANSFER_CONFIG"] = str(Path(config_path).resolve())
+        if host is not None:
+            os.environ["ETRANSFER_HOST"] = host
+        if port is not None:
+            os.environ["ETRANSFER_PORT"] = str(port)
+        if storage_path is not None:
+            os.environ["ETRANSFER_STORAGE_PATH"] = str(storage_path)
+        if state_backend is not None:
+            os.environ["ETRANSFER_STATE_BACKEND"] = state_backend
+        if redis_url is not None:
+            os.environ["ETRANSFER_REDIS_URL"] = redis_url
+
+        uvicorn.run(
+            "etransfer.server.main:app",
+            host=settings.host,
+            port=settings.port,
+            workers=settings.workers,
+        )
+    else:
+        app = create_app(settings)
+
+        uvicorn.run(
+            app,
+            host=settings.host,
+            port=settings.port,
+        )
 
 
 # For uvicorn command line: uvicorn etransfer.server.main:app

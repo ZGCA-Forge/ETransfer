@@ -368,6 +368,36 @@ def upload(
         raise typer.Exit(1)
 
 
+def _resolve_file_id(prefix: str, server: str, token: Optional[str]) -> str:
+    """Resolve a short file ID prefix to the full ID by querying the server.
+
+    If the prefix is already 32 chars (full hex UUID without dashes), return as-is.
+    Otherwise, list files and find a unique match.
+    """
+    if len(prefix) >= 32:
+        return prefix
+
+    from etransfer.client.tus_client import EasyTransferClient
+
+    with EasyTransferClient(server, token=token) as client:
+        # Fetch enough files to find a match (all pages would be ideal,
+        # but a reasonable page size covers most cases)
+        files = client.list_files(page=1, page_size=200, include_partial=True)
+
+    matches = [f["file_id"] for f in files if f.get("file_id", "").startswith(prefix)]
+
+    if len(matches) == 1:
+        return matches[0]
+    elif len(matches) == 0:
+        print_error(f"No file found matching prefix [bold]{prefix}[/bold]")
+        raise typer.Exit(1)
+    else:
+        print_error(f"Ambiguous prefix [bold]{prefix}[/bold] — matches {len(matches)} files:")
+        for m in matches[:10]:
+            console.print(f"  [dim]{m[:6]}.. {m}[/dim]")
+        raise typer.Exit(1)
+
+
 @app.command()
 def download(
     file_id: str = typer.Argument(..., help="File ID to download"),
@@ -393,6 +423,9 @@ def download(
     """Download a file from the server."""
     server = _get_server_url()
     token = token or _get_token()
+
+    # Resolve short ID prefix to full ID
+    file_id = _resolve_file_id(file_id, server, token)
 
     try:
         from etransfer.client.downloader import ChunkDownloader
@@ -516,9 +549,10 @@ def list_files(
             header_style="bold magenta",
             border_style="cyan",
         )
-        table.add_column("ID", style="dim", width=12)
+        table.add_column("ID", style="dim", width=8)
         table.add_column("Filename", style="white")
         table.add_column("Size", justify="right", style="green")
+        table.add_column("Time", style="dim", width=17)
         table.add_column("Progress", justify="right")
         table.add_column("Status", justify="center")
         table.add_column("Retention", justify="center", style="dim")
@@ -548,10 +582,29 @@ def list_files(
             }
             retention_str = retention_labels.get(retention, retention)
 
+            # Format created_at
+            raw_time = f.get("created_at", "")
+            if raw_time:
+                try:
+                    from datetime import datetime as _dt
+
+                    if isinstance(raw_time, str):
+                        # Handle ISO format with or without timezone
+                        ts = raw_time.replace("Z", "+00:00")
+                        dt = _dt.fromisoformat(ts)
+                    else:
+                        dt = raw_time
+                    time_str = dt.strftime("%y-%m-%d %H:%M:%S")
+                except Exception:
+                    time_str = str(raw_time)[:17]
+            else:
+                time_str = ""
+
             table.add_row(
-                f.get("file_id", "")[:10] + "..",
+                f.get("file_id", "")[:6] + "..",
                 f.get("filename", "unknown"),
                 format_size(f.get("size", 0)),
+                time_str,
                 progress_str,
                 status,
                 retention_str,
