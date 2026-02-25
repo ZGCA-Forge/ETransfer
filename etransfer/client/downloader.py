@@ -76,6 +76,18 @@ class ChunkDownloader:
         # Primary client for metadata queries (always first endpoint)
         self._client = self._clients[0]
 
+        # Cancellation support
+        self._cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        """Signal cancellation and close all HTTP clients to abort in-flight requests."""
+        self._cancelled.set()
+        for c in self._clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     @staticmethod
     def _local_cache_for(output_path: Path, size_hint: int = 0) -> LocalCache:
         """Create a ``LocalCache`` rooted next to *output_path*.
@@ -408,7 +420,7 @@ class ChunkDownloader:
 
         def _download_worker(http: httpx.Client) -> bool:
             nonlocal downloaded_bytes
-            while True:
+            while not self._cancelled.is_set():
                 with _iter_lock:
                     idx = next(_chunk_iter, None)
                 if idx is None:
@@ -427,6 +439,8 @@ class ChunkDownloader:
                         if progress_callback:
                             progress_callback(downloaded_bytes, total_size)
                 except Exception as e:
+                    if self._cancelled.is_set():
+                        return True
                     print(f"Error downloading chunk {idx}: {e}")
                     return False
             return True
@@ -475,7 +489,7 @@ class ChunkDownloader:
 
         def _download_worker(http: httpx.Client) -> bool:
             nonlocal downloaded_bytes
-            while True:
+            while not self._cancelled.is_set():
                 with _iter_lock:
                     idx = next(_chunk_iter, None)
                 if idx is None:
@@ -493,6 +507,8 @@ class ChunkDownloader:
                         if progress_callback:
                             progress_callback(downloaded_bytes, total_size)
                 except Exception as e:
+                    if self._cancelled.is_set():
+                        return True
                     print(f"Error downloading chunk {idx}: {e}")
                     return False
             return True
@@ -603,7 +619,7 @@ class ChunkDownloader:
         total_size = 0
         cache: Optional[LocalCache] = None
 
-        while True:
+        while not self._cancelled.is_set():
             info = self.get_file_info(file_id)
             total_size = info.size
             available = info.available_size
@@ -653,8 +669,13 @@ class ChunkDownloader:
                                 if progress_callback:
                                     progress_callback(downloaded_bytes, total_size)
                             except Exception as e:
+                                if self._cancelled.is_set():
+                                    break
                                 print(f"Error downloading chunk {futures[future]}: {e}")
                                 return False
+
+            if self._cancelled.is_set():
+                break
 
             if is_complete and downloaded_bytes >= total_size:
                 break
@@ -702,7 +723,7 @@ class ChunkDownloader:
         path_str = str(output_path)
 
         try:
-            while True:
+            while not self._cancelled.is_set():
                 try:
                     info = self.get_file_info(file_id)
                 except httpx.HTTPStatusError as e:
@@ -773,6 +794,8 @@ class ChunkDownloader:
                     _lock = threading.Lock()
 
                     def _write_chunk(idx: int) -> int:
+                        if self._cancelled.is_set():
+                            return 0
                         http = self._clients[idx % len(self._clients)]
                         data = self.download_chunk(
                             file_id,
@@ -796,6 +819,8 @@ class ChunkDownloader:
                                     if progress_callback:
                                         progress_callback(downloaded_bytes, total_size)
                             except Exception as e:
+                                if self._cancelled.is_set():
+                                    break
                                 print(f"Error downloading chunk {futures[future]}: {e}")
                                 return False
 

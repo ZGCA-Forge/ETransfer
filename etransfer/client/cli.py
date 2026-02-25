@@ -914,26 +914,45 @@ def download(
                     f"available (upload in progress) — will follow upload"
                 )
 
-        with create_transfer_progress() as progress:
-            task = progress.add_task("[cyan]Downloading", total=info.size if is_partial else info.available_size)
-            start_time = time.time()
+        import signal
 
-            def update_progress(downloaded: int, total: int) -> None:
-                progress.update(task, completed=downloaded, total=total)
+        _prev_sig = signal.getsignal(signal.SIGINT)
 
-            if is_partial:
-                success = downloader.download_file_follow(
-                    file_id,
-                    output_path,
-                    progress_callback=update_progress,
-                )
-            else:
-                success = downloader.download_file(
-                    file_id,
-                    output_path,
-                    progress_callback=update_progress,
-                    skip_chunks=_have_set if _have_set else None,
-                )
+        def _download_sigint(signum: int, frame: object) -> None:
+            downloader.cancel()
+            print("\n\x1b[33m⚠ Cancelling download...\x1b[0m", flush=True)
+
+        signal.signal(signal.SIGINT, _download_sigint)
+
+        try:
+            with create_transfer_progress() as progress:
+                task = progress.add_task("[cyan]Downloading", total=info.size if is_partial else info.available_size)
+                start_time = time.time()
+
+                def update_progress(downloaded: int, total: int) -> None:
+                    progress.update(task, completed=downloaded, total=total)
+
+                if is_partial:
+                    success = downloader.download_file_follow(
+                        file_id,
+                        output_path,
+                        progress_callback=update_progress,
+                    )
+                else:
+                    success = downloader.download_file(
+                        file_id,
+                        output_path,
+                        progress_callback=update_progress,
+                        skip_chunks=_have_set if _have_set else None,
+                    )
+        finally:
+            signal.signal(signal.SIGINT, _prev_sig)
+
+        if downloader._cancelled.is_set():
+            console.print()
+            print_warning("Download cancelled.")
+            console.print(f"   [dim]Resume: re-run [bold]et download {file_id[:8]}[/bold][/dim]")
+            raise typer.Exit(130)
 
         elapsed = time.time() - start_time
         final_size = info.size if is_partial else info.available_size

@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -462,6 +463,14 @@ def create_tus_router(
             # Write failed — release the reservation we just made
             if patch_owner_id:
                 await quota_svc.release(patch_owner_id, content_length)
+            # Clean up partial chunk file for chunked storage
+            if upload_record and upload_record.chunked_storage:
+                chunk_index = offset // upload_record.chunk_size
+                try:
+                    chunk_path = storage.get_chunk_path(file_id, chunk_index)
+                    os.remove(chunk_path)
+                except (FileNotFoundError, OSError):
+                    pass
             raise
 
         # Adjust reservation if fewer bytes were actually written

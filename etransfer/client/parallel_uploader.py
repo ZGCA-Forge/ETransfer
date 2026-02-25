@@ -271,6 +271,13 @@ class ParallelUploader:
 
         def _sigint_handler(signum: int, frame: Any) -> None:
             self._cancelled.set()
+            print("\n\x1b[33m⚠ Cancelling upload...\x1b[0m", flush=True)
+            # Close all HTTP clients to abort in-flight PATCH requests
+            for _c, _ in clients:
+                try:
+                    _c.close()
+                except Exception:
+                    pass
 
         signal.signal(signal.SIGINT, _sigint_handler)
 
@@ -393,6 +400,10 @@ class ParallelUploader:
                 else:
                     last_exc = RuntimeError(f"PATCH {offset} failed: HTTP {resp.status_code} {resp.text[:200]}")
             except Exception as e:
+                if self._cancelled.is_set():
+                    return
                 last_exc = e
 
+        if self._cancelled.is_set():
+            return
         raise RuntimeError(f"Chunk at offset {offset} failed after {self.retries} retries") from last_exc

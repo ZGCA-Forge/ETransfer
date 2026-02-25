@@ -315,11 +315,31 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                 "X-Retention-Policy": retention,
             }
 
-            # For download_once: delete chunk after sending
+            # For download_once: stream in sub-chunks and only consume
+            # (delete) the chunk after the entire response is delivered.
+            # If the client disconnects mid-transfer, the chunk is preserved.
             if retention == "download_once":
                 headers["X-Retention-Warning"] = "Chunk will be deleted after download"
+                _fully_sent = False
 
-                async def _delete_chunk() -> None:
+                async def _stream_once_chunk() -> AsyncIterator[bytes]:
+                    nonlocal _fully_sent
+                    _sub_buf = 1024 * 1024  # 1 MB sub-chunks
+                    for _i in range(0, len(data), _sub_buf):
+                        piece = data[_i : _i + _sub_buf]
+                        if _dl_limiter:
+                            await _dl_limiter.consume(len(piece))
+                        yield piece
+                    _fully_sent = True
+
+                async def _maybe_delete_chunk() -> None:
+                    if not _fully_sent:
+                        logger.info(
+                            "DOWNLOAD %s chunk %d: client disconnected, preserving chunk",
+                            file_id[:8],
+                            chunk,  # type: ignore[arg-type]
+                        )
+                        return
                     await storage.delete_chunk_file(file_id, chunk)  # type: ignore[arg-type]
                     # Release per-chunk quota
                     owner_id = info.get("owner_id")
@@ -337,7 +357,14 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                         await storage.record_download(file_id)
                         await storage.delete_upload(file_id)
 
-                background_tasks.add_task(_delete_chunk)
+                background_tasks.add_task(_maybe_delete_chunk)
+
+                return StreamingResponse(
+                    _stream_once_chunk(),
+                    status_code=200,
+                    media_type=mime_type,
+                    headers=headers,
+                )
 
             if _dl_limiter:
 
