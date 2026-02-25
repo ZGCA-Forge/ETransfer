@@ -6,7 +6,7 @@ import os
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -18,6 +18,21 @@ from etransfer.common.fileutil import pwrite
 from etransfer.common.models import DownloadInfo
 
 logger = logging.getLogger("etransfer.client.downloader")
+
+
+def _wait_futures(futures: list) -> list:
+    """Yield completed futures, using short timeouts to allow KeyboardInterrupt on Windows.
+
+    On Windows, ``future.result()`` blocks in C-level threading primitives
+    that swallow SIGINT.  By using ``wait(timeout=0.5)`` the main thread
+    periodically runs Python bytecode so Ctrl+C is delivered.
+    """
+    pending = set(futures)
+    done_ordered: list = []
+    while pending:
+        done, pending = wait(pending, timeout=0.5)
+        done_ordered.extend(done)
+    return done_ordered
 
 
 class ChunkDownloader:
@@ -217,6 +232,7 @@ class ChunkDownloader:
         output_path: Path,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         use_cache: bool = True,
+        skip_chunks: Optional[set[int]] = None,
     ) -> bool:
         """Download a file with chunked transfer and automatic resume.
 
@@ -233,6 +249,7 @@ class ChunkDownloader:
             output_path: Output file path
             progress_callback: Progress callback (downloaded_bytes, total_bytes)
             use_cache: Use local chunk cache
+            skip_chunks: Chunk indices already on disk (skip download)
 
         Returns:
             True if download successful
@@ -264,9 +281,13 @@ class ChunkDownloader:
                 total_chunks,
                 progress_callback,
                 use_cache,
+                skip_chunks=skip_chunks,
             )
+            # Only clean up .part/ if ALL chunks are present
             if success:
-                self._cleanup_part_dir(part_dir)
+                all_present = self.load_downloaded_chunks(part_dir)
+                if len(all_present) >= total_chunks:
+                    self._cleanup_part_dir(part_dir)
             return success
 
         # Range mode: standard download — always use cache for resume
@@ -312,6 +333,26 @@ class ChunkDownloader:
         return success
 
     @staticmethod
+    def _save_downloaded_chunks(part_dir: Path, chunks: set[int]) -> None:
+        """Persist downloaded chunk indices to ``.part/chunks.json``."""
+        part_dir.mkdir(parents=True, exist_ok=True)
+        (part_dir / "chunks.json").write_text(
+            json.dumps(sorted(chunks)),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def load_downloaded_chunks(part_dir: Path) -> set[int]:
+        """Load previously downloaded chunk indices from ``.part/chunks.json``."""
+        p = part_dir / "chunks.json"
+        if not p.exists():
+            return set()
+        try:
+            return set(json.loads(p.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
+
+    @staticmethod
     def _cleanup_part_dir(part_dir: Path) -> None:
         """Remove the ``.part/`` folder after successful download."""
         try:
@@ -328,30 +369,42 @@ class ChunkDownloader:
         total_chunks: int,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         use_cache: bool = True,
+        skip_chunks: Optional[set[int]] = None,
     ) -> bool:
         """Download a file using chunk-index mode (?chunk=N).
 
         Each chunk is requested by index; server deletes download_once
         chunks after serving them.
+
+        *skip_chunks* — indices already on disk (from a previous partial
+        download).  Those are counted towards progress but not re-fetched.
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         path_str = str(output_path)
+        part_dir = self._part_dir_for(output_path)
 
-        # Pre-allocate sparse file
-        with open(output_path, "wb") as f:
-            if total_size > 0:
-                f.seek(total_size - 1)
-                f.write(b"\0")
+        skip = skip_chunks or set()
+        target_indices = [i for i in range(total_chunks) if i not in skip]
 
-        downloaded_bytes = 0
+        # Pre-allocate sparse file (skip if already exists at correct size — resume)
+        if not output_path.exists() or output_path.stat().st_size != total_size:
+            with open(output_path, "wb") as f:
+                if total_size > 0:
+                    f.seek(total_size - 1)
+                    f.write(b"\0")
+
+        # Account for already-downloaded chunks in progress
+        downloaded_bytes = len(skip) * chunk_size
+        if progress_callback and skip:
+            progress_callback(downloaded_bytes, total_size)
+
         _lock = threading.Lock()
-        _chunk_iter = iter(range(total_chunks))
+        _chunk_iter = iter(target_indices)
         _iter_lock = threading.Lock()
+        _downloaded_set = set(skip)
 
         fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0)) if self.use_pwrite else -1
-        # For pwrite: fd is shared (pwrite is thread-safe)
-        # For seek+write: each worker opens its own handle via _write_at
 
         def _download_worker(http: httpx.Client) -> bool:
             nonlocal downloaded_bytes
@@ -370,6 +423,7 @@ class ChunkDownloader:
                     self._write_at(fd if self.use_pwrite else path_str, data, idx * chunk_size)
                     with _lock:
                         downloaded_bytes += len(data)
+                        _downloaded_set.add(idx)
                         if progress_callback:
                             progress_callback(downloaded_bytes, total_size)
                 except Exception as e:
@@ -383,12 +437,14 @@ class ChunkDownloader:
                     executor.submit(_download_worker, self._clients[i % len(self._clients)])
                     for i in range(self.max_concurrent)
                 ]
-                for fut in futures:
+                for fut in _wait_futures(futures):
                     if not fut.result():
                         return False
         finally:
             if self.use_pwrite and fd != -1:
                 os.close(fd)
+            # Persist progress for resume
+            self._save_downloaded_chunks(part_dir, _downloaded_set)
 
         return True
 
@@ -451,7 +507,7 @@ class ChunkDownloader:
                     )
                     for i in range(self.max_concurrent)
                 ]
-                for future in futures:
+                for future in _wait_futures(futures):
                     if not future.result():
                         return False
         finally:
@@ -589,7 +645,7 @@ class ChunkDownloader:
                             for i in new_indices
                         }
 
-                        for future in futures:
+                        for future in _wait_futures(list(futures.keys())):
                             try:
                                 chunk_data = future.result()
                                 downloaded_chunks.add(futures[future])
@@ -634,7 +690,10 @@ class ChunkDownloader:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        downloaded_chunks: set[int] = set()
+        part_dir = self._part_dir_for(output_path)
+
+        # Resume: load previously downloaded chunk indices
+        downloaded_chunks: set[int] = self.load_downloaded_chunks(part_dir)
         downloaded_bytes = 0
         total_size = 0
         chunk_size = self.chunk_size
@@ -660,6 +719,12 @@ class ChunkDownloader:
                 is_upload_complete = getattr(info, "is_upload_complete", False)
                 chunks_consumed = getattr(info, "chunks_consumed", 0)
                 upload_active = getattr(info, "upload_active", True)
+
+                # Update downloaded_bytes from resume state (first iteration)
+                if downloaded_chunks and downloaded_bytes == 0:
+                    downloaded_bytes = len(downloaded_chunks) * chunk_size
+                    if progress_callback:
+                        progress_callback(downloaded_bytes, total_size)
 
                 logger.debug(
                     "chunked poll: avail_chunks=%d total_chunks=%d downloaded=%d "
@@ -690,17 +755,18 @@ class ChunkDownloader:
                     )
                     return False
 
-                # Pre-allocate file on first iteration
+                # Pre-allocate file on first iteration (skip if file already exists from resume)
                 if fd == -1 and total_size > 0:
-                    with open(output_path, "wb") as f:
-                        f.seek(total_size - 1)
-                        f.write(b"\0")
+                    if not output_path.exists() or output_path.stat().st_size != total_size:
+                        with open(output_path, "wb") as f:
+                            f.seek(total_size - 1)
+                            f.write(b"\0")
                     if self.use_pwrite:
                         fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0))
                     else:
                         fd = 0  # sentinel: file created but no fd needed
 
-                # Find new chunks to download
+                # Find new chunks to download (skip already-downloaded)
                 new_chunks = [c for c in available if c not in downloaded_chunks]
 
                 if new_chunks:
@@ -720,7 +786,7 @@ class ChunkDownloader:
                     with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
                         futures = {executor.submit(_write_chunk, idx): idx for idx in new_chunks}
 
-                        for future in futures:
+                        for future in _wait_futures(list(futures.keys())):
                             try:
                                 size = future.result()
                                 idx = futures[future]
@@ -732,6 +798,9 @@ class ChunkDownloader:
                             except Exception as e:
                                 print(f"Error downloading chunk {futures[future]}: {e}")
                                 return False
+
+                    # Persist progress for resume
+                    self._save_downloaded_chunks(part_dir, downloaded_chunks)
 
                 # Done when all chunks downloaded
                 if len(downloaded_chunks) >= total_chunks and is_upload_complete:

@@ -454,7 +454,7 @@ def upload(
         )
         console.print(panel)
 
-        console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
+        console.print("[dim]  Press [bold]Ctrl+C[/bold] to cancel[/dim]")
 
         with create_transfer_progress() as progress:
             task = progress.add_task("[cyan]Uploading", total=file_size)
@@ -464,36 +464,6 @@ def upload(
                 progress.update(task, completed=uploaded)
 
             uploader.progress_callback = update_progress
-
-            # Interactive input listener thread
-            def _input_listener() -> None:
-                while not uploader._cancelled.is_set():
-                    try:
-                        line = sys.stdin.readline()
-                        if not line:
-                            continue
-                        cmd = line.strip().lower()
-                        if cmd in ("q", "quit", "cancel"):
-                            uploader._cancelled.set()
-                            return
-                        elif cmd in ("s", "status"):
-                            elapsed_now = time.time() - start_time
-                            uploaded = uploader._uploaded_bytes
-                            pct = (uploaded / file_size * 100) if file_size else 100
-                            spd = uploaded / elapsed_now if elapsed_now > 0 else 0
-                            console.print(
-                                f"\n[bold cyan]Status:[/bold cyan] "
-                                f"{format_size(uploaded)}/{format_size(file_size)} "
-                                f"({pct:.1f}%) | "
-                                f"{format_size(int(spd))}/s | "
-                                f"{elapsed_now:.0f}s elapsed"
-                            )
-                    except Exception:
-                        return
-
-            input_thread = threading.Thread(target=_input_listener, daemon=True)
-            input_thread.start()
-
             uploader.upload()
 
         client.close()
@@ -651,7 +621,7 @@ def reupload(
         f"already uploaded {format_size(uploaded_size)} ({progress_pct:.0f}%)[/dim]"
     )
     console.print(Panel(info_lines, title="[bold cyan]Re-upload[/bold cyan]", border_style="yellow"))
-    console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
+    console.print("[dim]  Press [bold]Ctrl+C[/bold] to cancel[/dim]")
 
     try:
         with create_transfer_progress() as progress:
@@ -670,36 +640,6 @@ def reupload(
                     wait_on_quota=wait_on_quota,
                     resume_url=resume_url,
                 )
-
-                # Interactive input listener thread
-                def _input_listener() -> None:
-                    while not uploader._cancelled.is_set():
-                        try:
-                            line = sys.stdin.readline()
-                            if not line:
-                                continue
-                            cmd = line.strip().lower()
-                            if cmd in ("q", "quit", "cancel"):
-                                uploader._cancelled.set()
-                                return
-                            elif cmd in ("s", "status"):
-                                elapsed_now = time.time() - start_time
-                                uploaded = uploader._uploaded_bytes
-                                pct = (uploaded / local_size * 100) if local_size else 100
-                                spd = uploaded / elapsed_now if elapsed_now > 0 else 0
-                                console.print(
-                                    f"\n[bold cyan]Status:[/bold cyan] "
-                                    f"{format_size(uploaded)}/{format_size(local_size)} "
-                                    f"({pct:.1f}%) | "
-                                    f"{format_size(int(spd))}/s | "
-                                    f"{elapsed_now:.0f}s elapsed"
-                                )
-                        except Exception:
-                            return
-
-                input_thread = threading.Thread(target=_input_listener, daemon=True)
-                input_thread.start()
-
                 location = uploader.upload()
 
         elapsed = time.time() - start_time
@@ -768,7 +708,13 @@ def download(
         None,
         "--output",
         "-o",
-        help="Output directory or file path",
+        help="Output file path (rename)",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "--path",
+        "-p",
+        help="Output directory",
     ),
 ) -> None:
     """Download a file from the server.
@@ -783,13 +729,14 @@ def download(
         console.print("[bold]Arguments:[/bold]")
         console.print("  FILE_ID                  File ID or short prefix (e.g. 6a9111db)\n")
         console.print("[bold]Options:[/bold]")
-        console.print("  -o, --output PATH        Output directory or file path [default: current dir]")
+        console.print("  -o, --output PATH        Output file path (rename) [default: original name]")
+        console.print("  -p, --path DIR           Output directory [default: current dir]")
         console.print("  -t, --token TEXT         API token (overrides saved session)")
         console.print()
         console.print("[bold]Examples:[/bold]")
-        console.print("  [dim]et download 6a9111db[/dim]                  # download to current dir")
-        console.print("  [dim]et download 6a9111db -o ~/Downloads[/dim]   # download to specific dir")
-        console.print("  [dim]et download 6a91 -o myfile.zip[/dim]        # short prefix + rename")
+        console.print("  [dim]et download 6a9111db[/dim]                    # download to current dir")
+        console.print("  [dim]et download 6a9111db -p ~/Downloads[/dim]     # download to specific dir")
+        console.print("  [dim]et download 6a91 -o myfile.zip[/dim]          # short prefix + rename")
         console.print()
         console.print("[bold]Resume:[/bold]")
         console.print("  [dim]Interrupted downloads are resumed automatically.[/dim]")
@@ -815,14 +762,20 @@ def download(
         info = downloader.get_file_info(file_id)
 
         # Determine output path
-        if output is None:
-            output_path = Path.cwd() / info.filename
-        elif output.is_dir():
-            output_path = output / info.filename
-        else:
+        # -o: always a file path (rename)
+        # -p: always a directory
+        # Neither: current working directory
+        if output is not None:
+            # -o = explicit file path
             output_path = output
+        elif output_dir is not None:
+            # -p = explicit directory
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / info.filename
+        else:
+            output_path = Path.cwd() / info.filename
 
-        # Auto-detect resume from .part/ folder
+        # Auto-detect resume from .part/ folder (cache-based or chunked-follow)
         part_dir = downloader._part_dir_for(output_path)
         resuming = False
         cached_count = 0
@@ -831,6 +784,9 @@ def download(
             if part_meta and part_meta.get("file_id") == file_id:
                 cache = downloader._local_cache_for(output_path)
                 cached_count = len(cache.get_cached_chunks(file_id))
+                # Also check chunked-follow state
+                chunked_count = len(downloader.load_downloaded_chunks(part_dir))
+                cached_count = max(cached_count, chunked_count)
                 if cached_count > 0:
                     resuming = True
 
@@ -889,37 +845,49 @@ def download(
         _chunks_consumed = getattr(info, "chunks_consumed", 0)
         _upload_active = getattr(info, "upload_active", True)
 
-        # Block: next needed chunk was consumed (download_once) — can't continue
+        # Analyse chunk state for download_once files
+        _have_set: set[int] = set()
+        _lost_count = 0
+        _tc = 0
         if _chunks_consumed > 0 and info.chunked_storage and info.available_chunks is not None:
             _chunk_sz = info.chunk_size or downloader.chunk_size
             _tc = info.total_chunks or ((info.size + _chunk_sz - 1) // _chunk_sz if info.size else 1)
             _avail_set = set(info.available_chunks)
 
-            # Determine first chunk we still need
+            # Determine what we already have locally
             if resuming:
                 _cache = downloader._local_cache_for(output_path)
-                _cached_set = set(_cache.get_cached_chunks(file_id))
-                _first_needed = next((i for i in range(_tc) if i not in _cached_set), None)
-            else:
-                _first_needed = 0
+                _have_set = set(_cache.get_cached_chunks(file_id))
+            _part = downloader._part_dir_for(output_path)
+            _have_set |= downloader.load_downloaded_chunks(_part)
 
-            # A chunk was consumed if it's not available AND its index is
-            # below the upload frontier (avail + consumed = total uploaded so far)
+            # Chunks permanently lost: consumed on server AND not locally cached
             _uploaded_frontier = len(_avail_set) + _chunks_consumed
-            if _first_needed is not None and _first_needed not in _avail_set and _first_needed < _uploaded_frontier:
-                # Chunk was uploaded but already consumed (not just pending upload)
+            _lost_count = sum(1 for i in range(_uploaded_frontier) if i not in _avail_set and i not in _have_set)
+
+            _recoverable = len(_avail_set - _have_set)
+
+            if _lost_count > 0 and _recoverable == 0 and not _upload_active and len(_avail_set) == 0:
+                # Nothing left to download at all
                 print_error(
-                    f"Chunk {_first_needed} has already been consumed (download_once). "
-                    f"Cannot {'resume' if resuming else 'start'} download.\n"
-                    f"   {_chunks_consumed} chunks consumed, "
-                    f"{len(info.available_chunks)} still on server.\n"
+                    f"All available chunks consumed (download_once). "
+                    f"{_chunks_consumed} consumed, {len(_have_set)} locally cached, "
+                    f"{_lost_count} permanently lost.\n"
                     f"   Ask the uploader to re-upload, or delete: "
                     f"[bold]et delete {file_id[:8]}[/bold]"
                 )
                 raise typer.Exit(1)
 
-        # Block: all chunks consumed, upload inactive
-        if (
+            if _lost_count > 0:
+                print_warning(
+                    f"{_lost_count} chunks permanently consumed (download_once) and not locally cached. "
+                    f"File cannot be fully assembled.\n"
+                    f"   {len(_have_set)} locally cached, {len(_avail_set)} on server, "
+                    f"{_lost_count} lost — downloading what's available"
+                )
+
+        # Block: all chunks consumed, upload inactive, no data
+        elif (
             _chunks_consumed > 0
             and info.available_size == 0
             and not _upload_active
@@ -928,21 +896,19 @@ def download(
             print_error(
                 f"All file chunks already consumed by a previous download "
                 f"({_chunks_consumed} chunks downloaded+deleted, retention=download_once).\n"
-                f"   The upload is incomplete and no longer active. "
-                f"These chunks cannot be retrieved again.\n"
                 f"   Ask the uploader to re-upload, or delete: "
                 f"[bold]et delete {file_id[:8]}[/bold]"
             )
             raise typer.Exit(1)
 
         if is_partial:
-            if _chunks_consumed > 0:
+            if _chunks_consumed > 0 and _lost_count == 0:
                 print_warning(
                     f"Only {format_size(info.available_size)} of {format_size(info.size)} "
                     f"available — {_chunks_consumed} chunks already consumed (download_once), "
                     f"waiting for new chunks from upload"
                 )
-            else:
+            elif _chunks_consumed == 0:
                 print_warning(
                     f"Only {format_size(info.available_size)} of {format_size(info.size)} "
                     f"available (upload in progress) — will follow upload"
@@ -966,6 +932,7 @@ def download(
                     file_id,
                     output_path,
                     progress_callback=update_progress,
+                    skip_chunks=_have_set if _have_set else None,
                 )
 
         elapsed = time.time() - start_time
@@ -973,7 +940,16 @@ def download(
         avg_speed = final_size / elapsed if elapsed > 0 else 0
 
         console.print()
-        if success:
+        if success and _lost_count > 0:
+            # Partial success — downloaded everything available but file is incomplete
+            _final_have = _have_set | (set(info.available_chunks) if info.available_chunks else set())
+            print_warning(f"Downloaded all available chunks ({len(_final_have)}/{_tc}).")
+            console.print(
+                f"   [dim]{_lost_count} chunks permanently lost (download_once consumed).[/dim]\n"
+                f"   [dim]Partial file saved to: [bold]{output_path}[/bold][/dim]\n"
+                f"   [dim].part/ state preserved for future resume.[/dim]"
+            )
+        elif success:
             print_success("Download complete!")
             console.print(f"   [dim]Time: {elapsed:.1f}s | Avg Speed: {format_size(int(avg_speed))}/s[/dim]")
             console.print(f"   [dim]Saved to: [bold]{output_path}[/bold][/dim]")

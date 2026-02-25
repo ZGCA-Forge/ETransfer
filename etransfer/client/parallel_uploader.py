@@ -6,7 +6,7 @@ import queue
 import signal
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
@@ -321,8 +321,13 @@ class ParallelUploader:
                     )
                     for i in range(self.max_concurrent)
                 ]
-                for future in as_completed(futures):
-                    future.result()
+                pending = set(futures)
+                while pending:
+                    if self._cancelled.is_set():
+                        break
+                    done, pending = wait(pending, timeout=0.5)
+                    for f in done:
+                        f.result()
             prefetch_thread.join(timeout=2)
         finally:
             signal.signal(signal.SIGINT, _prev_handler)
