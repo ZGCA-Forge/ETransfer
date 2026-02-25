@@ -422,6 +422,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         else:
             parsed_role_quotas[role_name] = qdict
     app.state.parsed_role_quotas = parsed_role_quotas
+    app.state.num_workers = settings.workers
 
     # User system routes (OIDC, roles, groups, quotas)
     if settings.user_system_enabled:

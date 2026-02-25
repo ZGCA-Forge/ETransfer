@@ -3,7 +3,6 @@
 import asyncio
 import hashlib
 import logging
-import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -414,31 +413,35 @@ def create_tus_router(
                 if _def_q:
                     upload_speed_limit = getattr(_def_q, "upload_speed_limit", None)
 
-        # ── Wrap receive with speed limiter if needed ────────
+        # ── Wrap receive with shared per-user rate limiter ────
+        _receive = request._receive
         if upload_speed_limit:
+            from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
+
+            _ul_key = get_user_key(request)
+            _num_workers = getattr(request.app.state, "num_workers", 1)
+            _ul_limiter = get_rate_limiter(
+                "upload",
+                _ul_key,
+                upload_speed_limit,
+                _num_workers,
+            )
             logger.debug(
-                "TUS PATCH %s: upload_speed_limit=%d bytes/s (%.1f MB/s)",
+                "TUS PATCH %s: upload_speed_limit=%d bytes/s (%.1f MB/s), " "per-worker=%.1f MB/s, key=%s",
                 file_id[:8],
                 upload_speed_limit,
                 upload_speed_limit / 1024 / 1024,
+                _ul_limiter.rate / 1024 / 1024,
+                _ul_key,
             )
-        _receive = request._receive
-        if upload_speed_limit:
-            _ul_t0 = time.monotonic()
-            _ul_total = 0
 
             _orig_receive = request._receive
 
             async def _throttled_receive() -> dict:
-                nonlocal _ul_total
                 message = await _orig_receive()
                 body = message.get("body", b"")
                 if body:
-                    _ul_total += len(body)
-                    expected = _ul_total / upload_speed_limit  # type: ignore[operator]
-                    elapsed = time.monotonic() - _ul_t0
-                    if elapsed < expected:
-                        await asyncio.sleep(expected - elapsed)
+                    await _ul_limiter.consume(len(body))
                 return message
 
             _receive = _throttled_receive
