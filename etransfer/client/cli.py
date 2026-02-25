@@ -325,46 +325,56 @@ def upload(
 
     file_size = file_path.stat().st_size
 
-    # Build info text
-    info_lines = f"[bold]{file_path.name}[/bold]\n"
-    info_lines += f"[dim]Size: {format_size(file_size)} | Chunk: {format_size(chunk_size)} | Threads: {threads}[/dim]"
-    if retention:
-        label = {"permanent": "Permanent", "download_once": "Download Once", "ttl": f"TTL {retention_ttl}s"}
-        info_lines += f"\n[dim]Retention: {label.get(retention, retention)}[/dim]"
-
-    # Print header
-    console.print()
-    panel = Panel(
-        info_lines,
-        title="[bold cyan]Upload[/bold cyan]",
-        border_style="cyan",
-    )
-    console.print(panel)
-
-    console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
-
     try:
         import sys
 
         from etransfer.client.tus_client import EasyTransferClient
 
-        with create_transfer_progress() as progress:
-            task = progress.add_task("[cyan]Uploading", total=file_size)
-            start_time = time.time()
+        with EasyTransferClient(server, token=token, chunk_size=chunk_size) as client:
+            uploader = client.create_parallel_uploader(
+                str(file_path),
+                chunk_size=chunk_size,
+                max_concurrent=threads,
+                progress_callback=lambda u, t: None,  # replaced below
+                retention=retention,
+                retention_ttl=retention_ttl,
+                wait_on_quota=wait_on_quota,
+            )
 
-            def update_progress(uploaded: int, total: int) -> None:
-                progress.update(task, completed=uploaded)
+            # Create the upload on the server to obtain the file ID
+            file_id = uploader.ensure_created()
 
-            with EasyTransferClient(server, token=token, chunk_size=chunk_size) as client:
-                uploader = client.create_parallel_uploader(
-                    str(file_path),
-                    chunk_size=chunk_size,
-                    max_concurrent=threads,
-                    progress_callback=update_progress,
-                    retention=retention,
-                    retention_ttl=retention_ttl,
-                    wait_on_quota=wait_on_quota,
-                )
+            # Build info text (now includes file_id)
+            info_lines = f"[bold]{file_path.name}[/bold]\n"
+            info_lines += (
+                f"[dim]Size: {format_size(file_size)} | Chunk: {format_size(chunk_size)} | Threads: {threads}[/dim]"
+            )
+            if retention:
+                label = {"permanent": "Permanent", "download_once": "Download Once", "ttl": f"TTL {retention_ttl}s"}
+                info_lines += f"\n[dim]Retention: {label.get(retention, retention)}[/dim]"
+            info_lines += (
+                f"\n[dim]File ID: [bold]{file_id}[/bold]  |  Download: [bold]et download {file_id[:8]}[/bold][/dim]"
+            )
+
+            # Print header
+            console.print()
+            panel = Panel(
+                info_lines,
+                title="[bold cyan]Upload[/bold cyan]",
+                border_style="cyan",
+            )
+            console.print(panel)
+
+            console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
+
+            with create_transfer_progress() as progress:
+                task = progress.add_task("[cyan]Uploading", total=file_size)
+                start_time = time.time()
+
+                def update_progress(uploaded: int, total: int) -> None:
+                    progress.update(task, completed=uploaded)
+
+                uploader.progress_callback = update_progress
 
                 # Interactive input listener thread
                 def _input_listener() -> None:
@@ -395,7 +405,7 @@ def upload(
                 input_thread = threading.Thread(target=_input_listener, daemon=True)
                 input_thread.start()
 
-                location = uploader.upload()
+                uploader.upload()
 
         elapsed = time.time() - start_time
         avg_speed = file_size / elapsed if elapsed > 0 else 0
@@ -403,11 +413,8 @@ def upload(
         console.print()
         print_success("Upload complete!")
         console.print(f"   [dim]Time: {elapsed:.1f}s | Avg Speed: {format_size(int(avg_speed))}/s[/dim]")
-
-        if location:
-            file_id = location.split("/")[-1]
-            console.print(f"   [dim]File ID: [bold]{file_id}[/bold][/dim]")
-            console.print(f"   [dim]Download: [bold]et download {file_id[:8]}[/bold][/dim]")
+        console.print(f"   [dim]File ID: [bold]{file_id}[/bold][/dim]")
+        console.print(f"   [dim]Download: [bold]et download {file_id[:8]}[/bold][/dim]")
         if retention == "download_once":
             print_warning("File will be deleted after first download")
             console.print("   [dim]Keep file: use [bold]--retention permanent[/bold][/dim]")
@@ -420,6 +427,10 @@ def upload(
     except KeyboardInterrupt:
         console.print()
         print_warning("Upload cancelled by user.")
+        cancel_fid: Optional[str] = getattr(uploader, "file_id", None) if "uploader" in dir() else None  # type: ignore[possibly-undefined]
+        if cancel_fid:
+            console.print(f"   [dim]File ID: [bold]{cancel_fid}[/bold][/dim]")
+            console.print(f"   [dim]Resume:  [bold]et reupload {cancel_fid[:8]} {file_path}[/bold][/dim]")
         raise typer.Exit(130)
     except Exception as e:
         console.print()

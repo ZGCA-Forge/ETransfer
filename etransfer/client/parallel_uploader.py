@@ -85,6 +85,26 @@ class ParallelUploader:
             netloc=parsed_ep.netloc,
         ).geturl()
 
+    @property
+    def file_id(self) -> Optional[str]:
+        """Extract file ID from the TUS upload URL."""
+        if not self.url:
+            return None
+        return self.url.rstrip("/").split("/")[-1]
+
+    def ensure_created(self) -> str:
+        """Ensure the TUS upload resource exists, creating it if needed.
+
+        Returns:
+            The file ID.
+        """
+        if not self.url:
+            self.url = self._create_upload()
+        fid = self.file_id
+        if not fid:
+            raise RuntimeError("Failed to obtain file ID")
+        return fid
+
     # ── TUS CREATE ───────────────────────────────────────────
 
     def _create_upload(self) -> str:
