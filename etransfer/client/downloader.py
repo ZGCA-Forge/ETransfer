@@ -6,9 +6,9 @@ import os
 import shutil
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import httpx
 
@@ -20,19 +20,20 @@ from etransfer.common.models import DownloadInfo
 logger = logging.getLogger("etransfer.client.downloader")
 
 
-def _wait_futures(futures: list) -> list:
+def _wait_futures(futures: list[Future[Any]]) -> Iterator[Future[Any]]:
     """Yield completed futures, using short timeouts to allow KeyboardInterrupt on Windows.
 
     On Windows, ``future.result()`` blocks in C-level threading primitives
     that swallow SIGINT.  By using ``wait(timeout=0.5)`` the main thread
     periodically runs Python bytecode so Ctrl+C is delivered.
+
+    This is a **generator** so that callers process each future immediately
+    (e.g. updating a progress bar) rather than waiting for the whole batch.
     """
     pending = set(futures)
-    done_ordered: list = []
     while pending:
         done, pending = wait(pending, timeout=0.5)
-        done_ordered.extend(done)
-    return done_ordered
+        yield from done
 
 
 class ChunkDownloader:
@@ -295,8 +296,8 @@ class ChunkDownloader:
                 use_cache,
                 skip_chunks=skip_chunks,
             )
-            # Only clean up .part/ if ALL chunks are present
-            if success:
+            # Only clean up .part/ if ALL chunks are present and not cancelled
+            if success and not self._cancelled.is_set():
                 all_present = self.load_downloaded_chunks(part_dir)
                 if len(all_present) >= total_chunks:
                     self._cleanup_part_dir(part_dir)
@@ -397,6 +398,9 @@ class ChunkDownloader:
         part_dir = self._part_dir_for(output_path)
 
         skip = skip_chunks or set()
+        # Merge with previously saved progress so we never lose state
+        _persisted = self.load_downloaded_chunks(part_dir)
+        skip = skip | _persisted
         target_indices = [i for i in range(total_chunks) if i not in skip]
 
         # Pre-allocate sparse file (skip if already exists at correct size — resume)
@@ -608,7 +612,7 @@ class ChunkDownloader:
                 progress_callback,
                 poll_interval,
             )
-            if success:
+            if success and not self._cancelled.is_set():
                 self._cleanup_part_dir(part_dir)
             return success
 
@@ -683,7 +687,9 @@ class ChunkDownloader:
             if not is_complete:
                 time.sleep(poll_interval)
 
-        # Assemble file from cache
+        # Assemble file from cache (skip on cancellation)
+        if self._cancelled.is_set():
+            return False
         if cache is not None:
             cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
             success = cache.assemble_file(file_id, output_path)
@@ -835,5 +841,10 @@ class ChunkDownloader:
         finally:
             if self.use_pwrite and fd > 0:
                 os.close(fd)
+            # Always persist progress for resume (cancel, error, or success)
+            if downloaded_chunks:
+                self._save_downloaded_chunks(part_dir, downloaded_chunks)
 
+        if self._cancelled.is_set():
+            return False
         return True

@@ -1,6 +1,7 @@
 """File management API routes."""
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta
@@ -351,6 +352,13 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     if upload:
                         upload.chunks_consumed += 1
                         await storage.update_upload(upload)
+                    # Also update the file record so list_files reflects consumption
+                    file_key = storage._file_key(file_id)
+                    file_data = await storage.state.get(file_key)
+                    if file_data:
+                        _finfo = json.loads(file_data)
+                        _finfo["chunks_consumed"] = _finfo.get("chunks_consumed", 0) + 1
+                        await storage.state.set(file_key, json.dumps(_finfo))
                     # Clean up when upload is complete AND all chunks consumed.
                     remaining = await storage.get_available_chunks(file_id)
                     if not remaining and upload and upload.is_complete:

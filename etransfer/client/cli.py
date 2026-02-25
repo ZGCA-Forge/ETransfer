@@ -847,6 +847,7 @@ def download(
 
         # Analyse chunk state for download_once files
         _have_set: set[int] = set()
+        _skip_set: set[int] = set()
         _lost_count = 0
         _tc = 0
         if _chunks_consumed > 0 and info.chunked_storage and info.available_chunks is not None:
@@ -860,6 +861,9 @@ def download(
                 _have_set = set(_cache.get_cached_chunks(file_id))
             _part = downloader._part_dir_for(output_path)
             _have_set |= downloader.load_downloaded_chunks(_part)
+
+            # Skip: all chunks NOT available on server + locally cached
+            _skip_set = (set(range(_tc)) - _avail_set) | _have_set
 
             # Chunks permanently lost: consumed on server AND not locally cached
             _uploaded_frontier = len(_avail_set) + _chunks_consumed
@@ -943,7 +947,7 @@ def download(
                         file_id,
                         output_path,
                         progress_callback=update_progress,
-                        skip_chunks=_have_set if _have_set else None,
+                        skip_chunks=_skip_set if _skip_set else None,
                     )
         finally:
             signal.signal(signal.SIGINT, _prev_sig)
@@ -981,6 +985,8 @@ def download(
         print_warning("Download cancelled.")
         console.print(f"   [dim]Resume: re-run [bold]et download {file_id[:8]}[/bold][/dim]")
         raise typer.Exit(130)
+    except typer.Exit:
+        raise
     except Exception as e:
         console.print()
         print_error(f"Download failed: {e}")

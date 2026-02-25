@@ -296,10 +296,12 @@ class ParallelUploader:
                             continue
             finally:
                 for _ in range(self.max_concurrent):
-                    try:
-                        chunk_queue.put(_SENTINEL, timeout=1)
-                    except queue.Full:
-                        pass
+                    while not self._cancelled.is_set():
+                        try:
+                            chunk_queue.put(_SENTINEL, timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
 
         prefetch_thread = threading.Thread(target=_prefetch, daemon=True)
         prefetch_thread.start()
