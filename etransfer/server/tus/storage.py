@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 from collections import defaultdict
@@ -11,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import aiofiles  # type: ignore[import-untyped]
 import aiofiles.os  # type: ignore[import-untyped]
+
+logger = logging.getLogger("etransfer.server.tus.storage")
 
 from etransfer.common.constants import RedisKeys
 from etransfer.common.fileutil import ftruncate, pwrite
@@ -498,7 +501,9 @@ class TusStorage:
 
     async def mark_chunk_available(self, file_id: str, chunk_index: int) -> None:
         """Mark a chunk as available for download in state backend."""
-        await self.state.set(self._chunk_state_key(file_id, chunk_index), "1")
+        key = self._chunk_state_key(file_id, chunk_index)
+        await self.state.set(key, "1")
+        logger.debug("mark_chunk_available %s chunk=%d key=%s", file_id[:8], chunk_index, key)
 
     async def is_chunk_available(self, file_id: str, chunk_index: int) -> bool:
         """Check if a chunk is available for download."""
@@ -516,6 +521,13 @@ class TusStorage:
             except (ValueError, IndexError):
                 continue
         indices.sort()
+        logger.debug(
+            "get_available_chunks %s: pattern=%s found=%d keys indices=%s",
+            file_id[:8],
+            pattern,
+            len(keys),
+            indices[:10] if indices else [],
+        )
         return indices
 
     async def read_chunk(

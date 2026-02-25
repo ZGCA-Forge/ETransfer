@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import os
-import time
 from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
@@ -268,19 +267,12 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
 
             _dl_key = get_user_key(request)
-            _num_workers = getattr(request.app.state, "num_workers", 1)
-            _dl_limiter = get_rate_limiter(
-                "download",
-                _dl_key,
-                _dl_speed_limit,
-                _num_workers,
-            )
+            _dl_limiter = get_rate_limiter("download", _dl_key, _dl_speed_limit)
             logger.debug(
-                "DOWNLOAD %s: download_speed_limit=%d bytes/s (%.1f MB/s), " "per-worker=%.1f MB/s, key=%s",
+                "DOWNLOAD %s: download_speed_limit=%d bytes/s (%.1f MB/s), key=%s",
                 file_id[:8],
                 _dl_speed_limit,
                 _dl_speed_limit / 1024 / 1024,
-                _dl_limiter.rate / 1024 / 1024,
                 _dl_key,
             )
 
