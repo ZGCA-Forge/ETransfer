@@ -142,10 +142,10 @@ def demo_server_info(server_url: str, token: str):
     print(f"文件总数: {info.total_files}")
     print(f"存储使用: {info.total_size / 1024 / 1024:.1f} MB")
 
-    if info.interfaces:
-        print("网络接口:")
-        for iface in info.interfaces:
-            print(f"  - {iface.name}: {iface.ip_address}")
+    if info.endpoints:
+        print("服务端点:")
+        for ep in info.endpoints:
+            print(f"  - {ep.endpoint}")
 
     # 存储状态
     try:

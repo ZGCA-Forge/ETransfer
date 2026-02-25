@@ -697,8 +697,13 @@ class TusStorage:
         upload = await self.get_upload(file_id)
         if upload:
             d = upload.to_redis_dict()
-            # For partial uploads, available_size = contiguous offset
-            d["available_size"] = upload.offset
+            if upload.chunked_storage:
+                # For chunked uploads, available_size = actual available chunks on disk
+                available = await self.get_available_chunks(upload.file_id)
+                d["available_size"] = min(len(available) * upload.chunk_size, upload.size)
+            else:
+                # For single-file uploads, available_size = contiguous offset from 0
+                d["available_size"] = upload.offset
             return d
 
         return None

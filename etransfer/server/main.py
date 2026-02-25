@@ -14,12 +14,12 @@ from etransfer.server.admin import create_admin_router
 from etransfer.server.background import _get_config_mtime, cleanup_loop, config_watch_loop
 from etransfer.server.config import ServerSettings, load_server_settings
 from etransfer.server.middleware.auth import TokenAuthMiddleware
+from etransfer.server.middleware.traffic import TrafficCounterMiddleware
 from etransfer.server.routes.auth import create_auth_router
 from etransfer.server.routes.files import create_files_router
 from etransfer.server.routes.info import create_info_router
-from etransfer.server.services.ip_mgr import IPManager
+from etransfer.server.services.instance_traffic import InstanceTrafficTracker
 from etransfer.server.services.state import BackendType, close_state_manager, get_state_manager
-from etransfer.server.services.traffic import TrafficMonitor
 from etransfer.server.tus.handler import TusHandler
 from etransfer.server.tus.storage import TusStorage
 
@@ -27,13 +27,48 @@ logger = logging.getLogger("etransfer.server")
 
 # Global singletons — initialised during the startup event.
 _storage: Optional[TusStorage] = None
-_traffic_monitor: Optional[TrafficMonitor] = None
-_ip_manager: Optional[IPManager] = None
+_instance_tracker: Optional[InstanceTrafficTracker] = None
 _user_db: Any = None
 _oidc_provider: Any = None
 
 
 # ── Helpers ──────────────────────────────────────────────────
+
+
+def _resolve_endpoint(settings: ServerSettings) -> str:
+    """Determine the endpoint string to advertise to clients.
+
+    Priority:
+      1. ``settings.advertised_endpoints[0]`` — explicit config
+      2. Auto-detect primary LAN IP via UDP socket trick
+      3. Fall back to ``settings.host:settings.port``
+
+    The returned string always includes the port, e.g. ``192.168.1.5:8765``.
+    """
+    import socket
+
+    port = settings.port
+
+    # 1. Explicit config
+    if settings.advertised_endpoints:
+        ep = settings.advertised_endpoints[0]
+        # If the user wrote just an IP/hostname without port, append it
+        if ":" not in ep or ep.count(":") > 1:  # IPv6 or plain hostname
+            ep = f"{ep}:{port}"
+        return ep
+
+    # 2. Auto-detect via UDP connect (no traffic sent)
+    host = settings.host
+    if host in ("0.0.0.0", "::", ""):  # nosec B104
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            host = s.getsockname()[0]
+            s.close()
+        except Exception:
+            host = "127.0.0.1"
+
+    return f"{host}:{port}"
 
 
 def _create_user_db(settings: ServerSettings) -> Any:
@@ -163,18 +198,11 @@ class _StorageProxy:
         return getattr(_storage, name)
 
 
-class _TrafficProxy:
+class _TrackerProxy:
     def __getattr__(self, name: str) -> Any:
-        if _traffic_monitor is None:
-            raise RuntimeError("Traffic monitor not initialized")
-        return getattr(_traffic_monitor, name)
-
-
-class _IPProxy:
-    def __getattr__(self, name: str) -> Any:
-        if _ip_manager is None:
-            raise RuntimeError("IP manager not initialized")
-        return getattr(_ip_manager, name)
+        if _instance_tracker is None:
+            raise RuntimeError("Instance tracker not initialized")
+        return getattr(_instance_tracker, name)
 
 
 class _UserDBProxy:
@@ -277,7 +305,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     @app.on_event("startup")
     async def startup_event() -> None:
         """Initialize services on startup."""
-        global _storage, _traffic_monitor, _ip_manager, _user_db
+        global _storage, _instance_tracker, _user_db
 
         backend_type = BackendType(settings.state_backend)
 
@@ -302,15 +330,20 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         )
         await _storage.initialize()
 
-        _traffic_monitor = TrafficMonitor(
-            interfaces=settings.interfaces or None,
+        # Instance traffic tracker (application-level throughput)
+        redis_client = None
+        if backend_type.value == "redis":
+            _backend = getattr(state_manager, "_backend", None)
+            redis_client = getattr(_backend, "_client", None) if _backend else None
+        resolved_ep = _resolve_endpoint(settings)
+        _instance_tracker = InstanceTrafficTracker(
+            host=settings.host,
+            port=settings.port,
+            redis_client=redis_client,
+            endpoint=resolved_ep,
         )
-        _traffic_monitor.start()
-
-        _ip_manager = IPManager(
-            interfaces=settings.interfaces or None,
-            prefer_ipv4=settings.prefer_ipv4,
-        )
+        _instance_tracker.start()
+        logger.info("Advertised endpoint: %s", resolved_ep)
 
         # User system
         if settings.user_system_enabled:
@@ -346,9 +379,10 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     @app.on_event("shutdown")
     async def shutdown_event() -> None:
         """Cleanup on shutdown."""
-        global _traffic_monitor, _user_db  # noqa: F824
-        if _traffic_monitor:
-            _traffic_monitor.stop()
+        global _instance_tracker, _user_db  # noqa: F824
+        if _instance_tracker:
+            await _instance_tracker.cleanup_redis()
+            _instance_tracker.stop()
         if _user_db:
             await _user_db.disconnect()
         await close_state_manager()
@@ -357,6 +391,10 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     # ── Proxies ──────────────────────────────────────────────
     storage_proxy = _StorageProxy()
     app.state.storage = storage_proxy
+    tracker_proxy = _TrackerProxy()
+
+    # ── Traffic counting middleware ──────────────────────────
+    app.add_middleware(TrafficCounterMiddleware, tracker=tracker_proxy)
 
     # ── Register routes ──────────────────────────────────────
     tus_handler = TusHandler(storage_proxy, settings.max_upload_size)  # type: ignore[arg-type]
@@ -367,10 +405,8 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     app.include_router(
         create_info_router(
             storage_proxy,  # type: ignore[arg-type]
-            _TrafficProxy(),  # type: ignore[arg-type]
-            _IPProxy(),  # type: ignore[arg-type]
+            tracker_proxy,  # type: ignore[arg-type]
             max_upload_size=settings.max_upload_size,
-            server_port=settings.port,
         )
     )
 

@@ -20,8 +20,8 @@ class StorageProxy:
         return getattr(target, name)
 
 
-class TrafficProxy:
-    """Proxy that resolves to the global TrafficMonitor after startup."""
+class TrackerProxy:
+    """Proxy that resolves to the global InstanceTrafficTracker after startup."""
 
     def __init__(self, getter: Any) -> None:
         self._getter = getter
@@ -29,20 +29,7 @@ class TrafficProxy:
     def __getattr__(self, name: str) -> Any:
         target = self._getter()
         if target is None:
-            raise RuntimeError("Traffic monitor not initialized")
-        return getattr(target, name)
-
-
-class IPProxy:
-    """Proxy that resolves to the global IPManager after startup."""
-
-    def __init__(self, getter: Any) -> None:
-        self._getter = getter
-
-    def __getattr__(self, name: str) -> Any:
-        target = self._getter()
-        if target is None:
-            raise RuntimeError("IP manager not initialized")
+            raise RuntimeError("Instance tracker not initialized")
         return getattr(target, name)
 
 

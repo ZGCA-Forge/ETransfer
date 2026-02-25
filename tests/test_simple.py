@@ -222,50 +222,40 @@ def test_tus_metadata():
     print("  ✓ TUS 元数据测试通过（含 retention）")
 
 
-def test_ip_manager():
-    """测试 IP 管理器。"""
-    print("测试 IP 管理器...")
+def test_instance_traffic_tracker():
+    """测试实例流量追踪器。"""
+    print("测试实例流量追踪器...")
 
-    from etransfer.server.services.ip_mgr import IPManager
+    from etransfer.server.services.instance_traffic import InstanceTrafficTracker
 
-    ip_mgr = IPManager()
+    tracker = InstanceTrafficTracker(host="127.0.0.1", port=8765)
+    print(f"  endpoint: {tracker.endpoint}")
+    assert tracker.endpoint == "127.0.0.1:8765"
 
-    # 获取接口列表
-    interfaces = ip_mgr.get_interfaces()
-    print(f"  发现 {len(interfaces)} 个网络接口")
+    # 记录流量
+    tracker.record_upload(1024)
+    tracker.record_download(2048)
+    assert tracker.total_bytes_recv == 1024
+    assert tracker.total_bytes_sent == 2048
 
-    for iface in interfaces[:3]:  # 只显示前3个
-        print(f"    - {iface.name}: {iface.ip_address}")
+    # 获取快照
+    snap = tracker.get_snapshot()
+    print(f"  snapshot: {snap}")
+    assert snap["endpoint"] == "127.0.0.1:8765"
+    assert snap["url"] == "http://127.0.0.1:8765"
+    assert snap["bytes_recv"] == 1024
+    assert snap["bytes_sent"] == 2048
 
-    # 获取 IP 列表
-    ips = ip_mgr.get_ip_addresses()
-    assert isinstance(ips, list)
+    # 提交样本后获取速率
+    tracker._commit_sample()
+    tracker.record_upload(1024)
+    tracker.record_download(2048)
+    tracker._commit_sample()
+    up, down = tracker.get_rates()
+    print(f"  rates: up={up} B/s, down={down} B/s")
+    assert up > 0 or down > 0
 
-    # 获取主 IP
-    primary = ip_mgr.get_primary_ip()
-    print(f"  主 IP: {primary}")
-
-    print("  ✓ IP 管理器测试通过")
-
-
-def test_traffic_monitor():
-    """测试流量监控。"""
-    print("测试流量监控...")
-
-    from etransfer.server.services.traffic import TrafficMonitor
-
-    monitor = TrafficMonitor()
-
-    # 获取当前流量
-    traffic = monitor.get_all_traffic()
-    print(f"  监控 {len(traffic)} 个接口")
-
-    # 获取总流量
-    total = monitor.get_total_traffic()
-    print(f"  总发送: {monitor.format_rate(total['upload_rate'])}")
-    print(f"  总接收: {monitor.format_rate(total['download_rate'])}")
-
-    print("  ✓ 流量监控测试通过")
+    print("  ✓ 实例流量追踪器测试通过")
 
 
 def run_all_tests():
@@ -280,8 +270,7 @@ def run_all_tests():
         test_config,
         test_cache,
         test_tus_metadata,
-        test_ip_manager,
-        test_traffic_monitor,
+        test_instance_traffic_tracker,
     ]
 
     passed = 0

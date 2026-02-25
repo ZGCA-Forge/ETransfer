@@ -55,20 +55,15 @@ class FileInfo(BaseModel):
         return self.uploaded_size >= self.size
 
 
-class NetworkInterface(BaseModel):
-    """Information about a network interface."""
+class EndpointInfo(BaseModel):
+    """Traffic information for a server endpoint (host:port)."""
 
-    name: str = Field(..., description="Interface name (e.g., eth0)")
-    ip_address: str = Field(..., description="IP address")
-    is_up: bool = Field(True, description="Whether interface is up")
-    speed_mbps: Optional[int] = Field(None, description="Link speed in Mbps")
-    bytes_sent: int = Field(0, description="Total bytes sent")
-    bytes_recv: int = Field(0, description="Total bytes received")
+    endpoint: str = Field(..., description="Endpoint address (host:port)")
+    url: str = Field("", description="Full HTTP URL for client access")
     upload_rate: float = Field(0.0, description="Current upload rate (bytes/sec)")
     download_rate: float = Field(0.0, description="Current download rate (bytes/sec)")
-    upload_load_percent: float = Field(0.0, description="Upload load as % of speed")
-    download_load_percent: float = Field(0.0, description="Download load as % of speed")
-    total_load_percent: float = Field(0.0, description="Total load as % of speed")
+    bytes_sent: int = Field(0, description="Total bytes sent")
+    bytes_recv: int = Field(0, description="Total bytes received")
 
 
 class ServerInfo(BaseModel):
@@ -79,7 +74,7 @@ class ServerInfo(BaseModel):
     tus_extensions: list[str] = Field(..., description="Supported TUS extensions")
     max_upload_size: Optional[int] = Field(None, description="Max upload size")
     chunk_size: int = Field(..., description="Default chunk size")
-    interfaces: list[NetworkInterface] = Field(default_factory=list, description="Network interfaces")
+    endpoints: list[EndpointInfo] = Field(default_factory=list, description="Server endpoints")
     total_files: int = Field(0, description="Total files on server")
     total_size: int = Field(0, description="Total storage used")
 

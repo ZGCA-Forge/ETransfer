@@ -181,11 +181,15 @@ class TusUpload(BaseModel):
             data["expires_at"] = self.expires_at.isoformat()
         if self.retention_expires_at:
             data["retention_expires_at"] = self.retention_expires_at.isoformat()
+        # Include computed property so callers can see total received bytes
+        data["received_bytes"] = self.received_bytes
         return data
 
     @classmethod
     def from_redis_dict(cls, data: dict) -> "TusUpload":
         """Create from Redis dict."""
+        # Strip computed properties that are not model fields
+        data.pop("received_bytes", None)
         for dt_field in ("created_at", "updated_at", "expires_at", "retention_expires_at"):
             if data.get(dt_field) and isinstance(data[dt_field], str):
                 data[dt_field] = datetime.fromisoformat(data[dt_field])

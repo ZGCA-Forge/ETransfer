@@ -84,7 +84,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                         file_id=u.file_id,
                         filename=u.filename,
                         size=u.size,
-                        uploaded_size=u.offset,
+                        uploaded_size=u.received_bytes,
                         mime_type=u.mime_type,
                         checksum=u.checksum,
                         created_at=u.created_at,
@@ -131,9 +131,10 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         if not info:
             raise HTTPException(404, f"File not found: {file_id}")
 
-        uploaded_size = info.get("available_size", 0)
+        uploaded_size = info.get("received_bytes", info.get("available_size", 0))
         total_size = info["size"]
-        is_complete = info.get("is_complete", uploaded_size >= total_size)
+        available_size = info.get("available_size", 0)
+        is_complete = info.get("is_complete", available_size >= total_size)
 
         file_metadata = {
             "retention": info.get("retention", "permanent"),

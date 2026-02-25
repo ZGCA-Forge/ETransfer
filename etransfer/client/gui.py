@@ -530,15 +530,13 @@ Chunk Size: {format_size(info.chunk_size)}
 Total Files: {info.total_files}
 Total Storage: {format_size(info.total_size)}
 
-Network Interfaces:
+Endpoints:
 """
-                    for iface in info.interfaces:
+                    for ep in info.endpoints:
                         text += f"""
-  {iface.name}:
-    IP: {iface.ip_address}
-    Speed: {iface.speed_mbps or 'N/A'} Mbps
-    Upload: {format_rate(iface.upload_rate)}
-    Download: {format_rate(iface.download_rate)}
+  {ep.endpoint}:
+    Upload: {format_rate(ep.upload_rate)}
+    Download: {format_rate(ep.download_rate)}
 """
 
                     self.info_text.insert(1.0, text)

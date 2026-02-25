@@ -148,6 +148,23 @@ def print_warning(message: str) -> None:
     console.print(f"[bold yellow]⚠[/bold yellow] {message}")
 
 
+def _select_endpoint(server: str, token: Optional[str], for_upload: bool = True) -> str:
+    """Query the server for the best available endpoint.
+
+    Calls ``/api/endpoints`` to discover all instances (via Redis in
+    multi-instance setups), picks the one with the lowest traffic rate,
+    and verifies it is reachable.  Falls back to *server* silently.
+    """
+    try:
+        from etransfer.client.tus_client import EasyTransferClient
+
+        with EasyTransferClient(server, token=token) as client:
+            best = client.select_best_reachable_endpoint(for_upload=for_upload, timeout=3.0)
+            return best
+    except Exception:
+        return server
+
+
 @app.command()
 def setup(
     address: str = typer.Argument(
@@ -299,6 +316,12 @@ def upload(
     if retention == "ttl" and not retention_ttl:
         print_error("--retention-ttl is required when using --retention ttl")
         raise typer.Exit(1)
+
+    # Endpoint selection — pick least-loaded reachable instance
+    target = _select_endpoint(server, token, for_upload=True)
+    if target != server:
+        console.print(f"  [dim]-> Redirecting to best endpoint: [bold]{target}[/bold][/dim]")
+        server = target
 
     file_size = file_path.stat().st_size
 
@@ -680,6 +703,12 @@ def download(
 
     # Resolve short ID prefix to full ID
     file_id = _resolve_file_id(file_id, server, token)
+
+    # Endpoint selection — pick least-loaded reachable instance
+    target = _select_endpoint(server, token, for_upload=False)
+    if target != server:
+        console.print(f"  [dim]-> Redirecting to best endpoint: [bold]{target}[/bold][/dim]")
+        server = target
 
     try:
         from etransfer.client.downloader import ChunkDownloader
@@ -1083,26 +1112,22 @@ def info(
 
         console.print(Panel(srv_text, title="[bold cyan]🖥️  Server[/bold cyan]", border_style="cyan"))
 
-        if server_info.interfaces:
+        if server_info.endpoints:
             table = Table(
-                title="[bold cyan]🌐 Network[/bold cyan]",
+                title="[bold cyan]🌐 Endpoints[/bold cyan]",
                 show_header=True,
                 header_style="bold magenta",
                 border_style="cyan",
             )
-            table.add_column("Interface", style="white")
-            table.add_column("IP Address", style="cyan")
-            table.add_column("Speed", justify="right")
+            table.add_column("Endpoint", style="cyan")
             table.add_column("↑ Upload", justify="right", style="green")
             table.add_column("↓ Download", justify="right", style="blue")
 
-            for iface in server_info.interfaces:
+            for ep in server_info.endpoints:
                 table.add_row(
-                    iface.name,
-                    iface.ip_address,
-                    f"{iface.speed_mbps} Mbps" if iface.speed_mbps else "N/A",
-                    format_rate(iface.upload_rate),
-                    format_rate(iface.download_rate),
+                    ep.endpoint,
+                    format_rate(ep.upload_rate),
+                    format_rate(ep.download_rate),
                 )
             console.print(table)
 

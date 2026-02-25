@@ -101,43 +101,6 @@ class EasyTransferClient(TusClient):
         """Get the download URL for a file."""
         return f"{self.server_url}/api/files/{file_id}/download"
 
-    def get_best_endpoint(self) -> Optional[str]:
-        """Get the best server endpoint based on traffic."""
-        try:
-            info = self.get_server_info()
-            endpoints = getattr(info, "advertised_endpoints", None) or []
-            if endpoints:
-                return endpoints[0]  # type: ignore[no-any-return]
-        except Exception:
-            pass
-        return None
-
-    def select_best_endpoint(self, for_upload: bool = True) -> str:
-        """Select the best server endpoint based on traffic load."""
-        try:
-            resp = self._http.get("/api/endpoints")
-            resp.raise_for_status()
-            data = resp.json()
-
-            if for_upload and data.get("best_for_upload"):
-                return data["best_for_upload"]  # type: ignore[no-any-return]
-            if not for_upload and data.get("best_for_download"):
-                return data["best_for_download"]  # type: ignore[no-any-return]
-
-            endpoints = data.get("endpoints", [])
-            if not endpoints:
-                return self.server_url
-
-            key = "upload_load_percent" if for_upload else "download_load_percent"
-            available = [e for e in endpoints if e.get("is_available", True)]
-            if not available:
-                return self.server_url
-
-            best = min(available, key=lambda x: x.get(key, 100))
-            return best.get("url", self.server_url)  # type: ignore[no-any-return]
-        except Exception:
-            return self.server_url
-
     def get_endpoints(self) -> dict:
         """Get all available endpoints with their load status."""
         resp = self._http.get("/api/endpoints")
@@ -149,6 +112,41 @@ class EasyTransferClient(TusClient):
         resp = self._http.get("/api/traffic")
         resp.raise_for_status()
         return resp.json()  # type: ignore[no-any-return]
+
+    def refresh_endpoints(self) -> list[dict]:
+        """Fetch the latest endpoint list from the server.
+
+        Returns:
+            List of endpoint dicts with ``url``, ``endpoint``,
+            ``upload_rate``, ``download_rate``, etc.
+        """
+        data = self.get_endpoints()
+        return data.get("endpoints", [])  # type: ignore[no-any-return]
+
+    def select_best_endpoint(self, for_upload: bool = True) -> str:
+        """Select the best server endpoint based on current traffic load.
+
+        Queries ``/api/endpoints`` and picks the endpoint with the
+        lowest upload_rate (for uploads) or download_rate (for downloads).
+        Falls back to ``self.server_url`` on error.
+        """
+        try:
+            data = self.get_endpoints()
+
+            key = "best_for_upload" if for_upload else "best_for_download"
+            best_url = data.get(key)
+            if best_url:
+                return best_url  # type: ignore[no-any-return]
+
+            endpoints = data.get("endpoints", [])
+            if not endpoints:
+                return self.server_url
+
+            rate_key = "upload_rate" if for_upload else "download_rate"
+            best = min(endpoints, key=lambda x: x.get(rate_key, float("inf")))
+            return best.get("url", self.server_url)  # type: ignore[no-any-return]
+        except Exception:
+            return self.server_url
 
     def get_storage_status(self) -> dict:
         """Get storage status."""
@@ -201,11 +199,13 @@ class EasyTransferClient(TusClient):
         results = []
         for ep in endpoints:
             url = ep.get("url", "")
-            if url:
+            if not url:
+                url = f"http://{ep.get('endpoint', '')}"
+            if url and url != "http://":
                 result = self.test_endpoint_connectivity(url, timeout)
-                result["load"] = {
-                    "upload": ep.get("upload_load_percent"),
-                    "download": ep.get("download_load_percent"),
+                result["traffic"] = {
+                    "upload_rate": ep.get("upload_rate", 0),
+                    "download_rate": ep.get("download_rate", 0),
                 }
                 results.append(result)
 
@@ -221,19 +221,28 @@ class EasyTransferClient(TusClient):
         timeout: float = 5.0,
         prefer_low_latency: bool = True,
     ) -> str:
-        """Select the best reachable endpoint by testing connectivity."""
+        """Select the best reachable endpoint by testing connectivity.
+
+        Fetches all endpoints, probes each for health, then sorts by
+        latency and current traffic rate.  Returns the URL of the best
+        reachable endpoint, or falls back to ``self.server_url``.
+        """
         test_results = self.test_all_endpoints(timeout)
         reachable = [r for r in test_results["endpoints"] if r.get("reachable")]
         if not reachable:
             return self.server_url
 
-        load_key = "upload_load_percent" if for_upload else "download_load_percent"
+        rate_key = "upload_rate" if for_upload else "download_rate"
 
-        if prefer_low_latency:
-            reachable.sort(key=lambda x: (x.get("latency_ms", 999), x.get(load_key, 100)))
-        else:
-            reachable.sort(key=lambda x: (x.get(load_key, 100), x.get("latency_ms", 999)))
+        def _sort_key(r: dict) -> tuple:
+            traffic = r.get("traffic", {})
+            rate = traffic.get(rate_key, 0)
+            latency = r.get("latency_ms", 999)
+            if prefer_low_latency:
+                return (latency, rate)
+            return (rate, latency)
 
+        reachable.sort(key=_sort_key)
         return reachable[0]["url"]  # type: ignore[no-any-return]
 
     # ── Upload helpers ───────────────────────────────────────

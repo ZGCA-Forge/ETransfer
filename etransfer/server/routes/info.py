@@ -5,64 +5,39 @@ from typing import Any, Optional
 from fastapi import APIRouter, Request
 
 from etransfer import __version__
-from etransfer.common.constants import DEFAULT_SERVER_PORT, TUS_EXTENSIONS, TUS_VERSION
-from etransfer.common.models import NetworkInterface, ServerInfo
-from etransfer.server.services.ip_mgr import IPManager
-from etransfer.server.services.traffic import TrafficMonitor
+from etransfer.common.constants import TUS_EXTENSIONS, TUS_VERSION
+from etransfer.common.models import EndpointInfo, ServerInfo
+from etransfer.server.services.instance_traffic import InstanceTrafficTracker
 from etransfer.server.tus.storage import TusStorage
 
 
 def create_info_router(
     storage: TusStorage,
-    traffic_monitor: "TrafficMonitor",
-    ip_manager: "IPManager",
+    tracker: "InstanceTrafficTracker",
     max_upload_size: Optional[int] = None,
-    server_port: int = DEFAULT_SERVER_PORT,
 ) -> APIRouter:
     """Create server info router.
 
-    ``advertised_endpoints`` is read from ``request.app.state.settings``
-    at request time so hot-reloaded config takes effect immediately.
-
     Args:
         storage: TUS storage backend
-        traffic_monitor: Traffic monitoring service
-        ip_manager: IP/NIC management service
+        tracker: Application-level instance traffic tracker
         max_upload_size: Maximum upload size
-        server_port: Server port number
 
     Returns:
         FastAPI router
     """
     router = APIRouter(prefix="/api", tags=["Server Info"])
-    _port = server_port
 
     @router.get("/info", response_model=ServerInfo)
     async def get_server_info() -> ServerInfo:
         """Get server information.
 
-        Returns server capabilities, network interfaces, and storage stats.
-        Each interface includes traffic load percentages for load balancing.
+        Returns server capabilities, endpoint traffic stats, and storage stats.
+        Each endpoint represents a running server instance with its throughput.
         """
-        # Get network interfaces with traffic info
-        interfaces = []
-        for iface in ip_manager.get_interfaces():
-            traffic = traffic_monitor.get_interface_traffic(iface.name)
-            interfaces.append(
-                NetworkInterface(
-                    name=iface.name,
-                    ip_address=iface.ip_address,
-                    is_up=iface.is_up,
-                    speed_mbps=traffic.get("speed_mbps") or iface.speed_mbps,
-                    bytes_sent=traffic.get("bytes_sent", 0),
-                    bytes_recv=traffic.get("bytes_recv", 0),
-                    upload_rate=traffic.get("upload_rate", 0),
-                    download_rate=traffic.get("download_rate", 0),
-                    upload_load_percent=traffic.get("upload_load_percent", 0),
-                    download_load_percent=traffic.get("download_load_percent", 0),
-                    total_load_percent=traffic.get("total_load_percent", 0),
-                )
-            )
+        # Get per-endpoint traffic (local + Redis peers)
+        all_eps = await tracker.get_all_endpoints()
+        endpoints = [EndpointInfo(**ep) for ep in all_eps]
 
         # Get storage stats
         files = await storage.list_files()
@@ -78,7 +53,7 @@ def create_info_router(
             tus_extensions=TUS_EXTENSIONS,
             max_upload_size=max_upload_size,
             chunk_size=storage.chunk_size,
-            interfaces=interfaces,
+            endpoints=endpoints,
             total_files=total_files,
             total_size=total_size,
         )
@@ -91,15 +66,15 @@ def create_info_router(
     @router.get("/stats")
     async def get_stats() -> dict[str, Any]:
         """Get detailed server statistics."""
-        # Get traffic stats
-        traffic_stats = traffic_monitor.get_all_traffic()
+        # Get per-endpoint traffic
+        all_eps = await tracker.get_all_endpoints()
 
         # Get file stats
         files = await storage.list_files()
         uploads = await storage.list_uploads(include_completed=False)
 
         return {
-            "traffic": traffic_stats,
+            "traffic": {ep["endpoint"]: ep for ep in all_eps},
             "files": {
                 "completed": len(files),
                 "in_progress": len(uploads),
@@ -110,112 +85,39 @@ def create_info_router(
 
     @router.get("/endpoints")
     async def get_endpoints(request: Request) -> dict[str, Any]:
-        """Get available endpoints with traffic load status.
+        """Get available endpoints with traffic status.
 
-        Returns all available IP addresses and their current traffic load,
+        Returns all known server instances and their current throughput,
         allowing clients to select the best endpoint for upload/download.
 
         Response includes:
-        - endpoints: List of endpoint info with IP, port, and load status
+        - endpoints: List of endpoint info with address and rates
         - best_for_upload: Recommended endpoint for uploading
         - best_for_download: Recommended endpoint for downloading
         """
-        # Read advertised_endpoints from settings (hot-reloadable)
-        _settings = getattr(request.app.state, "settings", None)
-        _advertised = (getattr(_settings, "advertised_endpoints", None) or []) if _settings else []
+        all_eps = await tracker.get_all_endpoints()
 
-        endpoints = []
-        best_upload_load = float("inf")
-        best_download_load = float("inf")
         best_for_upload = None
         best_for_download = None
+        lowest_up = float("inf")
+        lowest_down = float("inf")
 
-        # Use advertised endpoints if configured
-        if _advertised:
-            # Advertised endpoints - use configured IPs
-            for ip_addr in _advertised:
-                # Try to get traffic from matching interface
-                traffic_data = {}
-                speed_mbps = 0
-                for iface in ip_manager.get_interfaces():
-                    if iface.ip_address == ip_addr:
-                        traffic_data = traffic_monitor.get_interface_traffic(iface.name)
-                        speed_mbps = traffic_data.get("speed_mbps") or iface.speed_mbps or 0
-                        break
-
-                # If no matching interface, use aggregate traffic
-                if not traffic_data:
-                    total = traffic_monitor.get_total_traffic()
-                    traffic_data = {
-                        "upload_rate": total.get("upload_rate", 0),
-                        "download_rate": total.get("download_rate", 0),
-                        "upload_load_percent": 0,
-                        "download_load_percent": 0,
-                        "total_load_percent": 0,
-                    }
-
-                endpoint_info = {
-                    "interface": "advertised",
-                    "ip_address": ip_addr,
-                    "url": f"http://{ip_addr}:{_port}",
-                    "speed_mbps": speed_mbps,
-                    "upload_rate": traffic_data.get("upload_rate", 0),
-                    "download_rate": traffic_data.get("download_rate", 0),
-                    "upload_load_percent": traffic_data.get("upload_load_percent", 0),
-                    "download_load_percent": traffic_data.get("download_load_percent", 0),
-                    "total_load_percent": traffic_data.get("total_load_percent", 0),
-                    "is_available": True,  # Assume advertised endpoints are available
-                }
-                endpoints.append(endpoint_info)
-
-                # Track best endpoints
-                upload_load = traffic_data.get("upload_load_percent", 0)
-                download_load = traffic_data.get("download_load_percent", 0)
-
-                if upload_load < best_upload_load:
-                    best_upload_load = upload_load
-                    best_for_upload = endpoint_info["url"]
-
-                if download_load < best_download_load:
-                    best_download_load = download_load
-                    best_for_download = endpoint_info["url"]
-        else:
-            # Auto-detect from interfaces
-            for iface in ip_manager.get_interfaces():
-                traffic = traffic_monitor.get_interface_traffic(iface.name)
-
-                endpoint_info = {
-                    "interface": iface.name,
-                    "ip_address": iface.ip_address,
-                    "url": f"http://{iface.ip_address}:{_port}",
-                    "speed_mbps": traffic.get("speed_mbps") or iface.speed_mbps or 0,
-                    "upload_rate": traffic.get("upload_rate", 0),
-                    "download_rate": traffic.get("download_rate", 0),
-                    "upload_load_percent": traffic.get("upload_load_percent", 0),
-                    "download_load_percent": traffic.get("download_load_percent", 0),
-                    "total_load_percent": traffic.get("total_load_percent", 0),
-                    "is_available": iface.is_up,
-                }
-                endpoints.append(endpoint_info)
-
-                # Track best endpoints
-                upload_load = traffic.get("upload_load_percent", 0)
-                download_load = traffic.get("download_load_percent", 0)
-
-                if iface.is_up and upload_load < best_upload_load:
-                    best_upload_load = upload_load
-                    best_for_upload = endpoint_info["url"]
-
-                if iface.is_up and download_load < best_download_load:
-                    best_download_load = download_load
-                    best_for_download = endpoint_info["url"]
+        for ep in all_eps:
+            ur = ep.get("upload_rate", 0)
+            dr = ep.get("download_rate", 0)
+            url = ep.get("url", f"http://{ep['endpoint']}")
+            if ur < lowest_up:
+                lowest_up = ur
+                best_for_upload = url
+            if dr < lowest_down:
+                lowest_down = dr
+                best_for_download = url
 
         return {
-            "endpoints": endpoints,
+            "endpoints": all_eps,
             "best_for_upload": best_for_upload,
             "best_for_download": best_for_download,
-            "total_endpoints": len(endpoints),
-            "server_port": _port,
+            "total_endpoints": len(all_eps),
         }
 
     @router.get("/storage")
@@ -253,40 +155,45 @@ def create_info_router(
 
     @router.get("/traffic")
     async def get_traffic() -> dict[str, Any]:
-        """Get real-time traffic information for all interfaces.
+        """Get real-time traffic information for all endpoints.
 
-        Returns current upload/download rates and load percentages
-        for each network interface.
+        Returns current upload/download rates for each server instance.
         """
-        traffic_data = traffic_monitor.get_all_traffic()
-        total = traffic_monitor.get_total_traffic()
+        all_eps = await tracker.get_all_endpoints()
 
-        # Format for response
-        interfaces = []
-        for name, data in traffic_data.items():
-            interfaces.append(
+        def _fmt(rate: float) -> str:
+            if rate < 1024:
+                return f"{rate:.0f} B/s"
+            elif rate < 1024 * 1024:
+                return f"{rate / 1024:.1f} KB/s"
+            elif rate < 1024 * 1024 * 1024:
+                return f"{rate / (1024 * 1024):.1f} MB/s"
+            else:
+                return f"{rate / (1024 * 1024 * 1024):.2f} GB/s"
+
+        formatted = []
+        total_up = 0.0
+        total_down = 0.0
+        for ep in all_eps:
+            ur = ep.get("upload_rate", 0)
+            dr = ep.get("download_rate", 0)
+            total_up += ur
+            total_down += dr
+            formatted.append(
                 {
-                    "name": name,
-                    "upload_rate": data["upload_rate"],
-                    "download_rate": data["download_rate"],
-                    "upload_rate_formatted": traffic_monitor.format_rate(data["upload_rate"]),
-                    "download_rate_formatted": traffic_monitor.format_rate(data["download_rate"]),
-                    "speed_mbps": data.get("speed_mbps", 0),
-                    "upload_load_percent": data.get("upload_load_percent", 0),
-                    "download_load_percent": data.get("download_load_percent", 0),
-                    "total_load_percent": data.get("total_load_percent", 0),
-                    "bytes_sent": data["bytes_sent"],
-                    "bytes_recv": data["bytes_recv"],
+                    **ep,
+                    "upload_rate_formatted": _fmt(ur),
+                    "download_rate_formatted": _fmt(dr),
                 }
             )
 
         return {
-            "interfaces": interfaces,
+            "endpoints": formatted,
             "total": {
-                "upload_rate": total["upload_rate"],
-                "download_rate": total["download_rate"],
-                "upload_rate_formatted": traffic_monitor.format_rate(total["upload_rate"]),
-                "download_rate_formatted": traffic_monitor.format_rate(total["download_rate"]),
+                "upload_rate": total_up,
+                "download_rate": total_down,
+                "upload_rate_formatted": _fmt(total_up),
+                "download_rate_formatted": _fmt(total_down),
             },
         }
 
