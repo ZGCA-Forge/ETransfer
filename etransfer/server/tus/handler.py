@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -368,6 +369,7 @@ def create_tus_router(
         if upload_record:
             _check_upload_ownership(request, upload_record)
         patch_owner_id = upload_record.owner_id if upload_record else None
+        upload_speed_limit: Optional[int] = None
         if patch_owner_id:
             user_db = getattr(request.app.state, "user_db", None)
             if user_db:
@@ -375,6 +377,7 @@ def create_tus_router(
                 if user:
                     role_quotas = getattr(request.app.state, "parsed_role_quotas", {})
                     effective = await user_db.get_effective_quota(user, role_quotas)
+                    upload_speed_limit = effective.upload_speed_limit
                     if effective.max_storage_size:
                         reserved = await quota_svc.get_reserved(patch_owner_id)
                         total_after = user.storage_used + reserved + content_length
@@ -397,6 +400,28 @@ def create_tus_router(
             # Reserve upfront — will release on write failure
             await quota_svc.reserve(patch_owner_id, content_length)
 
+        # ── Wrap receive with speed limiter if needed ────────
+        _receive = request._receive
+        if upload_speed_limit:
+            _ul_t0 = time.monotonic()
+            _ul_total = 0
+
+            _orig_receive = request._receive
+
+            async def _throttled_receive() -> dict:
+                nonlocal _ul_total
+                message = await _orig_receive()
+                body = message.get("body", b"")
+                if body:
+                    _ul_total += len(body)
+                    expected = _ul_total / upload_speed_limit  # type: ignore[operator]
+                    elapsed = time.monotonic() - _ul_t0
+                    if elapsed < expected:
+                        await asyncio.sleep(expected - elapsed)
+                return message
+
+            _receive = _throttled_receive
+
         # ── Stream body → disk (no full-body buffering) ──────
         # For chunked storage: compute chunk index and write to chunk file
         try:
@@ -405,14 +430,14 @@ def create_tus_router(
                 written = await storage.write_chunk_file_streaming(
                     file_id,
                     chunk_index,
-                    request._receive,
+                    _receive,
                     content_length,
                 )
                 await storage.mark_chunk_available(file_id, chunk_index)
             else:
                 written = await storage.write_chunk_streaming(
                     file_id,
-                    request._receive,
+                    _receive,
                     offset,
                     content_length,
                 )

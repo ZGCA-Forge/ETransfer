@@ -1,5 +1,6 @@
 """Chunked file downloader with HTTP Range support."""
 
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +13,8 @@ from etransfer.client.cache import LocalCache
 from etransfer.common.constants import AUTH_HEADER, DEFAULT_CHUNK_SIZE
 from etransfer.common.fileutil import pwrite
 from etransfer.common.models import DownloadInfo
+
+logger = logging.getLogger("etransfer.client.downloader")
 
 
 class ChunkDownloader:
@@ -513,6 +516,14 @@ class ChunkDownloader:
         info = self.get_file_info(file_id)
         chunked_mode = info.chunked_storage
 
+        logger.debug(
+            "follow mode: chunked=%s available_size=%s available_chunks=%s is_upload_complete=%s",
+            chunked_mode,
+            info.available_size,
+            len(info.available_chunks) if info.available_chunks else None,
+            getattr(info, "is_upload_complete", None),
+        )
+
         # Write part meta for resume detection
         part_dir = self._part_dir_for(Path(output_path))
         self._write_part_meta(
@@ -546,6 +557,14 @@ class ChunkDownloader:
             total_size = info.size
             available = info.available_size
             is_complete = available >= total_size
+
+            logger.debug(
+                "range poll: available=%d total=%d last_available=%d is_complete=%s",
+                available,
+                total_size,
+                last_available,
+                is_complete,
+            )
 
             if available > last_available:
                 last_available = available
@@ -646,6 +665,14 @@ class ChunkDownloader:
                 total_chunks = info.total_chunks or ((total_size + chunk_size - 1) // chunk_size)
                 available = info.available_chunks or []
                 is_upload_complete = getattr(info, "is_upload_complete", False)
+
+                logger.debug(
+                    "chunked poll: avail_chunks=%d total_chunks=%d downloaded=%d is_complete=%s",
+                    len(available),
+                    total_chunks,
+                    len(downloaded_chunks),
+                    is_upload_complete,
+                )
 
                 # Pre-allocate file on first iteration
                 if fd == -1 and total_size > 0:

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
@@ -384,6 +385,16 @@ def create_files_router(storage: TusStorage) -> APIRouter:
 
         file_path_str = str(file_path)
 
+        # ── Resolve download speed limit for current user ──
+        _dl_speed_limit: Optional[int] = None
+        _dl_user = getattr(request.state, "user", None)
+        if _dl_user:
+            _dl_user_db = getattr(request.app.state, "user_db", None)
+            if _dl_user_db:
+                _dl_rq = getattr(request.app.state, "parsed_role_quotas", {})
+                _dl_eff = await _dl_user_db.get_effective_quota(_dl_user, _dl_rq)
+                _dl_speed_limit = _dl_eff.download_speed_limit
+
         # ---- Fast path: pread for Range requests ----
         if range_header:
             loop = asyncio.get_running_loop()
@@ -411,6 +422,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         async def generate_fast() -> AsyncIterator[bytes]:
             loop = asyncio.get_running_loop()
             fd = os.open(file_path_str, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+            t0 = time.monotonic()
+            total_sent = 0
             try:
                 offset = start
                 remaining = content_length
@@ -422,6 +435,12 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     yield buf
                     offset += len(buf)
                     remaining -= len(buf)
+                    if _dl_speed_limit:
+                        total_sent += len(buf)
+                        expected = total_sent / _dl_speed_limit
+                        elapsed = time.monotonic() - t0
+                        if elapsed < expected:
+                            await asyncio.sleep(expected - elapsed)
             finally:
                 os.close(fd)
 
@@ -471,6 +490,19 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         if not upload_complete:
             received = info.get("received_bytes", 0)
             upload_complete = received >= info["size"]
+
+        logger.debug(
+            "download_info %s: chunked=%s avail_size=%s avail_chunks=%s "
+            "received=%s offset=%s is_final=%s upload_complete=%s",
+            file_id[:8],
+            is_chunked,
+            info.get("available_size"),
+            len(available_chunks) if available_chunks else None,
+            info.get("received_bytes", 0),
+            info.get("offset", 0),
+            info.get("is_final", False),
+            upload_complete,
+        )
 
         return DownloadInfo(
             file_id=file_id,
