@@ -56,17 +56,23 @@ class ChunkDownloader:
         self._client = self._clients[0]
 
     @staticmethod
-    def _local_cache_for(output_path: Path) -> LocalCache:
+    def _local_cache_for(output_path: Path, size_hint: int = 0) -> LocalCache:
         """Create a ``LocalCache`` rooted next to *output_path*.
 
         For ``/data/movie.mp4`` the cache dir is ``/data/.movie.mp4.part/``.
         This keeps partial chunks visible alongside the target file and
         avoids polluting a global ``~/.etransfer/cache`` directory.
+
+        *size_hint* (bytes) ensures the cache limit is large enough to
+        hold the entire file so that LRU eviction does not delete chunks
+        mid-download.
         """
         parent = output_path.parent
         name = output_path.name
         cache_dir = parent / f".{name}.part"
-        return LocalCache(cache_dir=cache_dir)
+        # Ensure cache can hold the whole file (+ 10 % headroom)
+        min_mb = max(1024, (size_hint * 110 // 100) // (1024 * 1024) + 1)
+        return LocalCache(cache_dir=cache_dir, max_size_mb=min_mb)
 
     @staticmethod
     def _part_dir_for(output_path: Path) -> Path:
@@ -265,7 +271,7 @@ class ChunkDownloader:
         available_size = info.available_size
         total_chunks = (available_size + self.chunk_size - 1) // self.chunk_size
 
-        cache = self._local_cache_for(Path(output_path))
+        cache = self._local_cache_for(Path(output_path), size_hint=available_size)
         cache.set_file_meta(file_id, info.filename, available_size, self.chunk_size)
         cached_chunks = set(cache.get_cached_chunks(file_id))
 
@@ -546,7 +552,7 @@ class ChunkDownloader:
                 total_chunks = (available + self.chunk_size - 1) // self.chunk_size
 
                 if cache is None:
-                    cache = self._local_cache_for(Path(output_path))
+                    cache = self._local_cache_for(Path(output_path), size_hint=total_size)
                     cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
                     # Pick up any previously cached chunks (resume)
                     downloaded_chunks = set(cache.get_cached_chunks(file_id))
