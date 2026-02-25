@@ -8,11 +8,52 @@ from typing import Any, AsyncIterator, Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
+from etransfer.common.constants import AUTH_HEADER
 from etransfer.common.fileutil import pread
 from etransfer.common.models import DownloadInfo, ErrorResponse, FileInfo, FileListResponse, FileStatus
 from etransfer.server.tus.storage import TusStorage
 
 logger = logging.getLogger("etransfer.server.files")
+
+
+def _get_caller_info(request: Request) -> tuple[Optional[int], bool]:
+    """Extract caller identity from the request.
+
+    Returns:
+        (owner_id, is_privileged)
+        - owner_id: user ID if session-authenticated, else None
+        - is_privileged: True for API-token auth or admin users (can see all files)
+    """
+    # Static API token → privileged (no owner_id)
+    _settings = getattr(request.app.state, "settings", None)
+    active_tokens = set(_settings.auth_tokens) if _settings else set()
+    api_token = request.headers.get(AUTH_HEADER, "")
+    if api_token and api_token in active_tokens:
+        return None, True
+
+    # Session-based user
+    user = getattr(request.state, "user", None)
+    if user:
+        uid = getattr(user, "id", None)
+        is_admin = getattr(user, "is_admin", False) or getattr(user, "role", "") == "admin"
+        return uid, is_admin
+
+    # No auth (auth disabled) → privileged (backward compat)
+    return None, True
+
+
+def _check_ownership(
+    info: dict,
+    owner_id: Optional[int],
+    is_privileged: bool,
+    file_id: str,
+) -> None:
+    """Raise 404 if the caller does not own the file and is not privileged."""
+    if is_privileged:
+        return
+    file_owner = info.get("owner_id")
+    if file_owner is None or file_owner != owner_id:
+        raise HTTPException(404, f"File not found: {file_id}")
 
 
 def create_files_router(storage: TusStorage) -> APIRouter:
@@ -35,6 +76,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         responses={500: {"model": ErrorResponse}},
     )
     async def list_files(
+        request: Request,
         page: int = Query(1, ge=1, description="Page number"),
         page_size: int = Query(20, ge=1, le=100, description="Page size"),
         include_partial: bool = Query(True, description="Include partial uploads"),
@@ -45,6 +87,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         Partial files can still be downloaded for their uploaded portion.
         """
         try:
+            owner_id, is_privileged = _get_caller_info(request)
+
             # Get completed files
             files_data = await storage.list_files()
 
@@ -52,6 +96,11 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             uploads = []
             if include_partial:
                 uploads = await storage.list_uploads(include_completed=False, include_partial=True)
+
+            # User isolation: non-privileged users only see their own files
+            if not is_privileged and owner_id is not None:
+                files_data = [f for f in files_data if f.get("owner_id") == owner_id]
+                uploads = [u for u in uploads if u.owner_id == owner_id]
 
             # Convert to FileInfo models
             all_files = []
@@ -125,11 +174,13 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         response_model=FileInfo,
         responses={404: {"model": ErrorResponse}},
     )
-    async def get_file(file_id: str) -> FileInfo:
+    async def get_file(file_id: str, request: Request) -> FileInfo:
         """Get file information."""
         info = await storage.get_file_info(file_id)
         if not info:
             raise HTTPException(404, f"File not found: {file_id}")
+
+        _check_ownership(info, *_get_caller_info(request), file_id)
 
         uploaded_size = info.get("received_bytes", info.get("available_size", 0))
         total_size = info["size"]
@@ -181,6 +232,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         info = await storage.get_file_info(file_id)
         if not info:
             raise HTTPException(404, f"File not found: {file_id}")
+
+        _check_ownership(info, *_get_caller_info(request), file_id)
 
         filename = info["filename"]
         mime_type = info.get("mime_type", "application/octet-stream")
@@ -389,7 +442,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         response_model=DownloadInfo,
         responses={404: {"model": ErrorResponse}},
     )
-    async def get_download_info(file_id: str) -> DownloadInfo:
+    async def get_download_info(file_id: str, request: Request) -> DownloadInfo:
         """Get download information for a file.
 
         Returns file metadata needed to start a download,
@@ -399,6 +452,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         info = await storage.get_file_info(file_id)
         if not info:
             raise HTTPException(404, f"File not found: {file_id}")
+
+        _check_ownership(info, *_get_caller_info(request), file_id)
 
         is_chunked = info.get("chunked_storage", False)
         chunk_size = info.get("chunk_size") if is_chunked else None
@@ -430,6 +485,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         info = await storage.get_file_info(file_id)
         if not info:
             raise HTTPException(404, f"File not found: {file_id}")
+
+        _check_ownership(info, *_get_caller_info(request), file_id)
 
         # Decrement user storage_used
         owner_id = info.get("owner_id")

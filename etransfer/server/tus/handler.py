@@ -26,6 +26,35 @@ from etransfer.server.tus.storage import TusStorage
 logger = logging.getLogger("etransfer.server.tus")
 
 
+def _check_upload_ownership(request: Request, upload: TusUpload) -> None:
+    """Raise 404 if the caller does not own the upload and is not privileged.
+
+    Privileged callers: static API-token holders, admin users.
+    """
+    # Static API token → privileged
+    _settings = getattr(request.app.state, "settings", None)
+    active_tokens = set(_settings.auth_tokens) if _settings else set()
+    api_token = request.headers.get(AUTH_HEADER, "")
+    if api_token and api_token in active_tokens:
+        return
+
+    # Session-based user
+    user = getattr(request.state, "user", None)
+    if user:
+        is_admin = getattr(user, "is_admin", False) or getattr(user, "role", "") == "admin"
+        if is_admin:
+            return
+        if getattr(user, "id", None) == upload.owner_id:
+            return
+        raise HTTPException(404, "Upload not found")
+
+    # No auth info and no API token → auth disabled, allow
+    if not active_tokens:
+        return
+
+    raise HTTPException(404, "Upload not found")
+
+
 def create_tus_router(
     storage: TusStorage,
     max_size: Optional[int] = None,
@@ -255,6 +284,8 @@ def create_tus_router(
         if not upload:
             raise HTTPException(404, "Upload not found")
 
+        _check_upload_ownership(request, upload)
+
         # Check expiration
         if upload.expires_at and upload.expires_at < datetime.utcnow():
             await storage.delete_upload(file_id)
@@ -334,6 +365,8 @@ def create_tus_router(
 
         # ── Per-user quota: reserve before writing to disk ────
         upload_record = await storage.get_upload(file_id)
+        if upload_record:
+            _check_upload_ownership(request, upload_record)
         patch_owner_id = upload_record.owner_id if upload_record else None
         if patch_owner_id:
             user_db = getattr(request.app.state, "user_db", None)
@@ -438,6 +471,8 @@ def create_tus_router(
         upload = await storage.get_upload(file_id)
         if not upload:
             raise HTTPException(404, "Upload not found")
+
+        _check_upload_ownership(request, upload)
 
         user_db = getattr(request.app.state, "user_db", None)
         if user_db and upload.owner_id:
