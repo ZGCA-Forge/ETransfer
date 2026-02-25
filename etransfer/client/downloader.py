@@ -81,13 +81,14 @@ class ChunkDownloader:
         self._cancelled = threading.Event()
 
     def cancel(self) -> None:
-        """Signal cancellation and close all HTTP clients to abort in-flight requests."""
+        """Signal cancellation.
+
+        Does NOT close HTTP clients — workers finish their current chunk
+        and then exit.  This prevents permanent chunk loss for
+        ``download_once`` files where the server deletes chunks after
+        serving them.
+        """
         self._cancelled.set()
-        for c in self._clients:
-            try:
-                c.close()
-            except Exception:
-                pass
 
     @staticmethod
     def _local_cache_for(output_path: Path, size_hint: int = 0) -> LocalCache:
@@ -410,15 +411,19 @@ class ChunkDownloader:
                     f.seek(total_size - 1)
                     f.write(b"\0")
 
+        # _downloaded_set tracks only chunks actually ON DISK (not consumed ones).
+        # 'skip' may include consumed chunks (to prevent 404), but those must NOT
+        # be recorded in chunks.json or counted towards completion.
+        _downloaded_set = set(_persisted)
+
         # Account for already-downloaded chunks in progress
-        downloaded_bytes = len(skip) * chunk_size
-        if progress_callback and skip:
+        downloaded_bytes = len(_downloaded_set) * chunk_size
+        if progress_callback and _downloaded_set:
             progress_callback(downloaded_bytes, total_size)
 
         _lock = threading.Lock()
         _chunk_iter = iter(target_indices)
         _iter_lock = threading.Lock()
-        _downloaded_set = set(skip)
 
         fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0)) if self.use_pwrite else -1
 

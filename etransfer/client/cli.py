@@ -970,7 +970,7 @@ def download(
             console.print(
                 f"   [dim]{_lost_count} chunks permanently lost (download_once consumed).[/dim]\n"
                 f"   [dim]Partial file saved to: [bold]{output_path}[/bold][/dim]\n"
-                f"   [dim].part/ state preserved for future resume.[/dim]"
+                f"   [dim].part/ state preserved for inspection.[/dim]"
             )
         elif success:
             print_success("Download complete!")
