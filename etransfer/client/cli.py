@@ -759,19 +759,21 @@ def download(
         # Visual server-state bar for chunked files
         _chunks_consumed = getattr(info, "chunks_consumed", 0)
         if _chunks_consumed > 0 or (info.chunked_storage and info.available_size < info.size):
-            _total_chunks = info.total_chunks or 1
+            _chunk_sz = info.chunk_size or downloader.chunk_size
+            _total_chunks = info.total_chunks or (
+                (info.size + _chunk_sz - 1) // _chunk_sz if info.size and _chunk_sz else 1
+            )
             _avail_count = len(info.available_chunks) if info.available_chunks else 0
-            _uploaded_count = _avail_count + _chunks_consumed
-            _pending_count = max(0, _total_chunks - _uploaded_count)
+            _pending_count = max(0, _total_chunks - _avail_count - _chunks_consumed)
 
-            _pct_avail = (_avail_count / _total_chunks * 100) if _total_chunks else 0
-            _pct_consumed = (_chunks_consumed / _total_chunks * 100) if _total_chunks else 0
-            _pct_pending = (_pending_count / _total_chunks * 100) if _total_chunks else 0
+            _pct_avail = _avail_count / _total_chunks * 100
+            _pct_consumed = _chunks_consumed / _total_chunks * 100
+            _pct_pending = _pending_count / _total_chunks * 100
 
-            _bar_width = 40
-            _bar_avail = round(_avail_count / _total_chunks * _bar_width) if _total_chunks else 0
-            _bar_consumed = round(_chunks_consumed / _total_chunks * _bar_width) if _total_chunks else 0
-            _bar_pending = _bar_width - _bar_avail - _bar_consumed
+            _bar_width = 30
+            _bar_avail = min(round(_pct_avail / 100 * _bar_width), _bar_width)
+            _bar_consumed = min(round(_pct_consumed / 100 * _bar_width), _bar_width - _bar_avail)
+            _bar_pending = max(0, _bar_width - _bar_avail - _bar_consumed)
 
             bar = (
                 f"[bold green]{'━' * _bar_avail}[/bold green]"
@@ -801,9 +803,40 @@ def download(
 
         is_partial = not getattr(info, "is_upload_complete", info.available_size >= info.size)
 
-        # Detect consumed state: chunks already downloaded+deleted, nothing left
+        # Detect consumed state for download_once files
         _chunks_consumed = getattr(info, "chunks_consumed", 0)
         _upload_active = getattr(info, "upload_active", True)
+
+        # Block: next needed chunk was consumed (download_once) — can't continue
+        if _chunks_consumed > 0 and info.chunked_storage and info.available_chunks is not None:
+            _chunk_sz = info.chunk_size or downloader.chunk_size
+            _tc = info.total_chunks or ((info.size + _chunk_sz - 1) // _chunk_sz if info.size else 1)
+            _avail_set = set(info.available_chunks)
+
+            # Determine first chunk we still need
+            if resuming:
+                _cache = downloader._local_cache_for(output_path)
+                _cached_set = set(_cache.get_cached_chunks(file_id))
+                _first_needed = next((i for i in range(_tc) if i not in _cached_set), None)
+            else:
+                _first_needed = 0
+
+            # A chunk was consumed if it's not available AND its index is
+            # below the upload frontier (avail + consumed = total uploaded so far)
+            _uploaded_frontier = len(_avail_set) + _chunks_consumed
+            if _first_needed is not None and _first_needed not in _avail_set and _first_needed < _uploaded_frontier:
+                # Chunk was uploaded but already consumed (not just pending upload)
+                print_error(
+                    f"Chunk {_first_needed} has already been consumed (download_once). "
+                    f"Cannot {'resume' if resuming else 'start'} download.\n"
+                    f"   {_chunks_consumed} chunks consumed, "
+                    f"{len(info.available_chunks)} still on server.\n"
+                    f"   Ask the uploader to re-upload, or delete: "
+                    f"[bold]et delete {file_id[:8]}[/bold]"
+                )
+                raise typer.Exit(1)
+
+        # Block: all chunks consumed, upload inactive
         if (
             _chunks_consumed > 0
             and info.available_size == 0
@@ -811,11 +844,11 @@ def download(
             and not getattr(info, "is_upload_complete", False)
         ):
             print_error(
-                f"File chunks already consumed by a previous download "
+                f"All file chunks already consumed by a previous download "
                 f"({_chunks_consumed} chunks downloaded+deleted, retention=download_once).\n"
-                f"   The upload was incomplete and is no longer active. "
+                f"   The upload is incomplete and no longer active. "
                 f"These chunks cannot be retrieved again.\n"
-                f"   Ask the uploader to re-upload the file, or delete this upload: "
+                f"   Ask the uploader to re-upload, or delete: "
                 f"[bold]et delete {file_id[:8]}[/bold]"
             )
             raise typer.Exit(1)
@@ -955,10 +988,12 @@ def list_files(
                 progress_str = f"[green]{bar}[/green] 100%"
             elif _consumed > 0 and _is_chunked and _total_ch > 0:
                 # download_once: show available vs consumed vs pending
-                _avail_ch = max(0, int(uploaded_size / (file_size / _total_ch)) - _consumed) if file_size else 0
-                _b_avail = round(_avail_ch / _total_ch * bar_width)
-                _b_consumed = round(_consumed / _total_ch * bar_width)
-                _b_pending = bar_width - _b_avail - _b_consumed
+                _uploaded_ch = round(uploaded_size / file_size * _total_ch) if file_size else 0
+                _avail_ch = max(0, _uploaded_ch - _consumed)
+                _pending_ch = max(0, _total_ch - _uploaded_ch)
+                _b_avail = min(round(_avail_ch / _total_ch * bar_width), bar_width)
+                _b_consumed = min(round(_consumed / _total_ch * bar_width), bar_width - _b_avail)
+                _b_pending = max(0, bar_width - _b_avail - _b_consumed)
                 bar = (
                     f"[green]{'█' * _b_avail}[/green]"
                     f"[yellow]{'░' * _b_consumed}[/yellow]"

@@ -511,7 +511,10 @@ def create_files_router(storage: TusStorage) -> APIRouter:
 
         is_chunked = info.get("chunked_storage", False)
         chunk_size = info.get("chunk_size") if is_chunked else None
+        # total_chunks may be 0 for partial uploads (only set on finalize)
         total_chunks = info.get("total_chunks") if is_chunked else None
+        if is_chunked and (not total_chunks) and chunk_size and info.get("size"):
+            total_chunks = (info["size"] + chunk_size - 1) // chunk_size
         available_chunks = await storage.get_available_chunks(file_id) if is_chunked else None
 
         # Determine if the upload is complete (all bytes received).

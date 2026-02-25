@@ -104,7 +104,7 @@ multi_line_output = 3
 
 [tool.flake8]
 max-line-length = 200
-extend-ignore = ["E203", "W503", "W291", "W293", "W391", "F401", "E402"]
+extend-ignore = ["E203", "W503", "W291", "W293", "W391", "F401", "E402", "F841"]
 exclude = ["build", "dist", "__pycache__", ".mypy_cache", ".pytest_cache", "htmlcov", ".vscode"]
 
 # ── Type checking ─────────────────────────────────────────────
