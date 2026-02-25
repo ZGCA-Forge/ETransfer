@@ -388,12 +388,16 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         # ── Resolve download speed limit for current user ──
         _dl_speed_limit: Optional[int] = None
         _dl_user = getattr(request.state, "user", None)
+        _dl_rq = getattr(request.app.state, "parsed_role_quotas", {})
         if _dl_user:
             _dl_user_db = getattr(request.app.state, "user_db", None)
             if _dl_user_db:
-                _dl_rq = getattr(request.app.state, "parsed_role_quotas", {})
                 _dl_eff = await _dl_user_db.get_effective_quota(_dl_user, _dl_rq)
                 _dl_speed_limit = _dl_eff.download_speed_limit
+        if _dl_speed_limit is None and _dl_rq:
+            _def_q = _dl_rq.get("user")
+            if _def_q:
+                _dl_speed_limit = getattr(_def_q, "download_speed_limit", None)
 
         # ---- Fast path: pread for Range requests ----
         if range_header:

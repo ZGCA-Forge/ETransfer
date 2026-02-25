@@ -400,7 +400,28 @@ def create_tus_router(
             # Reserve upfront — will release on write failure
             await quota_svc.reserve(patch_owner_id, content_length)
 
+        # Fallback: resolve speed limit when no owner_id (API-token auth)
+        if upload_speed_limit is None:
+            _req_user = getattr(request.state, "user", None)
+            _rq = getattr(request.app.state, "parsed_role_quotas", {})
+            if _req_user:
+                _udb = getattr(request.app.state, "user_db", None)
+                if _udb:
+                    _eff = await _udb.get_effective_quota(_req_user, _rq)
+                    upload_speed_limit = _eff.upload_speed_limit
+            if upload_speed_limit is None and _rq:
+                _def_q = _rq.get("user")
+                if _def_q:
+                    upload_speed_limit = getattr(_def_q, "upload_speed_limit", None)
+
         # ── Wrap receive with speed limiter if needed ────────
+        if upload_speed_limit:
+            logger.debug(
+                "TUS PATCH %s: upload_speed_limit=%d bytes/s (%.1f MB/s)",
+                file_id[:8],
+                upload_speed_limit,
+                upload_speed_limit / 1024 / 1024,
+            )
         _receive = request._receive
         if upload_speed_limit:
             _ul_t0 = time.monotonic()

@@ -412,19 +412,21 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
     app.include_router(create_auth_router(settings.auth_tokens))
 
+    # ── Always parse role quotas (speed limits apply even without user system) ──
+    from etransfer.server.auth.models import RoleQuota
+
+    parsed_role_quotas: dict[str, RoleQuota] = {}
+    for role_name, qdict in settings.role_quotas.items():
+        if isinstance(qdict, dict):
+            parsed_role_quotas[role_name] = RoleQuota(**qdict)
+        else:
+            parsed_role_quotas[role_name] = qdict
+    app.state.parsed_role_quotas = parsed_role_quotas
+
     # User system routes (OIDC, roles, groups, quotas)
     if settings.user_system_enabled:
-        from etransfer.server.auth.models import RoleQuota
         from etransfer.server.auth.oauth import OIDCProvider
         from etransfer.server.auth.routes import create_user_router
-
-        parsed_role_quotas: dict[str, RoleQuota] = {}
-        for role_name, qdict in settings.role_quotas.items():
-            if isinstance(qdict, dict):
-                parsed_role_quotas[role_name] = RoleQuota(**qdict)
-            else:
-                parsed_role_quotas[role_name] = qdict
-        app.state.parsed_role_quotas = parsed_role_quotas
 
         callback_prefix = (
             settings.oidc_callback_url.rstrip("/")
