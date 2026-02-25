@@ -142,16 +142,19 @@ class ParallelUploader:
 
     # ── Upload with prefetch pipeline ────────────────────────
 
-    def _query_server_ranges(self) -> list[list[int]]:
+    def _query_server_ranges(self) -> Optional[list[list[int]]]:
         """Query the server via TUS HEAD for already-received byte ranges.
 
         Parses ``X-Received-Ranges`` (precise, for parallel uploads) first,
         falling back to ``Upload-Offset`` (contiguous from 0).
 
-        Returns a list of [start, end) ranges already uploaded.
+        Returns:
+            A list of [start, end) ranges already uploaded, or an empty
+            list when the upload exists but has no progress yet.
+            ``None`` when the upload is not found on the server.
         """
         if not self.url:
-            return []
+            return None
         base_headers = dict(self.client.headers or {})
         base_headers["Tus-Resumable"] = TUS_VERSION
         try:
@@ -159,7 +162,7 @@ class ParallelUploader:
                 resp = c.head(self.url, headers=base_headers)
                 if resp.status_code in (404, 410):
                     # Upload expired or not found — cannot resume
-                    return []
+                    return None
                 resp.raise_for_status()
 
                 # Prefer X-Received-Ranges for precise parallel resume
@@ -178,9 +181,10 @@ class ParallelUploader:
                 offset = int(resp.headers.get("Upload-Offset", "0"))
                 if offset > 0:
                     return [[0, offset]]
+                # Upload exists on server but has 0 bytes — still valid
                 return []
         except Exception:
-            return []
+            return None
 
     def upload(self) -> Optional[str]:
         """Upload the file using a prefetch pipeline + thread pool.
@@ -195,10 +199,12 @@ class ParallelUploader:
         already_uploaded_ranges: list[list[int]] = []
         if self.url:
             # Resume mode: query server for progress
-            already_uploaded_ranges = self._query_server_ranges()
-            if not already_uploaded_ranges:
+            server_ranges = self._query_server_ranges()
+            if server_ranges is None:
                 # Server doesn't know about this upload — start fresh
                 self.url = None
+            else:
+                already_uploaded_ranges = server_ranges
 
         if not self.url:
             self.url = self._create_upload()

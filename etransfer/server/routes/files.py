@@ -491,7 +491,7 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             received = info.get("received_bytes", 0)
             upload_complete = received >= info["size"]
 
-        logger.debug(
+        logger.info(
             "download_info %s: chunked=%s avail_size=%s avail_chunks=%s "
             "received=%s offset=%s is_final=%s upload_complete=%s",
             file_id[:8],
