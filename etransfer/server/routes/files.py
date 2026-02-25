@@ -286,11 +286,15 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     user_db = getattr(request.app.state, "user_db", None)
                     if user_db and owner_id:
                         await user_db.update_storage_used(owner_id, -len(data))
-                    # Check if all chunks downloaded — if so, clean up metadata
+                    # Only clean up when upload is complete AND all chunks consumed.
+                    # If the upload is still in progress, keep the record so the
+                    # uploader can continue and the downloader keeps polling.
                     remaining = await storage.get_available_chunks(file_id)
                     if not remaining:
-                        await storage.record_download(file_id)
-                        await storage.delete_upload(file_id)
+                        upload = await storage.get_upload(file_id)
+                        if upload and upload.is_complete:
+                            await storage.record_download(file_id)
+                            await storage.delete_upload(file_id)
 
                 background_tasks.add_task(_delete_chunk)
 
@@ -460,11 +464,20 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         total_chunks = info.get("total_chunks") if is_chunked else None
         available_chunks = await storage.get_available_chunks(file_id) if is_chunked else None
 
+        # Determine if the upload is complete (all bytes received).
+        # Use is_final / received_bytes instead of available_size because
+        # download_once chunks are deleted after download, reducing available_size.
+        upload_complete = info.get("is_final", False)
+        if not upload_complete:
+            received = info.get("received_bytes", 0)
+            upload_complete = received >= info["size"]
+
         return DownloadInfo(
             file_id=file_id,
             filename=info["filename"],
             size=info["size"],
             available_size=info["available_size"],
+            is_upload_complete=upload_complete,
             mime_type=info.get("mime_type"),
             checksum=info.get("checksum"),
             chunked_storage=is_chunked,

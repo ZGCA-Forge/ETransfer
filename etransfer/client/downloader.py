@@ -636,15 +636,16 @@ class ChunkDownloader:
                     info = self.get_file_info(file_id)
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 404 and downloaded_chunks:
-                        # download_once: server deleted metadata after all chunks consumed
-                        break
+                        # Fallback: server cleaned up after upload complete + all chunks consumed
+                        if len(downloaded_chunks) >= total_chunks and total_chunks > 0:
+                            break
                     raise
 
                 total_size = info.size
                 chunk_size = info.chunk_size or self.chunk_size
                 total_chunks = info.total_chunks or ((total_size + chunk_size - 1) // chunk_size)
                 available = info.available_chunks or []
-                is_upload_complete = info.available_size >= total_size
+                is_upload_complete = getattr(info, "is_upload_complete", False)
 
                 # Pre-allocate file on first iteration
                 if fd == -1 and total_size > 0:

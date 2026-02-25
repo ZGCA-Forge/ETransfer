@@ -95,6 +95,7 @@ class DownloadInfo(BaseModel):
     filename: str
     size: int
     available_size: int = Field(..., description="Bytes available for download")
+    is_upload_complete: bool = Field(False, description="Whether the upload has finished (all bytes received)")
     mime_type: Optional[str] = None
     checksum: Optional[str] = None
     supports_range: bool = True

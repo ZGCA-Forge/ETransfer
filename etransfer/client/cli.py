@@ -754,13 +754,13 @@ def download(
             )
         console.print(Panel(info_lines, title="[bold cyan]Download[/bold cyan]", border_style="cyan"))
 
-        if info.available_size < info.size:
+        is_partial = not getattr(info, "is_upload_complete", info.available_size >= info.size)
+
+        if is_partial:
             print_warning(
                 f"Only {format_size(info.available_size)} of {format_size(info.size)} "
                 f"available (upload in progress) — will follow upload"
             )
-
-        is_partial = info.available_size < info.size
 
         with create_transfer_progress() as progress:
             task = progress.add_task("[cyan]Downloading", total=info.size if is_partial else info.available_size)
