@@ -1,6 +1,7 @@
 """Extended TUS client for EasyTransfer."""
 
 import mimetypes
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urljoin
@@ -8,9 +9,8 @@ from urllib.parse import urljoin
 import httpx
 from tusclient.client import TusClient
 
-# Re-export for backward compatibility
-from etransfer.client.parallel_uploader import ParallelUploader  # noqa: F401
-from etransfer.client.uploader import EasyTransferUploader  # noqa: F401
+from etransfer.client.parallel_uploader import ParallelUploader
+from etransfer.client.uploader import EasyTransferUploader
 from etransfer.common.constants import AUTH_HEADER, DEFAULT_CHUNK_SIZE, TUS_VERSION
 from etransfer.common.models import FileInfo, ServerInfo
 
@@ -164,8 +164,6 @@ class EasyTransferClient(TusClient):
         Returns:
             Dict with ``reachable``, ``latency_ms``, and optional ``error``.
         """
-        import time
-
         try:
             start = time.monotonic()
             with httpx.Client(timeout=timeout) as c:

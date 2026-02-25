@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from etransfer.common.constants import AUTH_HEADER
 from etransfer.common.fileutil import pread
 from etransfer.common.models import DownloadInfo, ErrorResponse, FileInfo, FileListResponse, FileStatus
+from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
 from etransfer.server.tus.storage import TusStorage
 
 logger = logging.getLogger("etransfer.server.files")
@@ -39,7 +40,7 @@ def _get_caller_info(request: Request) -> tuple[Optional[int], bool]:
         is_admin = getattr(user, "is_admin", False) or getattr(user, "role", "") == "admin"
         return uid, is_admin
 
-    # No auth (auth disabled) → privileged (backward compat)
+    # No auth info → privileged
     return None, True
 
 
@@ -124,6 +125,10 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                             "retention_ttl": f.get("retention_ttl"),
                             "retention_expires_at": f.get("retention_expires_at"),
                             "download_count": f.get("download_count", 0),
+                            "chunks_consumed": f.get("chunks_consumed", 0),
+                            "chunked_storage": f.get("chunked_storage", False),
+                            "total_chunks": f.get("total_chunks", 0),
+                            "uploaded_chunks": f.get("total_chunks", 0),
                         },
                     )
                 )
@@ -150,6 +155,11 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                             "chunks_consumed": u.chunks_consumed,
                             "chunked_storage": u.chunked_storage,
                             "total_chunks": ((u.size + u.chunk_size - 1) // u.chunk_size if u.chunked_storage else 0),
+                            "uploaded_chunks": (
+                                u.received_bytes // u.chunk_size + (1 if u.received_bytes % u.chunk_size else 0)
+                                if u.chunked_storage and u.chunk_size
+                                else 0
+                            ),
                         },
                     )
                 )
@@ -268,10 +278,9 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                 _dl_speed_limit = getattr(_def_q, "download_speed_limit", None)
         _dl_limiter = None
         if _dl_speed_limit:
-            from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
-
             _dl_key = get_user_key(request)
-            _dl_limiter = get_rate_limiter("download", _dl_key, _dl_speed_limit)
+            _num_workers = getattr(getattr(request.app.state, "settings", None), "workers", 1)
+            _dl_limiter = get_rate_limiter("download", _dl_key, _dl_speed_limit, _num_workers)
             logger.debug(
                 "DOWNLOAD %s: download_speed_limit=%d bytes/s (%.1f MB/s), key=%s",
                 file_id[:8],

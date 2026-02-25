@@ -1,8 +1,11 @@
 """Chunked file downloader with HTTP Range support."""
 
+import json
 import logging
 import os
+import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
@@ -85,8 +88,6 @@ class ChunkDownloader:
     @staticmethod
     def _write_part_meta(part_dir: Path, file_id: str, filename: str, size: int, chunk_size: int) -> None:
         """Write ``meta.json`` into the ``.part/`` folder for resume detection."""
-        import json
-
         part_dir.mkdir(parents=True, exist_ok=True)
         meta = {
             "file_id": file_id,
@@ -99,8 +100,6 @@ class ChunkDownloader:
     @staticmethod
     def read_part_meta(part_dir: Path) -> Optional[dict]:
         """Read ``meta.json`` from a ``.part/`` folder. Returns None if missing/invalid."""
-        import json
-
         meta_path = part_dir / "meta.json"
         if not meta_path.exists():
             return None
@@ -315,8 +314,6 @@ class ChunkDownloader:
     @staticmethod
     def _cleanup_part_dir(part_dir: Path) -> None:
         """Remove the ``.part/`` folder after successful download."""
-        import shutil
-
         try:
             shutil.rmtree(part_dir)
         except Exception:
@@ -511,8 +508,6 @@ class ChunkDownloader:
         Returns:
             True if download successful
         """
-        import time
-
         info = self.get_file_info(file_id)
         chunked_mode = info.chunked_storage
 
@@ -636,8 +631,6 @@ class ChunkDownloader:
         Handles download_once files where metadata is deleted after
         all chunks are consumed.
         """
-        import time
-
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 

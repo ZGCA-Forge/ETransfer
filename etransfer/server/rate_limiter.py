@@ -1,8 +1,9 @@
 """Per-user async rate limiter for upload/download speed control.
 
 Uses a token-bucket algorithm shared across all concurrent async tasks
-for the same user within a single worker process.  Each worker enforces
-the full configured speed limit independently.
+for the same user within a single worker process.  The configured speed
+limit is divided by the number of uvicorn workers so that the aggregate
+throughput across all workers matches the configured limit.
 """
 
 import asyncio
@@ -72,24 +73,32 @@ def get_rate_limiter(
     direction: str,
     user_key: str,
     speed_limit: int,
+    num_workers: int = 1,
 ) -> AsyncRateLimiter:
     """Get or create a shared rate limiter.
+
+    The *speed_limit* is divided by *num_workers* so that the aggregate
+    throughput across all worker processes matches the configured limit.
 
     Args:
         direction: ``"upload"`` or ``"download"``.
         user_key: Unique key identifying the user (from :func:`get_user_key`).
-        speed_limit: Target speed limit in bytes/sec.
+        speed_limit: Target speed limit in bytes/sec (total, before division).
+        num_workers: Number of uvicorn worker processes.
 
     Returns:
         A shared :class:`AsyncRateLimiter` instance for the given user/direction.
     """
     store = _upload_limiters if direction == "upload" else _download_limiters
     if user_key not in store:
-        store[user_key] = AsyncRateLimiter(speed_limit)
+        per_worker = speed_limit // max(1, num_workers)
+        store[user_key] = AsyncRateLimiter(per_worker)
         logger.debug(
-            "Created %s rate limiter for %s: %.1f MB/s",
+            "Created %s rate limiter for %s: %.1f MB/s (total %.1f / %d workers)",
             direction,
             user_key,
+            per_worker / 1024 / 1024,
             speed_limit / 1024 / 1024,
+            num_workers,
         )
     return store[user_key]

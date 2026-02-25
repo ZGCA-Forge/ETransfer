@@ -1,11 +1,14 @@
 """Command-line interface for EasyTransfer client."""
 
 import json
+import sys
 import threading
 import time
+from datetime import datetime as _dt
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import typer
 from rich.console import Console
 from rich.panel import Panel
@@ -22,7 +25,15 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
-from etransfer.common.constants import AUTH_HEADER, DEFAULT_CHUNK_SIZE, DEFAULT_SERVER_PORT
+from etransfer import __version__
+from etransfer.client.downloader import ChunkDownloader
+from etransfer.client.tus_client import EasyTransferClient
+from etransfer.common.constants import (
+    AUTH_HEADER,
+    CACHE_DIR_NAME,
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_SERVER_PORT,
+)
 
 app = typer.Typer(
     name="etransfer",
@@ -72,8 +83,6 @@ def _normalise_server_url(address: str) -> str:
     When no scheme is given and no port is specified, defaults to :8765.
     If the user provides a full URL (http/https), it is kept as-is.
     """
-    from etransfer.common.constants import DEFAULT_SERVER_PORT
-
     address = address.strip().rstrip("/")
     if address.startswith(("http://", "https://")):
         return address
@@ -148,18 +157,82 @@ def print_warning(message: str) -> None:
     console.print(f"[bold yellow]⚠[/bold yellow] {message}")
 
 
+_ENDPOINT_CACHE_TTL = 6 * 3600  # 6 hours
+
+
+def _get_endpoint_cache_path() -> Path:
+    p = Path.home() / CACHE_DIR_NAME / "cache" / "endpoint_cache.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _load_endpoint_cache(server: str, for_upload: bool) -> Optional[str]:
+    try:
+        p = _get_endpoint_cache_path()
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text())
+        key = f"{server}|{'upload' if for_upload else 'download'}"
+        entry = data.get(key)
+        if not entry:
+            return None
+        if time.time() - entry.get("ts", 0) > _ENDPOINT_CACHE_TTL:
+            return None
+        return entry.get("endpoint")
+    except Exception:
+        return None
+
+
+def _save_endpoint_cache(server: str, for_upload: bool, endpoint: str) -> None:
+    try:
+        p = _get_endpoint_cache_path()
+        data: dict = {}
+        if p.exists():
+            data = json.loads(p.read_text())
+        key = f"{server}|{'upload' if for_upload else 'download'}"
+        data[key] = {"endpoint": endpoint, "ts": time.time()}
+        p.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _invalidate_endpoint_cache(server: Optional[str] = None) -> None:
+    try:
+        p = _get_endpoint_cache_path()
+        if not p.exists():
+            return
+        if server is None:
+            p.unlink(missing_ok=True)
+            return
+        data = json.loads(p.read_text())
+        changed = False
+        for key in list(data.keys()):
+            if key.startswith(f"{server}|"):
+                del data[key]
+                changed = True
+        if changed:
+            p.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
 def _select_endpoint(server: str, token: Optional[str], for_upload: bool = True) -> str:
     """Query the server for the best available endpoint.
 
     Calls ``/api/endpoints`` to discover all instances (via Redis in
     multi-instance setups), picks the one with the lowest traffic rate,
     and verifies it is reachable.  Falls back to *server* silently.
-    """
-    try:
-        from etransfer.client.tus_client import EasyTransferClient
 
+    Results are cached locally for 6 hours.
+    """
+    cached = _load_endpoint_cache(server, for_upload)
+    if cached:
+        return cached
+
+    try:
         with EasyTransferClient(server, token=token) as client:
             best = client.select_best_reachable_endpoint(for_upload=for_upload, timeout=3.0)
+            _save_endpoint_cache(server, for_upload, best)
             return best
     except Exception:
         return server
@@ -182,8 +255,6 @@ def setup(
         etransfer setup myserver.example.com:8765
         etransfer setup http://myserver.example.com:8765
     """
-    import httpx
-
     server_url = _normalise_server_url(address)
     console.print()
 
@@ -317,7 +388,8 @@ def upload(
         print_error("--retention-ttl is required when using --retention ttl")
         raise typer.Exit(1)
 
-    # Endpoint selection — pick least-loaded reachable instance
+    # Endpoint selection — pick least-loaded reachable instance (cached 6h)
+    _orig_server = server
     target = _select_endpoint(server, token, for_upload=True)
     if target != server:
         console.print(f"  [dim]-> Redirecting to best endpoint: [bold]{target}[/bold][/dim]")
@@ -326,86 +398,105 @@ def upload(
     file_size = file_path.stat().st_size
 
     try:
-        import sys
 
-        from etransfer.client.tus_client import EasyTransferClient
-
-        with EasyTransferClient(server, token=token, chunk_size=chunk_size) as client:
-            uploader = client.create_parallel_uploader(
+        def _make_uploader(srv: str) -> tuple:
+            c = EasyTransferClient(srv, token=token, chunk_size=chunk_size)
+            u = c.create_parallel_uploader(
                 str(file_path),
                 chunk_size=chunk_size,
                 max_concurrent=threads,
-                progress_callback=lambda u, t: None,  # replaced below
+                progress_callback=lambda _u, _t: None,
                 retention=retention,
                 retention_ttl=retention_ttl,
                 wait_on_quota=wait_on_quota,
             )
+            return c, u
 
-            # Create the upload on the server to obtain the file ID
+        client, uploader = _make_uploader(server)
+
+        # Create the upload on the server to obtain the file ID.
+        # On HTTP error, invalidate cached endpoint, re-select, and retry once.
+        try:
             file_id = uploader.ensure_created()
+        except Exception as _create_err:
+            if isinstance(_create_err, (httpx.HTTPStatusError, httpx.ConnectError, httpx.ConnectTimeout, OSError)):
+                _invalidate_endpoint_cache(_orig_server)
+                new_target = _select_endpoint(_orig_server, token, for_upload=True)
+                if new_target != server:
+                    console.print(f"  [dim]-> Endpoint error, retrying on: [bold]{new_target}[/bold][/dim]")
+                    client.close()
+                    server = new_target
+                    client, uploader = _make_uploader(server)
+                    file_id = uploader.ensure_created()
+                else:
+                    raise
+            else:
+                raise
 
-            # Build info text (now includes file_id)
-            info_lines = f"[bold]{file_path.name}[/bold]\n"
-            info_lines += (
-                f"[dim]Size: {format_size(file_size)} | Chunk: {format_size(chunk_size)} | Threads: {threads}[/dim]"
-            )
-            if retention:
-                label = {"permanent": "Permanent", "download_once": "Download Once", "ttl": f"TTL {retention_ttl}s"}
-                info_lines += f"\n[dim]Retention: {label.get(retention, retention)}[/dim]"
-            info_lines += (
-                f"\n[dim]File ID: [bold]{file_id}[/bold]  |  Download: [bold]et download {file_id[:8]}[/bold][/dim]"
-            )
+        # Build info text (now includes file_id)
+        info_lines = f"[bold]{file_path.name}[/bold]\n"
+        info_lines += (
+            f"[dim]Size: {format_size(file_size)} | Chunk: {format_size(chunk_size)} | Threads: {threads}[/dim]"
+        )
+        if retention:
+            label = {"permanent": "Permanent", "download_once": "Download Once", "ttl": f"TTL {retention_ttl}s"}
+            info_lines += f"\n[dim]Retention: {label.get(retention, retention)}[/dim]"
+        info_lines += (
+            f"\n[dim]File ID: [bold]{file_id}[/bold]  |  Download: [bold]et download {file_id[:8]}[/bold][/dim]"
+        )
 
-            # Print header
-            console.print()
-            panel = Panel(
-                info_lines,
-                title="[bold cyan]Upload[/bold cyan]",
-                border_style="cyan",
-            )
-            console.print(panel)
+        # Print header
+        console.print()
+        panel = Panel(
+            info_lines,
+            title="[bold cyan]Upload[/bold cyan]",
+            border_style="cyan",
+        )
+        console.print(panel)
 
-            console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
+        console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
 
-            with create_transfer_progress() as progress:
-                task = progress.add_task("[cyan]Uploading", total=file_size)
-                start_time = time.time()
+        with create_transfer_progress() as progress:
+            task = progress.add_task("[cyan]Uploading", total=file_size)
+            start_time = time.time()
 
-                def update_progress(uploaded: int, total: int) -> None:
-                    progress.update(task, completed=uploaded)
+            def update_progress(uploaded: int, total: int) -> None:
+                progress.update(task, completed=uploaded)
 
-                uploader.progress_callback = update_progress
+            uploader.progress_callback = update_progress
 
-                # Interactive input listener thread
-                def _input_listener() -> None:
-                    while not uploader._cancelled.is_set():
-                        try:
-                            line = sys.stdin.readline()
-                            if not line:
-                                continue
-                            cmd = line.strip().lower()
-                            if cmd in ("q", "quit", "cancel"):
-                                uploader._cancelled.set()
-                                return
-                            elif cmd in ("s", "status"):
-                                elapsed_now = time.time() - start_time
-                                uploaded = uploader._uploaded_bytes
-                                pct = (uploaded / file_size * 100) if file_size else 100
-                                spd = uploaded / elapsed_now if elapsed_now > 0 else 0
-                                console.print(
-                                    f"\n[bold cyan]Status:[/bold cyan] "
-                                    f"{format_size(uploaded)}/{format_size(file_size)} "
-                                    f"({pct:.1f}%) | "
-                                    f"{format_size(int(spd))}/s | "
-                                    f"{elapsed_now:.0f}s elapsed"
-                                )
-                        except Exception:
+            # Interactive input listener thread
+            def _input_listener() -> None:
+                while not uploader._cancelled.is_set():
+                    try:
+                        line = sys.stdin.readline()
+                        if not line:
+                            continue
+                        cmd = line.strip().lower()
+                        if cmd in ("q", "quit", "cancel"):
+                            uploader._cancelled.set()
                             return
+                        elif cmd in ("s", "status"):
+                            elapsed_now = time.time() - start_time
+                            uploaded = uploader._uploaded_bytes
+                            pct = (uploaded / file_size * 100) if file_size else 100
+                            spd = uploaded / elapsed_now if elapsed_now > 0 else 0
+                            console.print(
+                                f"\n[bold cyan]Status:[/bold cyan] "
+                                f"{format_size(uploaded)}/{format_size(file_size)} "
+                                f"({pct:.1f}%) | "
+                                f"{format_size(int(spd))}/s | "
+                                f"{elapsed_now:.0f}s elapsed"
+                            )
+                    except Exception:
+                        return
 
-                input_thread = threading.Thread(target=_input_listener, daemon=True)
-                input_thread.start()
+            input_thread = threading.Thread(target=_input_listener, daemon=True)
+            input_thread.start()
 
-                uploader.upload()
+            uploader.upload()
+
+        client.close()
 
         elapsed = time.time() - start_time
         avg_speed = file_size / elapsed if elapsed > 0 else 0
@@ -425,6 +516,8 @@ def upload(
             console.print("   [dim]Retention: permanent (file won't auto-delete)[/dim]")
 
     except KeyboardInterrupt:
+        if "client" in dir():
+            client.close()  # type: ignore[possibly-undefined]
         console.print()
         print_warning("Upload cancelled by user.")
         cancel_fid: Optional[str] = getattr(uploader, "file_id", None) if "uploader" in dir() else None  # type: ignore[possibly-undefined]
@@ -433,6 +526,8 @@ def upload(
             console.print(f"   [dim]Resume:  [bold]et reupload {cancel_fid[:8]} {file_path}[/bold][/dim]")
         raise typer.Exit(130)
     except Exception as e:
+        if "client" in dir():
+            client.close()  # type: ignore[possibly-undefined]
         console.print()
         print_error(f"Upload failed: {e}")
         raise typer.Exit(1)
@@ -478,8 +573,6 @@ def reupload(
         et reupload 580374 ./largefile.iso
         et reupload 580374 ./largefile.iso -j 8
     """
-    import httpx
-
     server = _get_server_url()
     token = token or _get_token()
 
@@ -561,10 +654,6 @@ def reupload(
     console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
 
     try:
-        import sys
-
-        from etransfer.client.tus_client import EasyTransferClient
-
         with create_transfer_progress() as progress:
             task = progress.add_task("[cyan]Uploading", total=local_size)
             start_time = time.time()
@@ -646,8 +735,6 @@ def _resolve_file_id(prefix: str, server: str, token: Optional[str]) -> str:
     if len(prefix) >= 32:
         return prefix
 
-    from etransfer.client.tus_client import EasyTransferClient
-
     with EasyTransferClient(server, token=token) as client:
         # Fetch enough files to find a match (all pages would be ideal,
         # but a reasonable page size covers most cases)
@@ -722,8 +809,6 @@ def download(
         server = target
 
     try:
-        from etransfer.client.downloader import ChunkDownloader
-
         downloader = ChunkDownloader(server, token=token, max_concurrent=5)
 
         # Get file info
@@ -776,20 +861,17 @@ def download(
             _bar_pending = max(0, _bar_width - _bar_avail - _bar_consumed)
 
             bar = (
+                f"[dim]{'━' * _bar_consumed}[/dim]"
                 f"[bold green]{'━' * _bar_avail}[/bold green]"
-                f"[dim yellow]{'░' * _bar_consumed}[/dim yellow]"
                 f"[dim]{'·' * _bar_pending}[/dim]"
             )
 
-            legend_parts = []
-            if _avail_count > 0:
-                legend_parts.append(f"[bold green]{_pct_avail:.0f}% on server[/bold green]")
-            if _chunks_consumed > 0:
-                legend_parts.append(f"[dim yellow]{_pct_consumed:.0f}% consumed[/dim yellow]")
-            if _pending_count > 0:
-                legend_parts.append(f"[dim]{_pct_pending:.0f}% pending[/dim]")
-
-            info_lines += f"\n{bar}  {' | '.join(legend_parts)}"
+            info_lines += (
+                f"\n{bar}  "
+                f"[dim]{_chunks_consumed}({_pct_consumed:.0f}%) consumed[/dim] | "
+                f"[bold green]{_avail_count}({_pct_avail:.0f}%) cached[/bold green] | "
+                f"[dim]{_pending_count}({_pct_pending:.0f}%) not uploaded[/dim]"
+            )
 
         if resuming:
             chunk_sz = info.chunk_size or downloader.chunk_size
@@ -932,8 +1014,6 @@ def list_files(
     token = token or _get_token()
 
     try:
-        from etransfer.client.tus_client import EasyTransferClient
-
         console.print()
         with console.status("[bold cyan]Loading files...", spinner="dots"):
             with EasyTransferClient(server, token=token) as client:
@@ -982,25 +1062,29 @@ def list_files(
             _is_chunked = metadata.get("chunked_storage", False)
             _total_ch = metadata.get("total_chunks", 0)
 
-            if file_status == "complete" or progress_pct >= 100:
-                status = "[green]● Complete[/green]"
-                bar = "█" * bar_width
-                progress_str = f"[green]{bar}[/green] 100%"
-            elif _consumed > 0 and _is_chunked and _total_ch > 0:
-                # download_once: show available vs consumed vs pending
-                _uploaded_ch = round(uploaded_size / file_size * _total_ch) if file_size else 0
+            if _consumed > 0 and _is_chunked and _total_ch > 0:
+                # download_once: show consumed / cached / not-uploaded
+                _uploaded_ch = metadata.get("uploaded_chunks") or (
+                    round(uploaded_size / file_size * _total_ch) if file_size else 0
+                )
                 _avail_ch = max(0, _uploaded_ch - _consumed)
                 _pending_ch = max(0, _total_ch - _uploaded_ch)
                 _b_avail = min(round(_avail_ch / _total_ch * bar_width), bar_width)
                 _b_consumed = min(round(_consumed / _total_ch * bar_width), bar_width - _b_avail)
                 _b_pending = max(0, bar_width - _b_avail - _b_consumed)
                 bar = (
+                    f"[dim]{'█' * _b_consumed}[/dim]"
                     f"[green]{'█' * _b_avail}[/green]"
-                    f"[yellow]{'░' * _b_consumed}[/yellow]"
                     f"[dim]{'·' * _b_pending}[/dim]"
                 )
-                status = "[yellow]◐ Partial[/yellow]"
-                progress_str = f"{bar} {progress_pct:.0f}%"
+                status = "[yellow]◐ Partial[/yellow]" if _pending_ch > 0 else "[green]● Complete[/green]"
+                progress_str = (
+                    f"{bar} " f"[dim]{_consumed}C[/dim] " f"[green]{_avail_ch}S[/green] " f"[dim]{_pending_ch}P[/dim]"
+                )
+            elif file_status == "complete" or progress_pct >= 100:
+                status = "[green]● Complete[/green]"
+                bar = "█" * bar_width
+                progress_str = f"[green]{bar}[/green] 100%"
             else:
                 filled = int(bar_width * progress_pct / 100)
                 bar = "█" * filled + "░" * (bar_width - filled)
@@ -1020,8 +1104,6 @@ def list_files(
             raw_time = f.get("created_at", "")
             if raw_time:
                 try:
-                    from datetime import datetime as _dt
-
                     if isinstance(raw_time, str):
                         # Handle ISO format with or without timezone
                         ts = raw_time.replace("Z", "+00:00")
@@ -1077,8 +1159,6 @@ def delete(
     token = token or _get_token()
 
     try:
-        from etransfer.client.tus_client import EasyTransferClient
-
         resolved_id = _resolve_file_id(file_id, server, token)
 
         if not force:
@@ -1121,8 +1201,6 @@ def delete_all(
     token = token or _get_token()
 
     try:
-        from etransfer.client.tus_client import EasyTransferClient
-
         with EasyTransferClient(server, token=token) as client:
             files = client.list_files(page=1, page_size=1000, include_partial=True)
 
@@ -1176,10 +1254,6 @@ def info(
     ),
 ) -> None:
     """Show client status, server info, user profile and quota."""
-    import httpx
-
-    from etransfer import __version__
-
     cfg = _load_client_config()
     server = cfg.get("server")
     token = token or _get_token()
@@ -1219,8 +1293,6 @@ def info(
 
     # ── Server Info ───────────────────────────────────────────
     try:
-        from etransfer.client.tus_client import EasyTransferClient
-
         with EasyTransferClient(server, token=token) as client:
             server_info = client.get_server_info()
 
@@ -1311,8 +1383,6 @@ def login(
 
     Run ``etransfer setup <address>`` first to configure the server.
     """
-    import httpx
-
     server = _get_server_url()
     console.print()
 
@@ -1368,8 +1438,6 @@ def login(
 
     def _poll_loop() -> None:
         """Background thread: poll server until login completes or cancelled."""
-        import httpx as _httpx
-
         elapsed = 0
         while not done_event.is_set() and elapsed < timeout:
             time.sleep(poll_interval)
@@ -1377,7 +1445,7 @@ def login(
                 return
             elapsed += poll_interval
             try:
-                r = _httpx.get(poll_url, timeout=10)
+                r = httpx.get(poll_url, timeout=10)
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("completed"):
@@ -1396,9 +1464,6 @@ def login(
     # Main thread: prompt for manual token while poll runs in background
     print_info("Waiting for browser login... (or paste token below to skip)")
     console.print()
-
-    # Use a non-blocking input loop so we can check done_event
-    import sys
 
     console.print("[bold cyan]Token (press Enter after paste): [/bold cyan]", end="")
     sys.stdout.flush()
@@ -1489,8 +1554,6 @@ def login(
 @app.command()
 def logout() -> None:
     """Logout and invalidate session."""
-    import httpx
-
     cfg = _load_client_config()
     server = cfg.get("server")
     token = cfg.get("token")
@@ -1533,8 +1596,6 @@ def recalculate_quota(
     Scans actual files on the server and updates each user's
     storage_used in the database.
     """
-    import httpx
-
     server = _get_server_url()
     token = token or _get_token()
     if not token:
@@ -1797,8 +1858,6 @@ def server_reload(
     API (PUT /api/groups/{id}/quota); they take effect immediately
     without reload.
     """
-    import httpx
-
     # ── Read server config YAML for token & address defaults ──
     yaml_token = None
     yaml_address = None
@@ -1843,8 +1902,6 @@ def server_reload(
 
     url = f"{server_url}/api/admin/reload-config"
     headers: dict[str, str] = {}
-
-    from etransfer.common.constants import AUTH_HEADER
 
     headers[AUTH_HEADER] = token
 

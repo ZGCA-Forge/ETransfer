@@ -19,6 +19,7 @@ from etransfer.common.constants import (
     TusHeaders,
 )
 from etransfer.server.auth.models import RoleQuota
+from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
 from etransfer.server.tus.models import TusCapabilities, TusErrors, TusMetadata, TusUpload
 from etransfer.server.tus.quota import QuotaService
 from etransfer.server.tus.storage import TusStorage
@@ -416,10 +417,9 @@ def create_tus_router(
         # ── Wrap receive with shared per-user rate limiter ────
         _receive = request._receive
         if upload_speed_limit:
-            from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
-
             _ul_key = get_user_key(request)
-            _ul_limiter = get_rate_limiter("upload", _ul_key, upload_speed_limit)
+            _num_workers = getattr(getattr(request.app.state, "settings", None), "workers", 1)
+            _ul_limiter = get_rate_limiter("upload", _ul_key, upload_speed_limit, _num_workers)
             logger.debug(
                 "TUS PATCH %s: upload_speed_limit=%d bytes/s (%.1f MB/s), key=%s",
                 file_id[:8],
