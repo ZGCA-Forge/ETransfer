@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta
 from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response
@@ -146,6 +147,9 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                                 u.retention_expires_at.isoformat() if u.retention_expires_at else None
                             ),
                             "download_count": u.download_count,
+                            "chunks_consumed": u.chunks_consumed,
+                            "chunked_storage": u.chunked_storage,
+                            "total_chunks": ((u.size + u.chunk_size - 1) // u.chunk_size if u.chunked_storage else 0),
                         },
                     )
                 )
@@ -313,15 +317,16 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                     user_db = getattr(request.app.state, "user_db", None)
                     if user_db and owner_id:
                         await user_db.update_storage_used(owner_id, -len(data))
-                    # Only clean up when upload is complete AND all chunks consumed.
-                    # If the upload is still in progress, keep the record so the
-                    # uploader can continue and the downloader keeps polling.
+                    # Track consumption on the upload record
+                    upload = await storage.get_upload(file_id)
+                    if upload:
+                        upload.chunks_consumed += 1
+                        await storage.update_upload(upload)
+                    # Clean up when upload is complete AND all chunks consumed.
                     remaining = await storage.get_available_chunks(file_id)
-                    if not remaining:
-                        upload = await storage.get_upload(file_id)
-                        if upload and upload.is_complete:
-                            await storage.record_download(file_id)
-                            await storage.delete_upload(file_id)
+                    if not remaining and upload and upload.is_complete:
+                        await storage.record_download(file_id)
+                        await storage.delete_upload(file_id)
 
                 background_tasks.add_task(_delete_chunk)
 
@@ -517,9 +522,26 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             received = info.get("received_bytes", 0)
             upload_complete = received >= info["size"]
 
+        # download_once consumption tracking
+        chunks_consumed = info.get("chunks_consumed", 0)
+
+        # Determine if upload is actively receiving data (PATCH within last 5 min)
+        upload_active = True
+        updated_at_str = info.get("updated_at")
+        if updated_at_str:
+            try:
+                if isinstance(updated_at_str, str):
+                    updated_at = datetime.fromisoformat(updated_at_str)
+                else:
+                    updated_at = updated_at_str
+                upload_active = (datetime.utcnow() - updated_at) < timedelta(minutes=5)
+            except (ValueError, TypeError):
+                pass
+
         logger.info(
             "download_info %s: chunked=%s avail_size=%s avail_chunks=%s "
-            "received=%s offset=%s is_final=%s upload_complete=%s",
+            "received=%s offset=%s is_final=%s upload_complete=%s "
+            "chunks_consumed=%d upload_active=%s",
             file_id[:8],
             is_chunked,
             info.get("available_size"),
@@ -528,6 +550,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             info.get("offset", 0),
             info.get("is_final", False),
             upload_complete,
+            chunks_consumed,
+            upload_active,
         )
 
         return DownloadInfo(
@@ -542,6 +566,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             chunk_size=chunk_size,
             total_chunks=total_chunks,
             available_chunks=available_chunks,
+            chunks_consumed=chunks_consumed,
+            upload_active=upload_active,
         )
 
     @router.delete(

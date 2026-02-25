@@ -129,6 +129,9 @@ class TusUpload(BaseModel):
     completed_at: Optional[str] = Field(None, description="ISO timestamp when upload completed")
     total_chunks: int = Field(0, description="Total number of chunks (0 = non-chunked)")
 
+    # download_once consumption tracking
+    chunks_consumed: int = Field(0, description="Number of chunks downloaded+deleted (download_once)")
+
     def _merge_range(self, start: int, end: int) -> None:
         """Merge a new [start, end) range into received_ranges (sorted, coalesced)."""
         new = [start, end]

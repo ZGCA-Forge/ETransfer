@@ -755,6 +755,40 @@ def download(
             f"[bold]{info.filename}[/bold]\n"
             f"[dim]Size: {format_size(info.size)} | Available: {format_size(info.available_size)}[/dim]"
         )
+
+        # Visual server-state bar for chunked files
+        _chunks_consumed = getattr(info, "chunks_consumed", 0)
+        if _chunks_consumed > 0 or (info.chunked_storage and info.available_size < info.size):
+            _total_chunks = info.total_chunks or 1
+            _avail_count = len(info.available_chunks) if info.available_chunks else 0
+            _uploaded_count = _avail_count + _chunks_consumed
+            _pending_count = max(0, _total_chunks - _uploaded_count)
+
+            _pct_avail = (_avail_count / _total_chunks * 100) if _total_chunks else 0
+            _pct_consumed = (_chunks_consumed / _total_chunks * 100) if _total_chunks else 0
+            _pct_pending = (_pending_count / _total_chunks * 100) if _total_chunks else 0
+
+            _bar_width = 40
+            _bar_avail = round(_avail_count / _total_chunks * _bar_width) if _total_chunks else 0
+            _bar_consumed = round(_chunks_consumed / _total_chunks * _bar_width) if _total_chunks else 0
+            _bar_pending = _bar_width - _bar_avail - _bar_consumed
+
+            bar = (
+                f"[bold green]{'━' * _bar_avail}[/bold green]"
+                f"[dim yellow]{'░' * _bar_consumed}[/dim yellow]"
+                f"[dim]{'·' * _bar_pending}[/dim]"
+            )
+
+            legend_parts = []
+            if _avail_count > 0:
+                legend_parts.append(f"[bold green]{_pct_avail:.0f}% on server[/bold green]")
+            if _chunks_consumed > 0:
+                legend_parts.append(f"[dim yellow]{_pct_consumed:.0f}% consumed[/dim yellow]")
+            if _pending_count > 0:
+                legend_parts.append(f"[dim]{_pct_pending:.0f}% pending[/dim]")
+
+            info_lines += f"\n{bar}  {' | '.join(legend_parts)}"
+
         if resuming:
             chunk_sz = info.chunk_size or downloader.chunk_size
             cached_bytes = cached_count * chunk_sz
@@ -767,11 +801,37 @@ def download(
 
         is_partial = not getattr(info, "is_upload_complete", info.available_size >= info.size)
 
-        if is_partial:
-            print_warning(
-                f"Only {format_size(info.available_size)} of {format_size(info.size)} "
-                f"available (upload in progress) — will follow upload"
+        # Detect consumed state: chunks already downloaded+deleted, nothing left
+        _chunks_consumed = getattr(info, "chunks_consumed", 0)
+        _upload_active = getattr(info, "upload_active", True)
+        if (
+            _chunks_consumed > 0
+            and info.available_size == 0
+            and not _upload_active
+            and not getattr(info, "is_upload_complete", False)
+        ):
+            print_error(
+                f"File chunks already consumed by a previous download "
+                f"({_chunks_consumed} chunks downloaded+deleted, retention=download_once).\n"
+                f"   The upload was incomplete and is no longer active. "
+                f"These chunks cannot be retrieved again.\n"
+                f"   Ask the uploader to re-upload the file, or delete this upload: "
+                f"[bold]et delete {file_id[:8]}[/bold]"
             )
+            raise typer.Exit(1)
+
+        if is_partial:
+            if _chunks_consumed > 0:
+                print_warning(
+                    f"Only {format_size(info.available_size)} of {format_size(info.size)} "
+                    f"available — {_chunks_consumed} chunks already consumed (download_once), "
+                    f"waiting for new chunks from upload"
+                )
+            else:
+                print_warning(
+                    f"Only {format_size(info.available_size)} of {format_size(info.size)} "
+                    f"available (upload in progress) — will follow upload"
+                )
 
         with create_transfer_progress() as progress:
             task = progress.add_task("[cyan]Downloading", total=info.size if is_partial else info.available_size)
@@ -882,19 +942,37 @@ def list_files(
             else:
                 progress_pct = 100.0
             bar_width = 10
-            filled = int(bar_width * progress_pct / 100)
-            bar = "█" * filled + "░" * (bar_width - filled)
 
             file_status = f.get("status", "complete")
+            metadata = f.get("metadata") or {}
+            _consumed = metadata.get("chunks_consumed", 0)
+            _is_chunked = metadata.get("chunked_storage", False)
+            _total_ch = metadata.get("total_chunks", 0)
+
             if file_status == "complete" or progress_pct >= 100:
                 status = "[green]● Complete[/green]"
+                bar = "█" * bar_width
                 progress_str = f"[green]{bar}[/green] 100%"
+            elif _consumed > 0 and _is_chunked and _total_ch > 0:
+                # download_once: show available vs consumed vs pending
+                _avail_ch = max(0, int(uploaded_size / (file_size / _total_ch)) - _consumed) if file_size else 0
+                _b_avail = round(_avail_ch / _total_ch * bar_width)
+                _b_consumed = round(_consumed / _total_ch * bar_width)
+                _b_pending = bar_width - _b_avail - _b_consumed
+                bar = (
+                    f"[green]{'█' * _b_avail}[/green]"
+                    f"[yellow]{'░' * _b_consumed}[/yellow]"
+                    f"[dim]{'·' * _b_pending}[/dim]"
+                )
+                status = "[yellow]◐ Partial[/yellow]"
+                progress_str = f"{bar} {progress_pct:.0f}%"
             else:
+                filled = int(bar_width * progress_pct / 100)
+                bar = "█" * filled + "░" * (bar_width - filled)
                 status = "[yellow]◐ Partial[/yellow]"
                 progress_str = f"[yellow]{bar}[/yellow] {progress_pct:.0f}%"
 
             # Retention info from metadata
-            metadata = f.get("metadata") or {}
             retention = metadata.get("retention", f.get("retention", "permanent"))
             retention_labels = {
                 "permanent": "[dim]permanent[/dim]",

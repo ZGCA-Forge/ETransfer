@@ -104,6 +104,9 @@ class DownloadInfo(BaseModel):
     chunk_size: Optional[int] = Field(None, description="Chunk size (when chunked_storage=True)")
     total_chunks: Optional[int] = Field(None, description="Total chunks (when chunked_storage=True)")
     available_chunks: Optional[list[int]] = Field(None, description="Available chunk indices")
+    # download_once lifecycle
+    chunks_consumed: int = Field(0, description="Chunks already downloaded+deleted (download_once)")
+    upload_active: bool = Field(True, description="Whether the upload is actively receiving data")
 
 
 class ErrorResponse(BaseModel):

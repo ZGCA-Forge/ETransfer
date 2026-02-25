@@ -665,14 +665,37 @@ class ChunkDownloader:
                 total_chunks = info.total_chunks or ((total_size + chunk_size - 1) // chunk_size)
                 available = info.available_chunks or []
                 is_upload_complete = getattr(info, "is_upload_complete", False)
+                chunks_consumed = getattr(info, "chunks_consumed", 0)
+                upload_active = getattr(info, "upload_active", True)
 
                 logger.debug(
-                    "chunked poll: avail_chunks=%d total_chunks=%d downloaded=%d is_complete=%s",
+                    "chunked poll: avail_chunks=%d total_chunks=%d downloaded=%d "
+                    "is_complete=%s consumed=%d upload_active=%s",
                     len(available),
                     total_chunks,
                     len(downloaded_chunks),
                     is_upload_complete,
+                    chunks_consumed,
+                    upload_active,
                 )
+
+                # Detect consumed state: chunks were downloaded+deleted,
+                # nothing available, and upload is not actively receiving data.
+                if (
+                    not available
+                    and chunks_consumed > 0
+                    and not upload_active
+                    and len(downloaded_chunks) < total_chunks
+                ):
+                    logger.warning(
+                        "File %s: %d chunks already consumed by previous download, "
+                        "%d/%d downloaded in this session. Cannot retrieve consumed chunks.",
+                        file_id[:8],
+                        chunks_consumed,
+                        len(downloaded_chunks),
+                        total_chunks,
+                    )
+                    return False
 
                 # Pre-allocate file on first iteration
                 if fd == -1 and total_size > 0:

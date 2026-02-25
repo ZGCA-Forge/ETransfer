@@ -6,7 +6,7 @@ import logging
 import os
 import shutil
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -103,16 +103,37 @@ class TusStorage:
             await self.state.set(size_key, str(upload.size), ex=RedisTTL.UPLOAD_SIZE)
             summary["uploads_refreshed"] += 1
 
+            logger.info(
+                "reconcile %s: chunked=%s offset=%d size=%d",
+                upload.file_id[:8],
+                upload.chunked_storage,
+                upload.offset,
+                upload.size,
+            )
+
             if not upload.chunked_storage:
                 continue
 
             chunk_dir = self.get_chunk_dir(upload.file_id)
+            logger.info(
+                "reconcile %s: chunk_dir=%s exists=%s",
+                upload.file_id[:8],
+                chunk_dir,
+                chunk_dir.is_dir(),
+            )
             if not chunk_dir.is_dir():
                 continue
 
             # Scan disk for chunk files
             disk_chunks: set[int] = set()
-            for entry in chunk_dir.iterdir():
+            all_entries = list(chunk_dir.iterdir())
+            logger.info(
+                "reconcile %s: %d entries in chunk_dir, first 5: %s",
+                upload.file_id[:8],
+                len(all_entries),
+                [e.name for e in all_entries[:5]],
+            )
+            for entry in all_entries:
                 if entry.name.startswith("chunk_") and entry.is_file() and entry.stat().st_size > 0:
                     try:
                         idx = int(entry.name.split("_")[1])
@@ -151,7 +172,33 @@ class TusStorage:
             for idx in redis_chunks & disk_chunks:
                 await self.state.expire(self._chunk_state_key(upload.file_id, idx), RedisTTL.CHUNK)
 
-        # ── 2. Reverse reconciliation: disk dirs without Redis upload record ──
+        # ── 2. Cleanup zombie uploads: chunks consumed, empty dir, inactive ──
+        zombie_threshold = datetime.utcnow() - timedelta(hours=1)
+        for upload in uploads:
+            if not upload.chunked_storage:
+                continue
+            if upload.chunks_consumed <= 0:
+                continue
+            chunk_dir = self.get_chunk_dir(upload.file_id)
+            has_files = False
+            if chunk_dir.is_dir():
+                has_files = any(
+                    e.name.startswith("chunk_") and e.is_file() and e.stat().st_size > 0 for e in chunk_dir.iterdir()
+                )
+            if has_files:
+                continue
+            # No chunk files, chunks were consumed, check activity
+            if upload.updated_at < zombie_threshold and not upload.is_complete:
+                logger.warning(
+                    "reconcile %s: zombie upload — %d chunks consumed, " "empty dir, inactive since %s — deleting",
+                    upload.file_id[:8],
+                    upload.chunks_consumed,
+                    upload.updated_at.isoformat(),
+                )
+                await self.delete_upload(upload.file_id)
+                summary["uploads_refreshed"] -= 1
+
+        # ── 3. Reverse reconciliation: disk dirs without Redis upload record ──
         known_file_ids = {u.file_id for u in uploads}
         if self.uploads_path.is_dir():
             for entry in self.uploads_path.iterdir():
@@ -185,8 +232,16 @@ class TusStorage:
                         file_id[:8],
                         len(disk_chunks_rev),
                     )
+                else:
+                    # Empty directory with no Redis record — remove it
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(None, shutil.rmtree, str(entry), True)
+                    logger.info(
+                        "reconcile_state: removed empty orphan dir %s",
+                        file_id[:8],
+                    )
 
-        # ── 3. Refresh file keys TTL ──
+        # ── 4. Refresh file keys TTL ──
         file_keys = await self.state.scan_keys(f"{RedisKeys.FILE_PREFIX}*")
         for fk in file_keys:
             data = await self.state.get(fk)
