@@ -330,6 +330,24 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         )
         await _storage.initialize()
 
+        # Reconcile Redis state with disk (rebuild missing chunk keys, refresh TTLs)
+        reconcile_result = await _storage.reconcile_state()
+        if reconcile_result["chunks_rebuilt"] or reconcile_result["chunks_orphaned"]:
+            logger.warning(
+                "State reconciliation: rebuilt=%d chunk keys, orphaned=%d removed, "
+                "uploads=%d refreshed, files=%d refreshed",
+                reconcile_result["chunks_rebuilt"],
+                reconcile_result["chunks_orphaned"],
+                reconcile_result["uploads_refreshed"],
+                reconcile_result["files_refreshed"],
+            )
+        else:
+            logger.info(
+                "State reconciliation: %d uploads, %d files — all consistent",
+                reconcile_result["uploads_refreshed"],
+                reconcile_result["files_refreshed"],
+            )
+
         # Instance traffic tracker (application-level throughput)
         redis_client = None
         if backend_type.value == "redis":

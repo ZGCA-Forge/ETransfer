@@ -15,14 +15,13 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from etransfer.common.constants import TRAFFIC_MONITOR_INTERVAL, RedisKeys
+from etransfer.common.constants import TRAFFIC_MONITOR_INTERVAL, RedisKeys, RedisTTL
 
 logger = logging.getLogger("etransfer.server.instance_traffic")
 
 # Rolling-window parameters
 _WINDOW_SECONDS = 10  # keep 10 s of samples
 _SAMPLE_INTERVAL = TRAFFIC_MONITOR_INTERVAL  # 1 s between samples
-_REDIS_TTL = 15  # auto-expire stale instance keys
 
 
 @dataclass
@@ -235,7 +234,7 @@ class InstanceTrafficTracker:
             return
         key = f"{RedisKeys.TRAFFIC_PREFIX}{self.endpoint}:{self._pid}"
         try:
-            await self._redis.set(key, json.dumps(self.get_snapshot()), ex=_REDIS_TTL)
+            await self._redis.set(key, json.dumps(self.get_snapshot()), ex=RedisTTL.TRAFFIC)
         except Exception:
             logger.debug("Failed to publish traffic to Redis", exc_info=True)
 

@@ -75,3 +75,16 @@ class RedisKeys:
     LOCK_PREFIX = "et:lock:"
     TRAFFIC_PREFIX = "et:traffic:"
     QUOTA_PREFIX = "et:quota:"  # per-user reserved quota
+    CHUNK_PREFIX = "et:chunk:"
+
+
+# Redis key TTL values (seconds)
+class RedisTTL:
+    UPLOAD = 86400 * 7  # 7 days — incomplete upload record
+    UPLOAD_SIZE = 86400 * 7  # 7 days — fast size lookup
+    CHUNK = 86400 * 7  # 7 days — chunk availability flag (refreshed on write)
+    FILE_PERMANENT = 86400 * 365  # 365 days — completed permanent file
+    FILE_DOWNLOAD_ONCE = 86400 * 7  # 7 days — download_once file (deleted after download)
+    LOCK = 30  # 30 seconds — distributed lock auto-expire
+    QUOTA = 86400 * 7  # 7 days — per-user quota reservation
+    TRAFFIC = 15  # 15 seconds — instance traffic snapshot

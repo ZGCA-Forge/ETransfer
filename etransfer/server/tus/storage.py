@@ -15,7 +15,7 @@ import aiofiles.os  # type: ignore[import-untyped]
 
 logger = logging.getLogger("etransfer.server.tus.storage")
 
-from etransfer.common.constants import RedisKeys
+from etransfer.common.constants import RedisKeys, RedisTTL
 from etransfer.common.fileutil import ftruncate, pwrite
 from etransfer.server.io_pool import io_pool
 from etransfer.server.tus.models import TusUpload
@@ -71,6 +71,148 @@ class TusStorage:
         for path in [self.uploads_path, self.files_path, self.temp_path]:
             path.mkdir(parents=True, exist_ok=True)
 
+    async def reconcile_state(self) -> dict:
+        """Reconcile Redis state with disk after server restart.
+
+        Performs:
+        1. Rebuild missing chunk availability keys from disk files.
+        2. Remove orphaned chunk Redis keys (no matching file on disk).
+        3. Refresh TTLs on all upload/chunk/file keys.
+        4. Clean up stale quota reservations.
+
+        Returns:
+            Summary dict with counts of actions taken.
+        """
+        summary = {
+            "chunks_rebuilt": 0,
+            "chunks_orphaned": 0,
+            "uploads_refreshed": 0,
+            "files_refreshed": 0,
+        }
+
+        # ── 1. Scan all upload records and reconcile chunk keys ──
+        uploads = await self.list_uploads(include_completed=True, include_partial=True)
+        for upload in uploads:
+            # Refresh upload key TTL
+            await self.state.set(
+                self._upload_key(upload.file_id),
+                json.dumps(upload.to_redis_dict()),
+                ex=RedisTTL.UPLOAD,
+            )
+            size_key = f"et:upload:{upload.file_id}:size"
+            await self.state.set(size_key, str(upload.size), ex=RedisTTL.UPLOAD_SIZE)
+            summary["uploads_refreshed"] += 1
+
+            if not upload.chunked_storage:
+                continue
+
+            chunk_dir = self.get_chunk_dir(upload.file_id)
+            if not chunk_dir.is_dir():
+                continue
+
+            # Scan disk for chunk files
+            disk_chunks: set[int] = set()
+            for entry in chunk_dir.iterdir():
+                if entry.name.startswith("chunk_") and entry.is_file() and entry.stat().st_size > 0:
+                    try:
+                        idx = int(entry.name.split("_")[1])
+                        disk_chunks.add(idx)
+                    except (ValueError, IndexError):
+                        continue
+
+            # Get current Redis chunk keys
+            redis_chunks: set[int] = set()
+            pattern = f"{RedisKeys.CHUNK_PREFIX}{upload.file_id}:*"
+            keys = await self.state.scan_keys(pattern)
+            prefix = f"{RedisKeys.CHUNK_PREFIX}{upload.file_id}:"
+            for k in keys:
+                try:
+                    redis_chunks.add(int(k[len(prefix) :]))
+                except (ValueError, IndexError):
+                    continue
+
+            # Rebuild missing keys (disk has file, Redis doesn't)
+            missing = disk_chunks - redis_chunks
+            for idx in missing:
+                await self.state.set(
+                    self._chunk_state_key(upload.file_id, idx),
+                    "1",
+                    ex=RedisTTL.CHUNK,
+                )
+            summary["chunks_rebuilt"] += len(missing)
+
+            # Remove orphaned keys (Redis has key, disk doesn't)
+            orphaned = redis_chunks - disk_chunks
+            for idx in orphaned:
+                await self.state.delete(self._chunk_state_key(upload.file_id, idx))
+            summary["chunks_orphaned"] += len(orphaned)
+
+            # Refresh TTL on existing chunk keys
+            for idx in redis_chunks & disk_chunks:
+                await self.state.expire(self._chunk_state_key(upload.file_id, idx), RedisTTL.CHUNK)
+
+        # ── 2. Reverse reconciliation: disk dirs without Redis upload record ──
+        known_file_ids = {u.file_id for u in uploads}
+        if self.uploads_path.is_dir():
+            for entry in self.uploads_path.iterdir():
+                if not entry.is_dir() or entry.name in known_file_ids:
+                    continue
+                # Directory on disk with no Redis upload record — scan for chunk files
+                file_id = entry.name
+                disk_chunks_rev: set[int] = set()
+                for chunk_entry in entry.iterdir():
+                    if (
+                        chunk_entry.name.startswith("chunk_")
+                        and chunk_entry.is_file()
+                        and chunk_entry.stat().st_size > 0
+                    ):
+                        try:
+                            idx = int(chunk_entry.name.split("_")[1])
+                            disk_chunks_rev.add(idx)
+                        except (ValueError, IndexError):
+                            continue
+                if disk_chunks_rev:
+                    for idx in disk_chunks_rev:
+                        await self.state.set(
+                            self._chunk_state_key(file_id, idx),
+                            "1",
+                            ex=RedisTTL.CHUNK,
+                        )
+                    summary["chunks_rebuilt"] += len(disk_chunks_rev)
+                    logger.warning(
+                        "reconcile_state: orphaned disk dir %s has %d chunk files "
+                        "(no Redis upload record) — rebuilt chunk keys",
+                        file_id[:8],
+                        len(disk_chunks_rev),
+                    )
+
+        # ── 3. Refresh file keys TTL ──
+        file_keys = await self.state.scan_keys(f"{RedisKeys.FILE_PREFIX}*")
+        for fk in file_keys:
+            data = await self.state.get(fk)
+            if data:
+                try:
+                    info = json.loads(data)
+                    retention = info.get("retention", "permanent")
+                    retention_ttl = info.get("retention_ttl")
+                    if retention == "ttl" and retention_ttl:
+                        ttl = int(retention_ttl) + 86400
+                    elif retention == "download_once":
+                        ttl = RedisTTL.FILE_DOWNLOAD_ONCE
+                    else:
+                        ttl = RedisTTL.FILE_PERMANENT
+                    await self.state.expire(fk, ttl)
+                    summary["files_refreshed"] += 1
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+        # ── 3. Clean stale quota reservations ──
+        quota_keys = await self.state.scan_keys(f"{RedisKeys.QUOTA_PREFIX}*")
+        for qk in quota_keys:
+            await self.state.expire(qk, RedisTTL.QUOTA)
+
+        return summary
+
     def get_file_path(self, file_id: str) -> Path:
         """Get the storage path for a file."""
         return self.uploads_path / file_id
@@ -103,7 +245,7 @@ class TusStorage:
         """Get key for file info."""
         return f"{RedisKeys.FILE_PREFIX}{file_id}"
 
-    async def acquire_lock(self, file_id: str, timeout: int = 30) -> bool:
+    async def acquire_lock(self, file_id: str, timeout: int = RedisTTL.LOCK) -> bool:
         """Acquire distributed lock for an upload.
 
         Args:
@@ -194,14 +336,14 @@ class TusStorage:
         await self.state.set(
             key,
             json.dumps(upload.to_redis_dict()),
-            ex=86400 * 7,  # 7 days TTL
+            ex=RedisTTL.UPLOAD,
         )
 
         # Lightweight size key for fast PATCH validation (no JSON parse)
         await self.state.set(
             f"et:upload:{upload.file_id}:size",
             str(upload.size),
-            ex=86400 * 7,
+            ex=RedisTTL.UPLOAD_SIZE,
         )
 
         if upload.chunked_storage:
@@ -255,7 +397,7 @@ class TusStorage:
         await self.state.set(
             key,
             json.dumps(upload.to_redis_dict()),
-            ex=86400 * 7,  # 7 days TTL
+            ex=RedisTTL.UPLOAD,
         )
 
     async def delete_upload(self, file_id: str) -> None:
@@ -502,7 +644,7 @@ class TusStorage:
     async def mark_chunk_available(self, file_id: str, chunk_index: int) -> None:
         """Mark a chunk as available for download in state backend."""
         key = self._chunk_state_key(file_id, chunk_index)
-        await self.state.set(key, "1")
+        await self.state.set(key, "1", ex=RedisTTL.CHUNK)
         logger.debug("mark_chunk_available %s chunk=%d key=%s", file_id[:8], chunk_index, key)
 
     async def is_chunk_available(self, file_id: str, chunk_index: int) -> bool:
@@ -520,6 +662,31 @@ class TusStorage:
                 indices.append(int(k[len(prefix) :]))
             except (ValueError, IndexError):
                 continue
+
+        # Auto-recovery: if Redis has no keys but chunk files exist on disk,
+        # rebuild the availability keys from the filesystem.
+        if not indices:
+            chunk_dir = self.get_chunk_dir(file_id)
+            if chunk_dir.is_dir():
+                recovered = []
+                for entry in chunk_dir.iterdir():
+                    if entry.name.startswith("chunk_") and entry.is_file() and entry.stat().st_size > 0:
+                        try:
+                            idx = int(entry.name.split("_")[1])
+                            await self.state.set(self._chunk_state_key(file_id, idx), "1", ex=RedisTTL.CHUNK)
+                            recovered.append(idx)
+                        except (ValueError, IndexError):
+                            continue
+                if recovered:
+                    recovered.sort()
+                    indices = recovered
+                    logger.warning(
+                        "get_available_chunks %s: recovered %d chunks from disk: %s",
+                        file_id[:8],
+                        len(recovered),
+                        recovered[:10],
+                    )
+
         indices.sort()
         logger.debug(
             "get_available_chunks %s: pattern=%s found=%d keys indices=%s",
@@ -632,7 +799,14 @@ class TusStorage:
         upload.download_count = 0
 
         file_key = self._file_key(file_id)
-        await self.state.set(file_key, json.dumps(upload.to_redis_dict()))
+        # TTL based on retention policy
+        if upload.retention == "ttl" and upload.retention_ttl:
+            file_ttl = upload.retention_ttl + 86400  # retention TTL + 1 day buffer
+        elif upload.retention == "download_once":
+            file_ttl = RedisTTL.FILE_DOWNLOAD_ONCE
+        else:
+            file_ttl = RedisTTL.FILE_PERMANENT
+        await self.state.set(file_key, json.dumps(upload.to_redis_dict()), ex=file_ttl)
 
         # Update upload record
         await self.update_upload(upload)
@@ -738,7 +912,14 @@ class TusStorage:
         if data:
             upload = TusUpload.from_redis_dict(json.loads(data))
             upload.download_count += 1
-            await self.state.set(file_key, json.dumps(upload.to_redis_dict()))
+            # Apply TTL based on retention policy
+            if upload.retention == "ttl" and upload.retention_ttl:
+                file_ttl = int(upload.retention_ttl) + 86400
+            elif upload.retention == "download_once":
+                file_ttl = RedisTTL.FILE_DOWNLOAD_ONCE
+            else:
+                file_ttl = RedisTTL.FILE_PERMANENT
+            await self.state.set(file_key, json.dumps(upload.to_redis_dict()), ex=file_ttl)
 
             return {
                 "should_delete": upload.retention == "download_once",

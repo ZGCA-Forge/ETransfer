@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from etransfer.common.constants import RedisKeys
+from etransfer.common.constants import RedisKeys, RedisTTL
 
 if TYPE_CHECKING:
     from etransfer.server.services.state import StateManager
@@ -41,7 +41,9 @@ class QuotaService:
 
     async def reserve(self, user_id: int, size: int) -> None:
         """Reserve *size* bytes for an upload (atomic INCRBY)."""
-        await self._state.incr(self._key(user_id), size)
+        key = self._key(user_id)
+        await self._state.incr(key, size)
+        await self._state.expire(key, RedisTTL.QUOTA)
 
     async def release(self, user_id: int, size: int) -> None:
         """Release *size* reserved bytes (atomic DECRBY, floor at 0)."""
@@ -50,4 +52,6 @@ class QuotaService:
         # Floor at 0 to avoid negative drift
         val = await self._state.get(key)
         if val and int(val) < 0:
-            await self._state.set(key, "0")
+            await self._state.set(key, "0", ex=RedisTTL.QUOTA)
+        else:
+            await self._state.expire(key, RedisTTL.QUOTA)
