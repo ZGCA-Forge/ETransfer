@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "etransfer"
-version = "0.1.12"
+version = "0.1.13"
 description = "A TUS-based file transfer tool with chunked upload/download support"
 readme = "README.md"
 license = "Apache-2.0"
@@ -147,7 +147,7 @@ skips = ["B101", "B110"]
 # ── Version management ────────────────────────────────────────
 
 [tool.bumpversion]
-current_version = "0.1.12"
+current_version = "0.1.13"
 commit = true
 tag = true
 tag_name = "v{new_version}"
