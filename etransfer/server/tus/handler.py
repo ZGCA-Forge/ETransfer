@@ -263,6 +263,12 @@ def create_tus_router(
         headers = get_tus_headers()
         headers[TusHeaders.UPLOAD_OFFSET] = str(upload.offset)
         headers[TusHeaders.UPLOAD_LENGTH] = str(upload.size)
+        headers["X-Received-Bytes"] = str(upload.received_bytes)
+        if upload.received_ranges:
+            # Expose received ranges for efficient parallel resume
+            # Format: "0-500,600-800" (byte ranges, end-exclusive)
+            range_parts = [f"{r[0]}-{r[1]}" for r in upload.received_ranges]
+            headers["X-Received-Ranges"] = ",".join(range_parts)
         if upload.chunked_storage:
             headers["X-Chunk-Size"] = str(upload.chunk_size)
             available = await storage.get_available_chunks(file_id)

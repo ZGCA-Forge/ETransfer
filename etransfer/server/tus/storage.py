@@ -798,11 +798,11 @@ class TusStorage:
             - uploads_count: number of in-progress uploads
             - is_full: True if storage is at capacity
         """
-        # Calculate actual disk usage
+        # Calculate actual disk usage (recursive to include chunked upload subdirs)
         used = 0
         for path_dir in [self.uploads_path, self.files_path]:
             if path_dir.exists():
-                for f in path_dir.iterdir():
+                for f in path_dir.rglob("*"):
                     if f.is_file():
                         used += f.stat().st_size
 

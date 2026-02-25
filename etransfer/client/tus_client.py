@@ -307,8 +307,13 @@ class EasyTransferClient(TusClient):
         retention: Optional[str] = None,
         retention_ttl: Optional[int] = None,
         wait_on_quota: bool = True,
+        resume_url: Optional[str] = None,
     ) -> ParallelUploader:
-        """Create a parallel uploader for a file."""
+        """Create a parallel uploader for a file.
+
+        If ``resume_url`` is provided, the uploader skips TUS CREATE and
+        queries the server for already-uploaded ranges to resume.
+        """
         file_path_obj = Path(file_path)
         if not file_path_obj.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -337,4 +342,5 @@ class EasyTransferClient(TusClient):
             progress_callback=progress_callback,
             endpoints=endpoints,
             wait_on_quota=wait_on_quota,
+            resume_url=resume_url,
         )

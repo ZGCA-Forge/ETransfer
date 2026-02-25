@@ -59,14 +59,46 @@ class ChunkDownloader:
     def _local_cache_for(output_path: Path) -> LocalCache:
         """Create a ``LocalCache`` rooted next to *output_path*.
 
-        For ``/data/movie.mp4`` the cache dir is ``/data/.movie.mp4.parts/``.
+        For ``/data/movie.mp4`` the cache dir is ``/data/.movie.mp4.part/``.
         This keeps partial chunks visible alongside the target file and
         avoids polluting a global ``~/.etransfer/cache`` directory.
         """
         parent = output_path.parent
         name = output_path.name
-        cache_dir = parent / f".{name}.parts"
+        cache_dir = parent / f".{name}.part"
         return LocalCache(cache_dir=cache_dir)
+
+    @staticmethod
+    def _part_dir_for(output_path: Path) -> Path:
+        """Return the ``.{name}.part/`` directory path for an output file."""
+        return output_path.parent / f".{output_path.name}.part"
+
+    @staticmethod
+    def _write_part_meta(part_dir: Path, file_id: str, filename: str, size: int, chunk_size: int) -> None:
+        """Write ``meta.json`` into the ``.part/`` folder for resume detection."""
+        import json
+
+        part_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "file_id": file_id,
+            "filename": filename,
+            "size": size,
+            "chunk_size": chunk_size,
+        }
+        (part_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def read_part_meta(part_dir: Path) -> Optional[dict]:
+        """Read ``meta.json`` from a ``.part/`` folder. Returns None if missing/invalid."""
+        import json
+
+        meta_path = part_dir / "meta.json"
+        if not meta_path.exists():
+            return None
+        try:
+            return json.loads(meta_path.read_text(encoding="utf-8"))  # type: ignore[no-any-return]
+        except Exception:
+            return None
 
     def _write_at(self, fd_or_path: "int | str", data: bytes, offset: int) -> None:
         """Write *data* at *offset* using pwrite (fd) or seek+write (path).
@@ -178,7 +210,12 @@ class ChunkDownloader:
         progress_callback: Optional[Callable[[int, int], None]] = None,
         use_cache: bool = True,
     ) -> bool:
-        """Download a file with chunked transfer.
+        """Download a file with chunked transfer and automatic resume.
+
+        On start, writes ``meta.json`` into a ``.{name}.part/`` folder next
+        to the output file.  If the ``.part/`` folder already exists with
+        cached chunks, those chunks are skipped (resume).  On completion the
+        ``.part/`` folder is removed.
 
         Automatically detects chunked_storage mode from server and uses
         chunk-index downloads (?chunk=N) instead of Range headers.
@@ -197,11 +234,21 @@ class ChunkDownloader:
         total_size = info.size
         chunked_mode = info.chunked_storage
 
+        # Write part meta for resume detection
+        part_dir = self._part_dir_for(Path(output_path))
+        self._write_part_meta(
+            part_dir,
+            file_id,
+            info.filename,
+            total_size,
+            info.chunk_size or self.chunk_size,
+        )
+
         if chunked_mode:
             # Chunk-index mode: server stores individual chunk files
             chunk_size = info.chunk_size or self.chunk_size
             total_chunks = info.total_chunks or ((total_size + chunk_size - 1) // chunk_size)
-            return self._download_chunked(
+            success = self._download_chunked(
                 file_id,
                 output_path,
                 total_size,
@@ -210,57 +257,61 @@ class ChunkDownloader:
                 progress_callback,
                 use_cache,
             )
+            if success:
+                self._cleanup_part_dir(part_dir)
+            return success
 
-        # Range mode: standard download
+        # Range mode: standard download — always use cache for resume
         available_size = info.available_size
         total_chunks = (available_size + self.chunk_size - 1) // self.chunk_size
 
-        if use_cache:
-            cache = self._local_cache_for(Path(output_path))
-            cache.set_file_meta(file_id, info.filename, available_size, self.chunk_size)
-            cached_chunks = set(cache.get_cached_chunks(file_id))
+        cache = self._local_cache_for(Path(output_path))
+        cache.set_file_meta(file_id, info.filename, available_size, self.chunk_size)
+        cached_chunks = set(cache.get_cached_chunks(file_id))
 
-            downloaded_bytes = len(cached_chunks) * self.chunk_size
-            if progress_callback and cached_chunks:
-                progress_callback(downloaded_bytes, available_size)
+        downloaded_bytes = len(cached_chunks) * self.chunk_size
+        if progress_callback and cached_chunks:
+            progress_callback(downloaded_bytes, available_size)
 
-            with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
-                futures = {}
-                for i in range(total_chunks):
-                    if i in cached_chunks:
-                        continue
-                    future = executor.submit(
-                        self._download_and_cache_chunk,
-                        file_id,
-                        i,
-                        available_size,
-                        cache,
-                    )
-                    futures[future] = i
+        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+            futures = {}
+            for i in range(total_chunks):
+                if i in cached_chunks:
+                    continue
+                future = executor.submit(
+                    self._download_and_cache_chunk,
+                    file_id,
+                    i,
+                    available_size,
+                    cache,
+                )
+                futures[future] = i
 
-                for future in futures:
-                    try:
-                        chunk_data = future.result()
-                        downloaded_bytes += len(chunk_data)
-                        if progress_callback:
-                            progress_callback(downloaded_bytes, available_size)
-                    except Exception as e:
-                        print(f"Error downloading chunk {futures[future]}: {e}")
-                        return False
+            for future in futures:
+                try:
+                    chunk_data = future.result()
+                    downloaded_bytes += len(chunk_data)
+                    if progress_callback:
+                        progress_callback(downloaded_bytes, available_size)
+                except Exception as e:
+                    print(f"Error downloading chunk {futures[future]}: {e}")
+                    return False
 
-            success = cache.assemble_file(file_id, output_path)
-            if success:
-                cache.clear_file(file_id)
-            return success
+        success = cache.assemble_file(file_id, output_path)
+        if success:
+            cache.clear_file(file_id)
+            self._cleanup_part_dir(part_dir)
+        return success
 
-        # Direct-write download: pre-allocate file and write chunks at their offsets
-        return self._download_range_direct(
-            file_id,
-            output_path,
-            available_size,
-            total_chunks,
-            progress_callback,
-        )
+    @staticmethod
+    def _cleanup_part_dir(part_dir: Path) -> None:
+        """Remove the ``.part/`` folder after successful download."""
+        import shutil
+
+        try:
+            shutil.rmtree(part_dir)
+        except Exception:
+            pass
 
     def _download_chunked(
         self,
@@ -434,20 +485,19 @@ class ChunkDownloader:
         output_path: Path,
         progress_callback: Optional[Callable[[int, int], None]] = None,
         poll_interval: float = 2.0,
-        use_cache: bool = True,
     ) -> bool:
         """Download a file that may still be uploading.
 
         Polls for new data and downloads chunks as they become available.
         For chunked_storage files, polls available_chunks from server.
         Finishes when the upload is complete and all data is downloaded.
+        Uses cache-based storage for resume support.
 
         Args:
             file_id: File identifier
             output_path: Output file path
             progress_callback: Progress callback (downloaded_bytes, total_bytes)
             poll_interval: Seconds between polling for new data
-            use_cache: Use local chunk cache
 
         Returns:
             True if download successful
@@ -457,102 +507,92 @@ class ChunkDownloader:
         info = self.get_file_info(file_id)
         chunked_mode = info.chunked_storage
 
+        # Write part meta for resume detection
+        part_dir = self._part_dir_for(Path(output_path))
+        self._write_part_meta(
+            part_dir,
+            file_id,
+            info.filename,
+            info.size,
+            info.chunk_size or self.chunk_size,
+        )
+
         if chunked_mode:
-            return self._download_file_follow_chunked(
+            success = self._download_file_follow_chunked(
                 file_id,
                 output_path,
                 progress_callback,
                 poll_interval,
             )
+            if success:
+                self._cleanup_part_dir(part_dir)
+            return success
 
-        # Range-based follow download (non-chunked)
+        # Range-based follow download (non-chunked) — always use cache for resume
         downloaded_chunks: set[int] = set()
         downloaded_bytes = 0
         last_available = 0
         total_size = 0
-        fd: int = -1
         cache: Optional[LocalCache] = None
-        path_str = str(Path(output_path))
 
-        try:
-            while True:
-                info = self.get_file_info(file_id)
-                total_size = info.size
-                available = info.available_size
-                is_complete = available >= total_size
+        while True:
+            info = self.get_file_info(file_id)
+            total_size = info.size
+            available = info.available_size
+            is_complete = available >= total_size
 
-                if available > last_available:
-                    last_available = available
-                    total_chunks = (available + self.chunk_size - 1) // self.chunk_size
+            if available > last_available:
+                last_available = available
+                total_chunks = (available + self.chunk_size - 1) // self.chunk_size
 
-                    if use_cache and cache is None:
-                        cache = self._local_cache_for(Path(output_path))
-                        cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
+                if cache is None:
+                    cache = self._local_cache_for(Path(output_path))
+                    cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
+                    # Pick up any previously cached chunks (resume)
+                    downloaded_chunks = set(cache.get_cached_chunks(file_id))
+                    downloaded_bytes = len(downloaded_chunks) * self.chunk_size
+                    if progress_callback and downloaded_chunks:
+                        progress_callback(downloaded_bytes, total_size)
 
-                    # Pre-allocate file and open fd on first data
-                    if fd == -1 and total_size > 0:
-                        output_path = Path(output_path)
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(output_path, "wb") as f:
-                            f.seek(total_size - 1)
-                            f.write(b"\0")
-                        if not use_cache:
-                            if self.use_pwrite:
-                                fd = os.open(path_str, os.O_WRONLY | getattr(os, "O_BINARY", 0))
-                            else:
-                                fd = 0  # sentinel: file created
+                # Download newly available chunks
+                new_indices = [i for i in range(total_chunks) if i not in downloaded_chunks]
+                if new_indices:
+                    with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
+                        futures = {
+                            executor.submit(
+                                self._download_and_cache_chunk,
+                                file_id,
+                                i,
+                                available,
+                                cache,
+                            ): i
+                            for i in new_indices
+                        }
 
-                    # Download newly available chunks
-                    new_indices = [i for i in range(total_chunks) if i not in downloaded_chunks]
-                    if new_indices:
-                        with ThreadPoolExecutor(max_workers=self.max_concurrent) as executor:
-                            if use_cache:
-                                futures = {
-                                    executor.submit(
-                                        self._download_and_cache_chunk,
-                                        file_id,
-                                        i,
-                                        available,
-                                        cache,
-                                    ): i
-                                    for i in new_indices
-                                }
-                            else:
-                                _path = path_str  # capture for closure
+                        for future in futures:
+                            try:
+                                chunk_data = future.result()
+                                downloaded_chunks.add(futures[future])
+                                downloaded_bytes += len(chunk_data)
+                                if progress_callback:
+                                    progress_callback(downloaded_bytes, total_size)
+                            except Exception as e:
+                                print(f"Error downloading chunk {futures[future]}: {e}")
+                                return False
 
-                                def _dl_write(idx: int) -> bytes:
-                                    data = self.download_chunk(file_id, idx, total_size=available)
-                                    self._write_at(fd if self.use_pwrite else _path, data, idx * self.chunk_size)
-                                    return data
+            if is_complete and downloaded_bytes >= total_size:
+                break
 
-                                futures = {executor.submit(_dl_write, i): i for i in new_indices}
-
-                            for future in futures:
-                                try:
-                                    chunk_data = future.result()
-                                    downloaded_chunks.add(futures[future])
-                                    downloaded_bytes += len(chunk_data)
-                                    if progress_callback:
-                                        progress_callback(downloaded_bytes, total_size)
-                                except Exception as e:
-                                    print(f"Error downloading chunk {futures[future]}: {e}")
-                                    return False
-
-                if is_complete and downloaded_bytes >= total_size:
-                    break
-
-                if not is_complete:
-                    time.sleep(poll_interval)
-        finally:
-            if self.use_pwrite and fd > 0:
-                os.close(fd)
+            if not is_complete:
+                time.sleep(poll_interval)
 
         # Assemble file from cache
-        if use_cache and cache is not None:
+        if cache is not None:
             cache.set_file_meta(file_id, info.filename, total_size, self.chunk_size)
             success = cache.assemble_file(file_id, output_path)
             if success:
                 cache.clear_file(file_id)
+                self._cleanup_part_dir(part_dir)
             return success
 
         return True

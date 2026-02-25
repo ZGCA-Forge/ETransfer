@@ -46,6 +46,7 @@ class ParallelUploader:
         wait_on_quota: bool = True,
         quota_poll_interval: float = 5.0,
         quota_max_wait: float = 3600.0,
+        resume_url: Optional[str] = None,
     ) -> None:
         self.client = client
         self.file_path = file_path
@@ -56,7 +57,7 @@ class ParallelUploader:
         self.retries = retries
         self.progress_callback = progress_callback
         self.endpoints = endpoints or []
-        self.url: Optional[str] = None
+        self.url: Optional[str] = resume_url
         self._uploaded_bytes = 0
         self._lock = threading.Lock()
         self.wait_on_quota = wait_on_quota
@@ -121,14 +122,91 @@ class ParallelUploader:
 
     # ── Upload with prefetch pipeline ────────────────────────
 
+    def _query_server_ranges(self) -> list[list[int]]:
+        """Query the server via TUS HEAD for already-received byte ranges.
+
+        Parses ``X-Received-Ranges`` (precise, for parallel uploads) first,
+        falling back to ``Upload-Offset`` (contiguous from 0).
+
+        Returns a list of [start, end) ranges already uploaded.
+        """
+        if not self.url:
+            return []
+        base_headers = dict(self.client.headers or {})
+        base_headers["Tus-Resumable"] = TUS_VERSION
+        try:
+            with httpx.Client(timeout=30.0) as c:
+                resp = c.head(self.url, headers=base_headers)
+                if resp.status_code in (404, 410):
+                    # Upload expired or not found — cannot resume
+                    return []
+                resp.raise_for_status()
+
+                # Prefer X-Received-Ranges for precise parallel resume
+                ranges_header = resp.headers.get("X-Received-Ranges", "")
+                if ranges_header:
+                    ranges: list[list[int]] = []
+                    for part in ranges_header.split(","):
+                        part = part.strip()
+                        if "-" in part:
+                            s, e = part.split("-", 1)
+                            ranges.append([int(s), int(e)])
+                    if ranges:
+                        return ranges
+
+                # Fallback: contiguous offset
+                offset = int(resp.headers.get("Upload-Offset", "0"))
+                if offset > 0:
+                    return [[0, offset]]
+                return []
+        except Exception:
+            return []
+
     def upload(self) -> Optional[str]:
         """Upload the file using a prefetch pipeline + thread pool.
+
+        If ``resume_url`` was provided at construction, the uploader queries
+        the server for already-uploaded ranges and skips those chunks.
 
         Returns:
             The upload URL on success.
         """
-        self.url = self._create_upload()
+        # Determine which chunks are already uploaded (for resume)
+        already_uploaded_ranges: list[list[int]] = []
+        if self.url:
+            # Resume mode: query server for progress
+            already_uploaded_ranges = self._query_server_ranges()
+            if not already_uploaded_ranges:
+                # Server doesn't know about this upload — start fresh
+                self.url = None
+
+        if not self.url:
+            self.url = self._create_upload()
+
         chunks = self._build_chunk_plan()
+        if not chunks:
+            return self.url
+
+        # Filter out already-uploaded chunks
+        if already_uploaded_ranges:
+            remaining_chunks = []
+            skipped_bytes = 0
+            for offset, length in chunks:
+                chunk_end = offset + length
+                already_done = False
+                for r in already_uploaded_ranges:
+                    if r[0] <= offset and chunk_end <= r[1]:
+                        already_done = True
+                        break
+                if already_done:
+                    skipped_bytes += length
+                else:
+                    remaining_chunks.append((offset, length))
+            chunks = remaining_chunks
+            self._uploaded_bytes = skipped_bytes
+            if self.progress_callback:
+                self.progress_callback(self._uploaded_bytes, self.file_size)
+
         if not chunks:
             return self.url
 

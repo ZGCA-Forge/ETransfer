@@ -474,7 +474,7 @@ def create_user_router(
         if not storage:
             raise HTTPException(500, "Storage not available")
 
-        # Gather actual file sizes per owner — completed files
+        # Gather actual file sizes per owner — completed files + partial uploads
         files = await storage.list_files()
         owner_sizes: dict[int, int] = {}
         orphan_size = 0
@@ -485,6 +485,15 @@ def create_user_router(
                 owner_sizes[oid] = owner_sizes.get(oid, 0) + size
             else:
                 orphan_size += size
+
+        # Also count partial (in-progress) uploads by actual received bytes
+        partial_uploads = await storage.list_uploads(include_completed=False, include_partial=True)
+        for u in partial_uploads:
+            oid = u.owner_id
+            if oid is not None:
+                owner_sizes[oid] = owner_sizes.get(oid, 0) + u.offset
+            else:
+                orphan_size += u.offset
 
         # Update each user
         updated = []

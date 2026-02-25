@@ -22,7 +22,7 @@ from rich.progress import (
 from rich.table import Table
 from rich.text import Text
 
-from etransfer.common.constants import DEFAULT_CHUNK_SIZE, DEFAULT_SERVER_PORT
+from etransfer.common.constants import AUTH_HEADER, DEFAULT_CHUNK_SIZE, DEFAULT_SERVER_PORT
 
 app = typer.Typer(
     name="etransfer",
@@ -404,6 +404,205 @@ def upload(
         raise typer.Exit(1)
 
 
+@app.command()
+def reupload(
+    file_id: str = typer.Argument(..., help="File ID (or short prefix) of the partial upload to resume"),
+    file_path: Path = typer.Argument(..., help="Path to the local file (must match server record)"),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    threads: int = typer.Option(
+        4,
+        "--threads",
+        "-j",
+        help="Number of concurrent upload threads",
+        min=1,
+        max=32,
+    ),
+    wait_on_quota: bool = typer.Option(
+        True,
+        "--wait-on-quota/--no-wait-on-quota",
+        help="Auto-wait and resume when storage quota is full",
+    ),
+) -> None:
+    """Resume a previously interrupted upload.
+
+    Requires the file ID (or short prefix) from the original upload and the
+    same local file.  The server record is validated against the local file:
+
+      - Filename must match
+      - File size must match
+
+    Retention policy and chunk size are inherited from the original upload
+    and cannot be changed.
+
+    Examples:
+        et reupload 580374 ./largefile.iso
+        et reupload 580374 ./largefile.iso -j 8
+    """
+    import httpx
+
+    server = _get_server_url()
+    token = token or _get_token()
+
+    if not file_path.exists():
+        print_error(f"File not found: {file_path}")
+        raise typer.Exit(1)
+
+    # Resolve short prefix to full file ID
+    resolved_id = _resolve_file_id(file_id, server, token)
+
+    # Query server for the upload record via /api/files/{id}
+    headers: dict[str, str] = {}
+    if token:
+        headers[AUTH_HEADER] = token
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        with httpx.Client(timeout=30.0) as http:
+            resp = http.get(f"{server}/api/files/{resolved_id}", headers=headers)
+            resp.raise_for_status()
+            record = resp.json()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            print_error(f"Upload [bold]{resolved_id[:8]}[/bold].. not found on server")
+        else:
+            print_error(f"Server error: {e.response.status_code}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(f"Failed to query server: {e}")
+        raise typer.Exit(1)
+
+    # Parse server record
+    server_status = record.get("status", "complete")
+    uploaded_size = record.get("uploaded_size", 0)
+    server_size = record.get("size", 0)
+    server_filename = record.get("filename", "")
+    server_chunk_size = record.get("chunk_size") or DEFAULT_CHUNK_SIZE
+
+    # Validate: status must be partial
+    if server_status == "complete" or uploaded_size >= server_size:
+        print_error(
+            f"Upload [bold]{resolved_id[:8]}[/bold].. is already complete "
+            f"({format_size(server_size)}). Nothing to reupload."
+        )
+        raise typer.Exit(1)
+
+    # Validate: filename must match
+    local_filename = file_path.name
+    if local_filename != server_filename:
+        print_error(
+            f"Filename mismatch: local [bold]{local_filename}[/bold] " f"!= server [bold]{server_filename}[/bold]"
+        )
+        raise typer.Exit(1)
+
+    # Validate: file size must match
+    local_size = file_path.stat().st_size
+    if local_size != server_size:
+        print_error(f"File size mismatch: local {format_size(local_size)} " f"!= server {format_size(server_size)}")
+        raise typer.Exit(1)
+
+    # Build resume URL: server_url + /tus/ + file_id
+    resume_url = f"{server}/tus/{resolved_id}"
+
+    progress_pct = (uploaded_size / server_size * 100) if server_size else 0
+    metadata = record.get("metadata") or {}
+    retention = metadata.get("retention", record.get("retention", "?"))
+
+    # Print header
+    console.print()
+    info_lines = (
+        f"[bold]{server_filename}[/bold]\n"
+        f"[dim]Size: {format_size(server_size)} | Chunk: {format_size(server_chunk_size)} "
+        f"| Threads: {threads}[/dim]\n"
+        f"[dim]Retention: {retention} (from original upload)[/dim]\n"
+        f"[bold yellow]Resuming[/bold yellow] [dim]{resolved_id[:8]}.. \u2014 "
+        f"already uploaded {format_size(uploaded_size)} ({progress_pct:.0f}%)[/dim]"
+    )
+    console.print(Panel(info_lines, title="[bold cyan]Re-upload[/bold cyan]", border_style="yellow"))
+    console.print("[dim]  Press [bold]q[/bold]+Enter to cancel | [bold]s[/bold]+Enter for status[/dim]")
+
+    try:
+        import sys
+
+        from etransfer.client.tus_client import EasyTransferClient
+
+        with create_transfer_progress() as progress:
+            task = progress.add_task("[cyan]Uploading", total=local_size)
+            start_time = time.time()
+
+            def update_progress(uploaded: int, total: int) -> None:
+                progress.update(task, completed=uploaded)
+
+            with EasyTransferClient(server, token=token, chunk_size=server_chunk_size) as client:
+                uploader = client.create_parallel_uploader(
+                    str(file_path),
+                    chunk_size=server_chunk_size,
+                    max_concurrent=threads,
+                    progress_callback=update_progress,
+                    wait_on_quota=wait_on_quota,
+                    resume_url=resume_url,
+                )
+
+                # Interactive input listener thread
+                def _input_listener() -> None:
+                    while not uploader._cancelled.is_set():
+                        try:
+                            line = sys.stdin.readline()
+                            if not line:
+                                continue
+                            cmd = line.strip().lower()
+                            if cmd in ("q", "quit", "cancel"):
+                                uploader._cancelled.set()
+                                return
+                            elif cmd in ("s", "status"):
+                                elapsed_now = time.time() - start_time
+                                uploaded = uploader._uploaded_bytes
+                                pct = (uploaded / local_size * 100) if local_size else 100
+                                spd = uploaded / elapsed_now if elapsed_now > 0 else 0
+                                console.print(
+                                    f"\n[bold cyan]Status:[/bold cyan] "
+                                    f"{format_size(uploaded)}/{format_size(local_size)} "
+                                    f"({pct:.1f}%) | "
+                                    f"{format_size(int(spd))}/s | "
+                                    f"{elapsed_now:.0f}s elapsed"
+                                )
+                        except Exception:
+                            return
+
+                input_thread = threading.Thread(target=_input_listener, daemon=True)
+                input_thread.start()
+
+                location = uploader.upload()
+
+        elapsed = time.time() - start_time
+        avg_speed = local_size / elapsed if elapsed > 0 else 0
+
+        console.print()
+        print_success("Re-upload complete!")
+        console.print(f"   [dim]Time: {elapsed:.1f}s | Avg Speed: {format_size(int(avg_speed))}/s[/dim]")
+
+        if location:
+            fid = location.split("/")[-1]
+            console.print(f"   [dim]File ID: [bold]{fid}[/bold][/dim]")
+            console.print(f"   [dim]Download: [bold]et download {fid[:8]}[/bold][/dim]")
+
+    except KeyboardInterrupt:
+        console.print()
+        print_warning("Upload cancelled by user.")
+        console.print(f"   [dim]Resume again: [bold]et reupload {resolved_id[:8]} {file_path.name}[/bold][/dim]")
+        raise typer.Exit(130)
+    except Exception as e:
+        console.print()
+        print_error(f"Re-upload failed: {e}")
+        console.print(f"   [dim]Retry: [bold]et reupload {resolved_id[:8]} {file_path.name}[/bold][/dim]")
+        raise typer.Exit(1)
+
+
 def _resolve_file_id(prefix: str, server: str, token: Optional[str]) -> str:
     """Resolve a short file ID prefix to the full ID by querying the server.
 
@@ -450,13 +649,12 @@ def download(
         "-o",
         help="Output directory or file path",
     ),
-    no_cache: bool = typer.Option(
-        True,
-        "--no-cache/--cache",
-        help="Direct-write mode (faster) vs chunk cache mode",
-    ),
 ) -> None:
-    """Download a file from the server."""
+    """Download a file from the server.
+
+    If a previous download was interrupted, the ``.{name}.part/`` folder
+    is detected automatically and the download resumes from where it left off.
+    """
     if file_id is None:
         console.print()
         console.print("[bold cyan]et download[/bold cyan] — Download a file from the server\n")
@@ -465,13 +663,16 @@ def download(
         console.print("  FILE_ID                  File ID or short prefix (e.g. 6a9111db)\n")
         console.print("[bold]Options:[/bold]")
         console.print("  -o, --output PATH        Output directory or file path [default: current dir]")
-        console.print("      --no-cache/--cache   Direct-write (faster) vs chunk cache [default: no-cache]")
         console.print("  -t, --token TEXT         API token (overrides saved session)")
         console.print()
         console.print("[bold]Examples:[/bold]")
         console.print("  [dim]et download 6a9111db[/dim]                  # download to current dir")
         console.print("  [dim]et download 6a9111db -o ~/Downloads[/dim]   # download to specific dir")
         console.print("  [dim]et download 6a91 -o myfile.zip[/dim]        # short prefix + rename")
+        console.print()
+        console.print("[bold]Resume:[/bold]")
+        console.print("  [dim]Interrupted downloads are resumed automatically.[/dim]")
+        console.print("  [dim]Just re-run the same command — the .part/ folder is detected.[/dim]")
         return
 
     server = _get_server_url()
@@ -488,22 +689,6 @@ def download(
         # Get file info
         info = downloader.get_file_info(file_id)
 
-        # Print header
-        console.print()
-        panel = Panel(
-            f"[bold]{info.filename}[/bold]\n"
-            f"[dim]Size: {format_size(info.size)} | Available: {format_size(info.available_size)}[/dim]",
-            title="[bold cyan]📥 Download[/bold cyan]",
-            border_style="cyan",
-        )
-        console.print(panel)
-
-        if info.available_size < info.size:
-            print_warning(
-                f"Only {format_size(info.available_size)} of {format_size(info.size)} "
-                f"available (upload in progress) — will follow upload"
-            )
-
         # Determine output path
         if output is None:
             output_path = Path.cwd() / info.filename
@@ -511,6 +696,40 @@ def download(
             output_path = output / info.filename
         else:
             output_path = output
+
+        # Auto-detect resume from .part/ folder
+        part_dir = downloader._part_dir_for(output_path)
+        resuming = False
+        cached_count = 0
+        if part_dir.exists():
+            part_meta = downloader.read_part_meta(part_dir)
+            if part_meta and part_meta.get("file_id") == file_id:
+                cache = downloader._local_cache_for(output_path)
+                cached_count = len(cache.get_cached_chunks(file_id))
+                if cached_count > 0:
+                    resuming = True
+
+        # Print header
+        console.print()
+        info_lines = (
+            f"[bold]{info.filename}[/bold]\n"
+            f"[dim]Size: {format_size(info.size)} | Available: {format_size(info.available_size)}[/dim]"
+        )
+        if resuming:
+            chunk_sz = info.chunk_size or downloader.chunk_size
+            cached_bytes = cached_count * chunk_sz
+            pct = (cached_bytes / info.size * 100) if info.size else 0
+            info_lines += (
+                f"\n[bold yellow]Resuming[/bold yellow] [dim]— "
+                f"already cached {cached_count} chunks ({format_size(cached_bytes)}, {pct:.0f}%)[/dim]"
+            )
+        console.print(Panel(info_lines, title="[bold cyan]Download[/bold cyan]", border_style="cyan"))
+
+        if info.available_size < info.size:
+            print_warning(
+                f"Only {format_size(info.available_size)} of {format_size(info.size)} "
+                f"available (upload in progress) — will follow upload"
+            )
 
         is_partial = info.available_size < info.size
 
@@ -526,14 +745,12 @@ def download(
                     file_id,
                     output_path,
                     progress_callback=update_progress,
-                    use_cache=not no_cache,
                 )
             else:
                 success = downloader.download_file(
                     file_id,
                     output_path,
                     progress_callback=update_progress,
-                    use_cache=not no_cache,
                 )
 
         elapsed = time.time() - start_time
@@ -551,7 +768,8 @@ def download(
 
     except KeyboardInterrupt:
         console.print()
-        print_warning("Download cancelled by user.")
+        print_warning("Download cancelled.")
+        console.print(f"   [dim]Resume: re-run [bold]et download {file_id[:8]}[/bold][/dim]")
         raise typer.Exit(130)
     except Exception as e:
         console.print()
