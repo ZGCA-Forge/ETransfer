@@ -18,6 +18,8 @@ from etransfer.server.middleware.traffic import TrafficCounterMiddleware
 from etransfer.server.routes.auth import create_auth_router
 from etransfer.server.routes.files import create_files_router
 from etransfer.server.routes.info import create_info_router
+from etransfer.server.routes.plugins import create_plugins_router
+from etransfer.server.routes.tasks import create_tasks_router
 from etransfer.server.services.instance_traffic import InstanceTrafficTracker
 from etransfer.server.services.state import BackendType, close_state_manager, get_state_manager
 from etransfer.server.tus.handler import TusHandler
@@ -373,6 +375,22 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             # Reconcile storage_used with actual files on disk / state backend
             await _reconcile_storage_quotas(_storage, _user_db)
 
+        # Task manager (Source/Sink pipeline)
+        from etransfer.plugins.registry import plugin_registry
+        from etransfer.server.tasks.manager import TaskManager
+
+        plugin_registry.discover()
+        sink_presets = getattr(settings, "sink_presets", None) or {}
+        app.state.sink_presets = sink_presets
+        _task_manager = TaskManager(
+            state_manager=state_manager,
+            storage=_storage,
+            registry=plugin_registry,
+            download_dir=settings.storage_path / "downloads",
+            sink_presets=sink_presets,
+        )
+        app.state.task_manager = _task_manager
+
         # Background tasks
         asyncio.create_task(cleanup_loop(settings.cleanup_interval, lambda: _storage, lambda: _user_db))
         if settings.config_watch:
@@ -429,6 +447,8 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     )
 
     app.include_router(create_auth_router(settings.auth_tokens))
+    app.include_router(create_tasks_router())
+    app.include_router(create_plugins_router())
 
     # ── Always parse role quotas (speed limits apply even without user system) ──
     from etransfer.server.auth.models import RoleQuota
@@ -466,6 +486,13 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
     # Admin routes
     app.include_router(create_admin_router(_propagate_hot_changes))
+
+    # ── SPA static files (must be last — catches all unmatched routes) ──
+    from fastapi.staticfiles import StaticFiles
+
+    _dist = Path(__file__).parent.parent.parent / "web" / "dist"
+    if _dist.exists():
+        app.mount("/", StaticFiles(directory=str(_dist), html=True), name="spa")
 
     return app
 

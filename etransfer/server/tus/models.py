@@ -24,6 +24,9 @@ class TusMetadata(BaseModel):
     checksum: Optional[str] = Field(None, description="File checksum")
     retention: Optional[str] = Field(None, description="Retention policy: permanent/download_once/ttl")
     retention_ttl: Optional[int] = Field(None, description="TTL in seconds (for ttl policy)")
+    relative_path: Optional[str] = Field(None, description="Relative path for folder uploads")
+    sink: Optional[str] = Field(None, description="Sink plugin name for upload forwarding")
+    sink_config: Optional[str] = Field(None, description="Base64-encoded JSON sink config")
 
     @classmethod
     def from_header(cls, header_value: str) -> "TusMetadata":
@@ -62,6 +65,9 @@ class TusMetadata(BaseModel):
             checksum=metadata.get("checksum"),
             retention=metadata.get("retention"),
             retention_ttl=(int(metadata["retention_ttl"]) if metadata.get("retention_ttl") else None),
+            relative_path=metadata.get("relativePath") or metadata.get("relative_path"),
+            sink=metadata.get("sink"),
+            sink_config=metadata.get("sink_config"),
         )
 
     def to_header(self) -> str:
@@ -80,6 +86,15 @@ class TusMetadata(BaseModel):
 
         if self.retention_ttl is not None:
             items.append(f"retention_ttl {base64.b64encode(str(self.retention_ttl).encode()).decode()}")
+
+        if self.relative_path:
+            items.append(f"relativePath {base64.b64encode(self.relative_path.encode()).decode()}")
+
+        if self.sink:
+            items.append(f"sink {base64.b64encode(self.sink.encode()).decode()}")
+
+        if self.sink_config:
+            items.append(f"sink_config {base64.b64encode(self.sink_config.encode()).decode()}")
 
         return ",".join(items)
 
@@ -131,6 +146,14 @@ class TusUpload(BaseModel):
 
     # download_once consumption tracking
     chunks_consumed: int = Field(0, description="Number of chunks downloaded+deleted (download_once)")
+
+    # Sink forwarding state
+    sink_plugin: Optional[str] = Field(None, description="Sink plugin name for forwarding")
+    sink_session_id: Optional[str] = Field(None, description="Sink multipart session ID")
+    sink_parts: list[dict] = Field(default_factory=list, description="Completed sink part results")
+
+    # Folder upload
+    relative_path: Optional[str] = Field(None, description="Relative path for folder uploads")
 
     def _merge_range(self, start: int, end: int) -> None:
         """Merge a new [start, end) range into received_ranges (sorted, coalesced)."""

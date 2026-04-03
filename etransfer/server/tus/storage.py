@@ -837,7 +837,15 @@ class TusStorage:
         else:
             # Single-file: move to final location
             src_path = self.get_file_path(file_id)
-            dst_path = self.get_final_path(file_id, upload.filename)
+
+            # Folder upload: respect relative_path for directory structure
+            rel = getattr(upload, "relative_path", None)
+            if rel:
+                dst_path = self.files_path / file_id / rel
+                dst_path.parent.mkdir(parents=True, exist_ok=True)
+            else:
+                dst_path = self.get_final_path(file_id, upload.filename)
+
             if src_path.exists():
                 await aiofiles.os.rename(str(src_path), str(dst_path))
             storage_path = str(dst_path)

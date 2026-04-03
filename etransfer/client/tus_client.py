@@ -351,3 +351,42 @@ class EasyTransferClient(TusClient):
             wait_on_quota=wait_on_quota,
             resume_url=resume_url,
         )
+
+    # ── Task / Plugin API ─────────────────────────────────────
+
+    def create_task(
+        self,
+        source_url: str,
+        sink: Optional[str] = None,
+        sink_config: Optional[dict] = None,
+        retention: str = "permanent",
+        retention_ttl: Optional[int] = None,
+    ) -> dict:
+        """Create a remote download (+push) task on the server."""
+        body: dict = {"source_url": source_url, "retention": retention}
+        if sink:
+            body["sink_plugin"] = sink
+        if sink_config:
+            body["sink_config"] = sink_config
+        if retention_ttl is not None:
+            body["retention_ttl"] = retention_ttl
+        resp = self._http.post("/api/tasks", json=body)
+        resp.raise_for_status()
+        return resp.json()  # type: ignore[no-any-return]
+
+    def get_task(self, task_id: str) -> dict:
+        resp = self._http.get(f"/api/tasks/{task_id}")
+        resp.raise_for_status()
+        return resp.json()  # type: ignore[no-any-return]
+
+    def list_tasks(self) -> list:
+        resp = self._http.get("/api/tasks")
+        resp.raise_for_status()
+        return resp.json()  # type: ignore[no-any-return]
+
+    def list_plugins(self) -> dict:
+        sources_resp = self._http.get("/api/plugins/sources")
+        sources_resp.raise_for_status()
+        sinks_resp = self._http.get("/api/plugins/sinks")
+        sinks_resp.raise_for_status()
+        return {"sources": sources_resp.json(), "sinks": sinks_resp.json()}

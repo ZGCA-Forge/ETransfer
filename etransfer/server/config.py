@@ -187,6 +187,14 @@ class ServerSettings(BaseSettings):
         description="Per-role quota defaults. Env: ETRANSFER_ROLE_QUOTAS as JSON.",
     )
 
+    # Sink presets (per-sink-plugin presets with role/group/default tiers)
+    sink_presets: dict = Field(
+        default_factory=dict,
+        description="Per-sink-plugin preset configs. "
+        "Format: {tos: {default: {bucket: ..., ak: ...}, vip: {...}}}. "
+        "Env: ETRANSFER_SINK_PRESETS as JSON.",
+    )
+
     # CORS
     cors_origins: list[str] = Field(["*"], description="CORS allowed origins")
 
@@ -309,6 +317,12 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
         for key in ("host", "port", "user", "password", "database"):
             if key in mysql:
                 d[f"mysql_{key}"] = mysql[key]
+
+    # Sink presets from YAML
+    if "sinks" in config:
+        sinks_cfg = config["sinks"]
+        if "presets" in sinks_cfg:
+            d["sink_presets"] = sinks_cfg["presets"]
 
     # Logging — accept `logging.level` or top-level `log_level`
     if "logging" in config:

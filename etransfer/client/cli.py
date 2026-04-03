@@ -2063,5 +2063,80 @@ cors:
         console.print(Panel(config_content, title="[bold cyan]Sample Config[/bold cyan]", border_style="cyan"))
 
 
+@app.command("remote-download")
+def remote_download(
+    url: str = typer.Argument(..., help="URL to download on the server"),
+    server: str = typer.Option(f"http://localhost:{DEFAULT_SERVER_PORT}", "--server", "-s"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos)"),
+    sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON"),
+    retention: str = typer.Option("permanent", "--retention", help="permanent / download_once / ttl"),
+    retention_ttl: Optional[int] = typer.Option(None, "--retention-ttl", help="TTL seconds"),
+) -> None:
+    """Create a remote download task on the server."""
+    headers: dict = {}
+    if token:
+        headers[AUTH_HEADER] = token
+
+    body: dict = {"source_url": url, "retention": retention}
+    if sink:
+        body["sink_plugin"] = sink
+    if sink_config:
+        body["sink_config"] = json.loads(sink_config)
+    if retention_ttl is not None:
+        body["retention_ttl"] = retention_ttl
+
+    try:
+        resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        print_success(f"Task created: {data.get('task_id', '')[:12]}...")
+        console.print(f"  Source: {data.get('source_plugin', '?')}")
+        console.print(f"  Sink:   {data.get('sink_plugin') or 'local'}")
+        console.print(f"  Status: {data.get('status')}")
+    except httpx.HTTPStatusError as e:
+        print_error(f"Server error: {e.response.text}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+
+@app.command("plugins")
+def list_plugins_cmd(
+    server: str = typer.Option(f"http://localhost:{DEFAULT_SERVER_PORT}", "--server", "-s"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+) -> None:
+    """List available Source and Sink plugins on the server."""
+    headers: dict = {}
+    if token:
+        headers[AUTH_HEADER] = token
+
+    try:
+        sources_resp = httpx.get(f"{server.rstrip('/')}/api/plugins/sources", headers=headers, timeout=15)
+        sinks_resp = httpx.get(f"{server.rstrip('/')}/api/plugins/sinks", headers=headers, timeout=15)
+
+        table = Table(title="Source Plugins")
+        table.add_column("Name")
+        table.add_column("Display")
+        table.add_column("Hosts")
+        table.add_column("Priority")
+        for s in sources_resp.json():
+            hosts = ", ".join(s.get("supported_hosts", [])) or "*"
+            table.add_row(s["name"], s["display_name"], hosts, str(s.get("priority", 0)))
+        console.print(table)
+
+        table2 = Table(title="Sink Plugins")
+        table2.add_column("Name")
+        table2.add_column("Display")
+        table2.add_column("Multipart")
+        for s in sinks_resp.json():
+            table2.add_row(s["name"], s["display_name"], "Yes" if s.get("supports_multipart") else "No")
+        console.print(table2)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()

@@ -231,7 +231,50 @@ def create_tus_router(
             owner_id=owner_id,
             chunked_storage=use_chunked,
             chunk_size=chunk_size,
+            sink_plugin=tus_metadata.sink,
+            relative_path=tus_metadata.relative_path,
         )
+
+        # Initialize sink if specified
+        if tus_metadata.sink:
+            try:
+                from etransfer.plugins.base_sink import SinkContext
+                from etransfer.plugins.registry import plugin_registry
+
+                user = getattr(request.state, "user", None)
+                sink_config_raw = None
+                if tus_metadata.sink_config:
+                    import base64 as _b64
+                    import json as _json
+
+                    try:
+                        sink_config_raw = _json.loads(_b64.b64decode(tus_metadata.sink_config).decode())
+                    except Exception:
+                        sink_config_raw = None
+
+                ctx = SinkContext(
+                    user=user,
+                    client_metadata={"sink_config": sink_config_raw} if sink_config_raw else {},
+                    retention=retention,
+                    filename=tus_metadata.filename,
+                    file_size=upload_length,
+                )
+                sink_presets = getattr(request.app.state, "sink_presets", {})
+                resolved_cfg = plugin_registry.resolve_sink_config(
+                    tus_metadata.sink, ctx, sink_presets.get(tus_metadata.sink, {})
+                )
+                sink_inst = plugin_registry.create_sink(tus_metadata.sink, config=resolved_cfg)
+                session_id = await sink_inst.initialize_upload(
+                    tus_metadata.filename, {"file_id": file_id, "retention": retention}
+                )
+                upload.sink_session_id = session_id
+                # Cache sink instance on app state for PATCH access
+                if not hasattr(request.app.state, "_sink_sessions"):
+                    request.app.state._sink_sessions = {}
+                request.app.state._sink_sessions[file_id] = sink_inst
+                logger.debug("TUS CREATE %s: sink=%s session=%s", file_id[:8], tus_metadata.sink, session_id[:12])
+            except Exception:
+                logger.exception("Failed to initialize sink %s for %s", tus_metadata.sink, file_id[:8])
 
         # Save to storage
         await storage.create_upload(upload)
@@ -452,6 +495,23 @@ def create_tus_router(
                     content_length,
                 )
                 await storage.mark_chunk_available(file_id, chunk_index)
+
+                # Sink forwarding: push chunk to remote storage
+                if upload_record and upload_record.sink_plugin and upload_record.sink_session_id:
+                    _sink_sessions = getattr(request.app.state, "_sink_sessions", {})
+                    _sink_inst = _sink_sessions.get(file_id)
+                    if _sink_inst:
+                        try:
+                            chunk_data = await storage.read_chunk_file(file_id, chunk_index)
+                            part_result = await _sink_inst.upload_part(
+                                upload_record.sink_session_id,
+                                chunk_index + 1,  # TOS part_number is 1-based
+                                chunk_data,
+                            )
+                            upload_record.sink_parts.append(part_result.model_dump())
+                            await storage.update_upload(upload_record)
+                        except Exception:
+                            logger.exception("Sink push failed: file=%s chunk=%d", file_id[:8], chunk_index)
             else:
                 written = await storage.write_chunk_streaming(
                     file_id,
@@ -507,6 +567,24 @@ def create_tus_router(
                     "yes" if user_db else "no",
                 )
             await storage.finalize_upload(file_id)
+
+            # Complete sink multipart upload
+            if upload.sink_plugin and upload.sink_session_id:
+                _sink_sessions = getattr(request.app.state, "_sink_sessions", {})
+                _sink_inst = _sink_sessions.pop(file_id, None)
+                if _sink_inst and upload.sink_parts:
+                    try:
+                        from etransfer.plugins.base_sink import PartResult as _PR
+
+                        parts = [_PR(**p) for p in upload.sink_parts]
+                        asyncio.create_task(_sink_inst.complete_upload(upload.sink_session_id, parts))
+                        logger.info(
+                            "TUS FINALIZE %s: sink complete queued (%d parts)",
+                            file_id[:8],
+                            len(parts),
+                        )
+                    except Exception:
+                        logger.exception("Sink complete failed: %s", file_id[:8])
 
         # ── Response ─────────────────────────────────────────
         headers = get_tus_headers()

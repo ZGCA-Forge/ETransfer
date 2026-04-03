@@ -53,6 +53,9 @@ redis = [
 mysql = [
     "aiomysql>=0.2.0",
 ]
+tos = [
+    "tos>=2.7.0",
+]
 dev = [
     "etransfer[server]",
     "pytest>=7.0.0",
@@ -75,6 +78,13 @@ all = [
 [project.scripts]
 etransfer = "etransfer.client.cli:app"
 et = "etransfer.client.cli:app"
+
+[project.entry-points."etransfer.sources"]
+direct = "etransfer.plugins.sources.direct:DirectLinkSource"
+
+[project.entry-points."etransfer.sinks"]
+local = "etransfer.plugins.sinks.local:LocalSink"
+tos = "etransfer.plugins.sinks.tos_multipart:TosSink"
 
 [project.urls]
 Homepage = "https://github.com/ZGCA-Forge/ETransfer"
