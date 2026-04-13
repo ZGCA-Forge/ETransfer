@@ -118,6 +118,10 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         """Process request and validate token."""
         path = request.url.path
 
+        # Only require auth for API and TUS protocol paths; let SPA/static assets through
+        if not (path.startswith("/api/") or path.startswith("/tus")):
+            return await call_next(request)
+
         # Skip authentication for excluded paths
         for exclude in self.exclude_paths:
             if path.startswith(exclude):
@@ -150,6 +154,9 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         # Also try X-API-Token as session token (CLI sends session here)
         if not session_token and api_token:
             session_token = api_token
+        # Query parameter fallback (for download URLs opened via window.open)
+        if not session_token:
+            session_token = request.query_params.get("token")
 
         if session_token and self.user_db:
             # Fast path: check in-process cache first

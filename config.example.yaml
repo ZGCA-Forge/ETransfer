@@ -30,7 +30,7 @@ auth:
 
 # File retention policies
 retention:
-  default: permanent # permanent / download_once / ttl
+  default: download_once # download_once / permanent / ttl
   # default_ttl: 86400  # Default TTL in seconds (for ttl policy)
   # token_policies:
   #   guest-token:

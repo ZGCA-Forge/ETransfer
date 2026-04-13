@@ -116,8 +116,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
                         size=f["size"],
                         uploaded_size=f["size"],
                         status=FileStatus.COMPLETE,
-                        mime_type=f.get("mime_type"),
-                        checksum=f.get("checksum"),
+                        mime_type=f.get("mime_type") or "application/octet-stream",
+                        checksum=f.get("checksum") or "",
                         created_at=f.get("created_at", ""),
                         updated_at=f.get("updated_at", ""),
                         expires_at=f.get("expires_at"),
@@ -214,8 +214,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             filename=info["filename"],
             size=total_size,
             uploaded_size=uploaded_size,
-            mime_type=info.get("mime_type"),
-            checksum=info.get("checksum"),
+            mime_type=info.get("mime_type") or "application/octet-stream",
+            checksum=info.get("checksum") or "",
             status=FileStatus.COMPLETE if is_complete else FileStatus.PARTIAL,
             chunk_size=storage.chunk_size,
             total_chunks=(total_size + storage.chunk_size - 1) // storage.chunk_size,
@@ -607,8 +607,8 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             size=info["size"],
             available_size=info["available_size"],
             is_upload_complete=upload_complete,
-            mime_type=info.get("mime_type"),
-            checksum=info.get("checksum"),
+            mime_type=info.get("mime_type") or "application/octet-stream",
+            checksum=info.get("checksum") or "",
             chunked_storage=is_chunked,
             chunk_size=chunk_size,
             total_chunks=total_chunks,
@@ -670,5 +670,51 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             "status": "ok",
             "cleaned": cleaned,
         }
+
+    @router.post("/{file_id}/push")
+    async def push_file_to_sink(file_id: str, request: Request) -> dict[str, Any]:
+        """Push an uploaded file to a sink (e.g. object storage).
+
+        Body: {"sink_plugin": "tos", "sink_config": {...}}
+        If sink_config is omitted, server presets are used.
+        """
+        body = await request.json()
+        sink_plugin = body.get("sink_plugin")
+        if not sink_plugin:
+            raise HTTPException(400, "sink_plugin is required")
+
+        file_info = await storage.get_file_info(file_id)
+        if not file_info:
+            raise HTTPException(404, "File not found")
+
+        filename = file_info.get("filename", file_id)
+        file_size = file_info.get("size", 0)
+
+        file_path = storage.get_file_path(file_id)
+        if not file_path.exists():
+            final_path = storage.get_final_path(file_id, filename)
+            if final_path.exists():
+                file_path = final_path
+            else:
+                raise HTTPException(404, "File data not found on disk")
+
+        mgr = getattr(request.app.state, "task_manager", None)
+        if mgr is None:
+            raise HTTPException(503, "Task manager not initialized")
+
+        user = getattr(request.state, "user", None)
+        owner_id = getattr(user, "id", None) if user else None
+        sink_config = body.get("sink_config")
+
+        task = await mgr.push_file(
+            file_path=file_path,
+            filename=filename,
+            file_size=file_size,
+            sink_plugin=sink_plugin,
+            sink_config=sink_config,
+            owner_id=owner_id,
+            user=user,
+        )
+        return {"task_id": task.task_id, "status": task.status.value}
 
     return router

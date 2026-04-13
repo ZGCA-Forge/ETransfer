@@ -25,6 +25,8 @@ from etransfer.server.tus.models import TusCapabilities, TusErrors, TusMetadata,
 from etransfer.server.tus.quota import QuotaService
 from etransfer.server.tus.storage import TusStorage
 
+from etransfer.common.fileutil import derive_sink_object_key
+
 logger = logging.getLogger("etransfer.server.tus")
 
 
@@ -75,7 +77,7 @@ def create_tus_router(
         FastAPI router with TUS endpoints
     """
     router = APIRouter(tags=["TUS"])
-    capabilities = TusCapabilities(max_size=max_size)  # type: ignore[call-arg]
+    capabilities = TusCapabilities(max_size=max_size or 0)  # type: ignore[call-arg]
     quota_svc = QuotaService(storage)
 
     def get_tus_headers() -> dict:
@@ -196,19 +198,28 @@ def create_tus_router(
             if token and token in _tok_pol:
                 tp = _tok_pol[token]
                 retention = tp.get("default_retention", _def_ret)
-                if retention_ttl is None:
+                if not retention_ttl:
                     retention_ttl = tp.get("default_ttl", _def_ttl)
             else:
                 retention = _def_ret
-                if retention_ttl is None:
+                if not retention_ttl:
                     retention_ttl = _def_ttl
 
         if retention not in ("permanent", "download_once", "ttl"):
             retention = "permanent"
 
-        # Chunk-based storage for download_once (streaming relay)
-        use_chunked = retention == "download_once"
+        # Chunk-based storage for download_once (streaming relay) or sink forwarding
+        use_chunked = retention == "download_once" or bool(tus_metadata.sink)
         chunk_size = DEFAULT_CHUNK_SIZE
+
+        # Calculate coalesced sink part size to stay within 9000 parts limit
+        import math as _math
+
+        sink_part_size = 0
+        if tus_metadata.sink and upload_length and upload_length > 0:
+            min_part = _math.ceil(upload_length / 9000)
+            sink_part_size = _math.ceil(min_part / chunk_size) * chunk_size
+            sink_part_size = max(sink_part_size, chunk_size)
 
         # Create upload record
         upload = TusUpload(  # type: ignore[call-arg]
@@ -232,7 +243,10 @@ def create_tus_router(
             chunked_storage=use_chunked,
             chunk_size=chunk_size,
             sink_plugin=tus_metadata.sink,
+            sink_part_size=sink_part_size,
             relative_path=tus_metadata.relative_path,
+            folder_id=tus_metadata.folder_id,
+            folder_name=tus_metadata.folder_name,
         )
 
         # Initialize sink if specified
@@ -264,8 +278,9 @@ def create_tus_router(
                     tus_metadata.sink, ctx, sink_presets.get(tus_metadata.sink, {})
                 )
                 sink_inst = plugin_registry.create_sink(tus_metadata.sink, config=resolved_cfg)
+                sink_key = derive_sink_object_key(tus_metadata.filename, user)
                 session_id = await sink_inst.initialize_upload(
-                    tus_metadata.filename, {"file_id": file_id, "retention": retention}
+                    sink_key, {"file_id": file_id, "retention": retention}
                 )
                 upload.sink_session_id = session_id
                 # Cache sink instance on app state for PATCH access
@@ -495,23 +510,6 @@ def create_tus_router(
                     content_length,
                 )
                 await storage.mark_chunk_available(file_id, chunk_index)
-
-                # Sink forwarding: push chunk to remote storage
-                if upload_record and upload_record.sink_plugin and upload_record.sink_session_id:
-                    _sink_sessions = getattr(request.app.state, "_sink_sessions", {})
-                    _sink_inst = _sink_sessions.get(file_id)
-                    if _sink_inst:
-                        try:
-                            chunk_data = await storage.read_chunk_file(file_id, chunk_index)
-                            part_result = await _sink_inst.upload_part(
-                                upload_record.sink_session_id,
-                                chunk_index + 1,  # TOS part_number is 1-based
-                                chunk_data,
-                            )
-                            upload_record.sink_parts.append(part_result.model_dump())
-                            await storage.update_upload(upload_record)
-                        except Exception:
-                            logger.exception("Sink push failed: file=%s chunk=%d", file_id[:8], chunk_index)
             else:
                 written = await storage.write_chunk_streaming(
                     file_id,
@@ -520,10 +518,8 @@ def create_tus_router(
                     content_length,
                 )
         except Exception:
-            # Write failed — release the reservation we just made
             if patch_owner_id:
                 await quota_svc.release(patch_owner_id, content_length)
-            # Clean up partial chunk file for chunked storage
             if upload_record and upload_record.chunked_storage:
                 chunk_index = offset // upload_record.chunk_size
                 try:
@@ -537,14 +533,42 @@ def create_tus_router(
         if patch_owner_id and written < content_length:
             await quota_svc.release(patch_owner_id, content_length - written)
 
-        # ── Merge range under local asyncio lock (2 Redis calls) ──
-        upload, completed = await storage.merge_range_atomic(
-            file_id,
-            offset,
-            written,
+        # ── Merge range + compute flushable sink parts ────────
+        upload, completed, sink_flush = await storage.merge_range_atomic(
+            file_id, offset, written,
         )
         if upload is None:
             raise HTTPException(404, "Upload not found")
+
+        # ── Flush coalesced sink parts (outside lock) ─────────
+        if sink_flush and upload.sink_session_id:
+            _sink_sessions = getattr(request.app.state, "_sink_sessions", {})
+            _sink_inst = _sink_sessions.get(file_id)
+            if _sink_inst:
+                _cs = upload.chunk_size
+                for flush_start, flush_end in sink_flush:
+                    try:
+                        data = bytearray()
+                        ci_start = flush_start // _cs
+                        ci_end = (flush_end + _cs - 1) // _cs
+                        for ci in range(ci_start, ci_end):
+                            data.extend(await storage.read_chunk_file(file_id, ci))
+                        data = bytes(data[:flush_end - flush_start])
+
+                        part_num = (flush_start // upload.sink_part_size) + 1
+                        result = await _sink_inst.upload_part(
+                            upload.sink_session_id, part_num, data,
+                        )
+                        await storage.append_sink_part(file_id, result.model_dump())
+                        logger.debug(
+                            "Sink coalesced part %d: %d-%d (%d bytes)",
+                            part_num, flush_start, flush_end, len(data),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Sink flush failed: file=%s range=%d-%d",
+                            file_id[:8], flush_start, flush_end,
+                        )
 
         # ── Finalize if complete ─────────────────────────────
         if completed:
@@ -554,42 +578,48 @@ def create_tus_router(
                 await quota_svc.release(upload.owner_id, upload.size)
                 logger.debug(
                     "TUS FINALIZE %s: owner_id=%d size=%d quota +%d",
-                    file_id[:8],
-                    upload.owner_id,
-                    upload.size,
-                    upload.size,
+                    file_id[:8], upload.owner_id, upload.size, upload.size,
                 )
             else:
                 logger.debug(
                     "TUS FINALIZE %s: no quota update (owner_id=%r user_db=%s)",
-                    file_id[:8],
-                    upload.owner_id,
-                    "yes" if user_db else "no",
+                    file_id[:8], upload.owner_id, "yes" if user_db else "no",
                 )
             await storage.finalize_upload(file_id)
 
-            # Complete sink multipart upload
+            # Complete sink multipart upload — wait for all flush operations
             if upload.sink_plugin and upload.sink_session_id:
                 _sink_sessions = getattr(request.app.state, "_sink_sessions", {})
                 _sink_inst = _sink_sessions.pop(file_id, None)
-                if _sink_inst and upload.sink_parts:
-                    try:
-                        from etransfer.plugins.base_sink import PartResult as _PR
-
-                        parts = [_PR(**p) for p in upload.sink_parts]
-                        asyncio.create_task(_sink_inst.complete_upload(upload.sink_session_id, parts))
-                        logger.info(
-                            "TUS FINALIZE %s: sink complete queued (%d parts)",
-                            file_id[:8],
-                            len(parts),
-                        )
-                    except Exception:
-                        logger.exception("Sink complete failed: %s", file_id[:8])
+                if _sink_inst:
+                    expected = upload.sink_parts_pushed
+                    for _retry in range(30):
+                        final_upload = await storage.get_upload(file_id)
+                        if final_upload and len(final_upload.sink_parts) >= expected:
+                            break
+                        await asyncio.sleep(0.5)
+                    if final_upload and final_upload.sink_parts:
+                        try:
+                            from etransfer.plugins.base_sink import PartResult as _PR
+                            parts = [_PR(**p) for p in final_upload.sink_parts]
+                            parts.sort(key=lambda p: p.part_number)
+                            await _sink_inst.complete_upload(upload.sink_session_id, parts)
+                            logger.info(
+                                "TUS FINALIZE %s: sink complete (%d parts, waited %d retries)",
+                                file_id[:8], len(parts), _retry,
+                            )
+                        except Exception:
+                            logger.exception("Sink complete failed: %s", file_id[:8])
 
         # ── Response ─────────────────────────────────────────
+        import math as _math2
+
         headers = get_tus_headers()
         headers[TusHeaders.UPLOAD_OFFSET] = str(upload.offset)
         headers["X-Received-Bytes"] = str(upload.received_bytes)
+        if upload.sink_part_size > 0:
+            total_sink_parts = _math2.ceil(upload.size / upload.sink_part_size)
+            headers["X-Sink-Parts"] = f"{upload.sink_parts_pushed}/{total_sink_parts}"
         return Response(status_code=204, headers=headers)
 
     @router.delete("/tus/{file_id}")

@@ -25,40 +25,45 @@ class TransferTask(BaseModel):
     source_url: str = Field(..., description="Remote URL to download")
     source_plugin: str = Field("", description="Matched source plugin name")
 
-    sink_plugin: Optional[str] = Field(None, description="Sink plugin name (None = local-only)")
+    sink_plugin: str = Field("", description="Sink plugin name (empty = local-only)")
     sink_config: dict = Field(default_factory=dict, description="Resolved sink configuration")
 
     status: TaskStatus = Field(TaskStatus.PENDING, description="Current task status")
     progress: float = Field(0.0, description="Overall progress 0.0 – 1.0")
     downloaded_bytes: int = Field(0, description="Bytes downloaded so far")
     pushed_parts: int = Field(0, description="Parts pushed to sink so far")
-    error: Optional[str] = Field(None, description="Error message on failure")
+    error: str = Field("", description="Error message (empty = no error)")
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = Field(None)
 
-    filename: Optional[str] = Field(None, description="Resolved filename")
-    file_size: Optional[int] = Field(None, description="Total file size")
-    file_id: Optional[str] = Field(None, description="Registered file_id in TusStorage")
+    filename: str = Field("", description="Resolved filename")
+    file_size: int = Field(0, description="Total file size (0 = unknown)")
+    file_id: str = Field("", description="Registered file_id in TusStorage")
 
-    retention: str = Field("permanent", description="permanent / download_once / ttl")
-    retention_ttl: Optional[int] = Field(None, description="TTL seconds (retention=ttl)")
+    retention: str = Field("download_once", description="download_once / permanent / ttl")
+    retention_ttl: int = Field(0, description="TTL seconds (0 = not applicable)")
 
     owner_id: Optional[int] = Field(None, description="Owning user ID")
 
-    sink_session_id: Optional[str] = Field(None, description="Sink multipart session ID")
-    sink_result_url: Optional[str] = Field(None, description="Final URL after sink push")
+    speed: float = Field(0.0, description="Current speed in bytes/sec")
+    download_progress: float = Field(0.0, description="Download phase progress 0.0-1.0")
+    push_progress: float = Field(0.0, description="Push phase progress 0.0-1.0")
+
+    sink_session_id: str = Field("", description="Sink multipart session ID")
+    sink_result_url: str = Field("", description="Final URL after sink push")
+    superseded_by: str = Field("", description="Task ID that replaced this one via retry")
 
 
 class CreateTaskRequest(BaseModel):
     """REST request body for creating a transfer task."""
 
     source_url: str = Field(..., description="URL to download")
-    sink_plugin: Optional[str] = Field(None, description="Sink plugin name")
-    sink_config: Optional[dict] = Field(None, description="Explicit sink config (overrides presets)")
-    retention: str = Field("permanent", description="permanent / download_once / ttl")
-    retention_ttl: Optional[int] = Field(None, description="TTL in seconds")
+    sink_plugin: str = Field("", description="Sink plugin name (empty = no push)")
+    sink_config: dict = Field(default_factory=dict, description="Explicit sink config (overrides presets)")
+    retention: str = Field("download_once", description="download_once / permanent / ttl")
+    retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
 
 
 class TaskResponse(BaseModel):
@@ -67,18 +72,22 @@ class TaskResponse(BaseModel):
     task_id: str
     source_url: str
     source_plugin: str
-    sink_plugin: Optional[str]
+    sink_plugin: str
     status: TaskStatus
     progress: float
     downloaded_bytes: int
     pushed_parts: int
-    error: Optional[str]
-    filename: Optional[str]
-    file_size: Optional[int]
-    file_id: Optional[str]
+    error: str
+    filename: str
+    file_size: int
+    file_id: str
     retention: str
-    retention_ttl: Optional[int]
-    sink_result_url: Optional[str]
+    retention_ttl: int
+    speed: float
+    download_progress: float
+    push_progress: float
+    sink_result_url: str
+    superseded_by: str
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime]

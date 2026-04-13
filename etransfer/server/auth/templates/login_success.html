@@ -58,6 +58,15 @@
         .hint { color: #78909c; font-size: 13px; margin-top: 18px; line-height: 1.6; }
         .check { font-size: 36px; margin-bottom: 10px; }
     </style>
+    <script>
+        // Immediately save token and redirect to SPA — runs before body renders
+        try {
+            localStorage.setItem('etransfer_session_token', '{token}');
+            window.location.replace('/');
+        } catch(e) {
+            // localStorage unavailable (e.g. incognito), fall through to show token page
+        }
+    </script>
 </head>
 <body>
     <div class="lang-switch">

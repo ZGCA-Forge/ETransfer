@@ -33,3 +33,21 @@ else:
     pread = os.pread
     pwrite = os.pwrite
     ftruncate = os.ftruncate
+
+
+def derive_sink_object_key(filename: str, user: object = None) -> str:
+    """Build a sink object key with a user-specific directory prefix.
+
+    OIDC users  -> ``<email_local_part>/<filename>``
+    API token   -> ``<millis_timestamp>/<filename>``
+    """
+    import time
+
+    if user is not None:
+        email = getattr(user, "email", "") or ""
+        if email and "@" in email:
+            return f"{email.split('@')[0]}/{filename}"
+        username = getattr(user, "username", "") or ""
+        if username:
+            return f"{username}/{filename}"
+    return f"{int(time.time() * 1000)}/{filename}"

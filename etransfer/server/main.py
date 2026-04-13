@@ -18,6 +18,7 @@ from etransfer.server.middleware.traffic import TrafficCounterMiddleware
 from etransfer.server.routes.auth import create_auth_router
 from etransfer.server.routes.files import create_files_router
 from etransfer.server.routes.info import create_info_router
+from etransfer.server.routes.folders import create_folders_router
 from etransfer.server.routes.plugins import create_plugins_router
 from etransfer.server.routes.tasks import create_tasks_router
 from etransfer.server.services.instance_traffic import InstanceTrafficTracker
@@ -269,6 +270,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             "X-Retention-Expires",
             "X-Retention-Warning",
             "X-Download-Count",
+            "X-Sink-Parts",
         ],
     )
 
@@ -391,6 +393,11 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         )
         app.state.task_manager = _task_manager
 
+        # Resume interrupted tasks from previous shutdown
+        resumed = await _task_manager.resume_interrupted()
+        if resumed:
+            logger.info("Resumed %d interrupted task(s) from previous shutdown", resumed)
+
         # Background tasks
         asyncio.create_task(cleanup_loop(settings.cleanup_interval, lambda: _storage, lambda: _user_db))
         if settings.config_watch:
@@ -416,6 +423,14 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     async def shutdown_event() -> None:
         """Cleanup on shutdown."""
         global _instance_tracker, _user_db  # noqa: F824
+
+        # Gracefully stop running tasks (save state for restart recovery)
+        task_mgr = getattr(app.state, "task_manager", None)
+        if task_mgr:
+            count = await task_mgr.shutdown()
+            if count:
+                logger.info("Stopped %d running task(s), saved for resume on restart", count)
+
         if _instance_tracker:
             await _instance_tracker.cleanup_redis()
             _instance_tracker.stop()
@@ -449,6 +464,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     app.include_router(create_auth_router(settings.auth_tokens))
     app.include_router(create_tasks_router())
     app.include_router(create_plugins_router())
+    app.include_router(create_folders_router(storage_proxy))  # type: ignore[arg-type]
 
     # ── Always parse role quotas (speed limits apply even without user system) ──
     from etransfer.server.auth.models import RoleQuota
@@ -478,6 +494,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             client_secret=settings.oidc_client_secret,
             callback_url=callback_url,
             scope=settings.oidc_scope,
+            provider=settings.oidc_provider,
         )
 
         app.include_router(

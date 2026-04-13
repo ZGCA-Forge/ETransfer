@@ -24,6 +24,9 @@ env/
 # Cursor
 .cursor/
 
+# Frontend (built separately)
+web/
+
 # Node (prettier cache)
 node_modules/
 
@@ -62,3 +65,6 @@ test_download_*/
 # Private / non-public directories
 server-*/
 cursor_docs/
+
+# Local deployment (secrets, scripts, local overrides)
+local_deploy/

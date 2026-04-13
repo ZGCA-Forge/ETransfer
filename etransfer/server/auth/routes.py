@@ -266,21 +266,45 @@ def create_user_router(
         if not access_token:
             raise HTTPException(400, "No access_token in OIDC response")
 
-        # Fetch user profile
+        # Fetch user profile (DingTalk: pass JWT claims for 403 fallback)
+        jwt_claims = token_data.get("_jwt_claims")
+        if jwt_claims:
+            oidc._jwt_claims = jwt_claims
         try:
             userinfo = await oidc.get_user_info(access_token)
         except Exception as e:
             raise HTTPException(400, f"Failed to fetch user profile: {e}")
+        finally:
+            if hasattr(oidc, "_jwt_claims"):
+                del oidc._jwt_claims
 
-        # Extract standard OIDC claims
-        oidc_sub = str(userinfo.get("sub") or userinfo.get("id") or "")
+        # Extract user claims (compatible with standard OIDC + DingTalk)
+        # DingTalk old API uses lowercase (openid/unionid), new API uses camelCase
+        oidc_sub = str(
+            userinfo.get("sub")
+            or userinfo.get("openId") or userinfo.get("openid")
+            or userinfo.get("unionId") or userinfo.get("unionid")
+            or userinfo.get("id")
+            or "",
+        )
         if not oidc_sub:
-            raise HTTPException(400, "No user ID (sub) in OIDC response")
+            raise HTTPException(400, "No user ID in OAuth response")
 
-        username = userinfo.get("preferred_username") or userinfo.get("name") or userinfo.get("displayName") or oidc_sub
-        display_name = userinfo.get("displayName") or userinfo.get("name")
-        email = userinfo.get("email")
-        avatar_url = userinfo.get("picture") or userinfo.get("avatar") or userinfo.get("permanentAvatar")
+        username = (
+            userinfo.get("preferred_username")
+            or userinfo.get("nick")
+            or userinfo.get("name")
+            or userinfo.get("displayName")
+            or oidc_sub
+        )
+        display_name = userinfo.get("displayName") or userinfo.get("nick") or userinfo.get("name")
+        email = (
+            userinfo.get("email")
+            or userinfo.get("org_email")
+            or userinfo.get("orgEmail")
+            or userinfo.get("mail")
+        )
+        avatar_url = userinfo.get("picture") or userinfo.get("avatar") or userinfo.get("avatarUrl") or userinfo.get("permanentAvatar")
         is_admin = bool(userinfo.get("isAdmin", False))
 
         # Extract groups (provider-specific: array of strings or objects)
@@ -548,9 +572,9 @@ def create_user_router(
         return UserPublic(
             id=user.id,  # type: ignore[arg-type]
             username=user.username,
-            display_name=user.display_name,
+            display_name=user.display_name or "",
             email=user.email,
-            avatar_url=user.avatar_url,
+            avatar_url=user.avatar_url or "",
             role=role_val,
             is_active=user.is_active,
             is_admin=user.is_admin,

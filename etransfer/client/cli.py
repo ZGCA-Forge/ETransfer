@@ -1,6 +1,7 @@
 """Command-line interface for EasyTransfer client."""
 
 import json
+import os
 import sys
 import threading
 import time
@@ -350,8 +351,21 @@ def upload(
         "--wait-on-quota/--no-wait-on-quota",
         help="Auto-wait and resume when storage quota is full",
     ),
+    sink: Optional[str] = typer.Option(
+        None,
+        "--sink",
+        help="After upload, push file to this sink (e.g. tos). Uses server preset if no --sink-config",
+    ),
+    sink_config_json: Optional[str] = typer.Option(
+        None,
+        "--sink-config",
+        help="Explicit sink config JSON (overrides server preset)",
+    ),
 ) -> None:
-    """Upload a file to the server."""
+    """Upload a file to the server (文件上传).
+
+    Optionally push to a remote sink (e.g. object storage) after upload.
+    """
     if file_path is None:
         console.print()
         console.print("[bold cyan]et upload[/bold cyan] — Upload a file to the server\n")
@@ -371,6 +385,7 @@ def upload(
         console.print("  [dim]et upload myfile.zip -r permanent[/dim]                 # keep forever")
         console.print("  [dim]et upload myfile.zip -r ttl --retention-ttl 3600[/dim]  # expire in 1h")
         console.print("  [dim]et upload largefile.iso -j 8[/dim]                      # 8 threads")
+        console.print("  [dim]et upload myfile.zip --sink tos[/dim]                   # upload then push to TOS")
         return
 
     server = _get_server_url()
@@ -388,6 +403,103 @@ def upload(
         print_error("--retention-ttl is required when using --retention ttl")
         raise typer.Exit(1)
 
+    # ── Directory upload: streaming walk + bounded queue ──
+    if file_path.is_dir():
+        import queue
+        import threading
+        import uuid as _uuid
+
+        _WALK_BATCH = 200  # pause walker when queue reaches this size
+
+        folder_id = _uuid.uuid4().hex
+        folder_name = file_path.name
+
+        _orig = server
+        _target = _select_endpoint(server, token, for_upload=True)
+        if _target != server:
+            console.print(f"  [dim]-> Endpoint: {_target}[/dim]")
+            server = _target
+
+        console.print()
+        console.print(f"[bold cyan]Folder upload:[/bold cyan] {folder_name}/")
+        console.print(f"[dim]  Folder ID: {folder_id}[/dim]")
+        console.print(f"[dim]  Scanning & uploading (queue size: {_WALK_BATCH})...[/dim]")
+
+        file_queue: queue.Queue = queue.Queue(maxsize=_WALK_BATCH)
+        walk_done = threading.Event()
+        walk_count = [0]
+
+        def _walker() -> None:
+            """Walk directory tree incrementally, feeding the bounded queue."""
+            for dirpath, dirnames, filenames in os.walk(str(file_path)):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for fn in sorted(filenames):
+                    if fn.startswith("."):
+                        continue
+                    fp = Path(dirpath) / fn
+                    if fp.is_file():
+                        walk_count[0] += 1
+                        file_queue.put(fp)  # blocks when queue is full
+            walk_done.set()
+
+        walker_thread = threading.Thread(target=_walker, daemon=True)
+        walker_thread.start()
+
+        uploaded = 0
+        failed = 0
+        total_bytes = 0
+        idx = 0
+
+        while True:
+            try:
+                fp = file_queue.get(timeout=0.5)
+            except queue.Empty:
+                if walk_done.is_set() and file_queue.empty():
+                    break
+                continue
+
+            idx += 1
+            rel = str(fp.relative_to(file_path))
+            fsize = fp.stat().st_size
+            total_bytes += fsize
+            discovered = walk_count[0]
+            console.print(f"  [{idx}/{discovered}{'+'if not walk_done.is_set() else ''}] {rel} ({format_size(fsize)})", end="")
+
+            try:
+                c = EasyTransferClient(server, token=token, chunk_size=chunk_size)
+                u = c.create_parallel_uploader(
+                    str(fp),
+                    chunk_size=chunk_size,
+                    max_concurrent=threads,
+                    progress_callback=lambda _u, _t: None,
+                    retention=retention,
+                    retention_ttl=retention_ttl,
+                    metadata={
+                        "folderId": folder_id, "folderName": folder_name, "relativePath": rel,
+                        **({"sink": sink} if sink else {}),
+                        **({"sink_config": __import__("base64").b64encode(sink_config_json.encode()).decode()} if sink and sink_config_json else {}),
+                    },
+                )
+                u.ensure_created()
+                u.upload()
+                c.close()
+                console.print(" [green]✓[/green]")
+                uploaded += 1
+            except Exception as e:
+                console.print(f" [red]✗ {e}[/red]")
+                failed += 1
+
+        walker_thread.join(timeout=2)
+
+        console.print()
+        print_success(f"Folder upload: {uploaded}/{idx} files ({format_size(total_bytes)})")
+        if failed:
+            print_warning(f"{failed} files failed")
+        console.print(f"   [dim]Folder ID: [bold]{folder_id}[/bold][/dim]")
+        return
+
+    # ── Single file upload ──
+
     # Endpoint selection — pick least-loaded reachable instance (cached 6h)
     _orig_server = server
     target = _select_endpoint(server, token, for_upload=True)
@@ -401,6 +513,12 @@ def upload(
 
         def _make_uploader(srv: str) -> tuple:
             c = EasyTransferClient(srv, token=token, chunk_size=chunk_size)
+            extra_meta: dict[str, str] = {}
+            if sink:
+                extra_meta["sink"] = sink
+                if sink_config_json:
+                    import base64 as _b64
+                    extra_meta["sink_config"] = _b64.b64encode(sink_config_json.encode()).decode()
             u = c.create_parallel_uploader(
                 str(file_path),
                 chunk_size=chunk_size,
@@ -409,6 +527,7 @@ def upload(
                 retention=retention,
                 retention_ttl=retention_ttl,
                 wait_on_quota=wait_on_quota,
+                metadata=extra_meta if extra_meta else None,
             )
             return c, u
 
@@ -484,6 +603,9 @@ def upload(
             print_info(f"File will expire in {retention_ttl}s after upload completes")
         elif retention == "permanent":
             console.print("   [dim]Retention: permanent (file won't auto-delete)[/dim]")
+
+        if sink:
+            print_success(f"Streamed to sink: {sink} (流式推送，与上传同步完成)")
 
     except KeyboardInterrupt:
         if "client" in dir():
@@ -2065,18 +2187,54 @@ cors:
 
 @app.command("remote-download")
 def remote_download(
-    url: str = typer.Argument(..., help="URL to download on the server"),
-    server: str = typer.Option(f"http://localhost:{DEFAULT_SERVER_PORT}", "--server", "-s"),
-    token: Optional[str] = typer.Option(None, "--token", "-t"),
-    sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos)"),
-    sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON"),
-    retention: str = typer.Option("permanent", "--retention", help="permanent / download_once / ttl"),
+    url: Optional[str] = typer.Argument(None, help="URL to download on the server"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos). Omit = save to server"),
+    sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
+    retention: str = typer.Option("download_once", "--retention", "-r", help="download_once / permanent / ttl"),
     retention_ttl: Optional[int] = typer.Option(None, "--retention-ttl", help="TTL seconds"),
+    wait: bool = typer.Option(False, "--wait", "-w", help="Wait for task to complete and show progress"),
 ) -> None:
-    """Create a remote download task on the server."""
+    """Create a remote download task on the server (离线下载).
+
+    Downloads a URL on the server side. Optionally pushes to a sink (e.g. TOS).
+    If --sink is provided without --sink-config, the server preset is used.
+
+    Examples:
+        et remote-download https://example.com/file.zip
+        et remote-download https://hf-mirror.com/gpt2/resolve/main/config.json
+        et remote-download https://example.com/file.zip --sink tos
+        et remote-download https://example.com/file.zip --sink tos -w
+    """
+    if url is None:
+        console.print()
+        console.print("[bold cyan]et remote-download[/bold cyan] — 离线下载 (server-side download)\n")
+        console.print("[bold]Usage:[/bold]  et remote-download <URL> [OPTIONS]\n")
+        console.print("[bold]Options:[/bold]")
+        console.print("  --sink TEXT          Push to sink plugin (e.g. tos). Omit = save to server")
+        console.print("  --sink-config JSON   Explicit sink config JSON (overrides preset)")
+        console.print("  -r, --retention TEXT  permanent (default) / download_once / ttl")
+        console.print("  --retention-ttl INT  TTL seconds (for --retention ttl)")
+        console.print("  -w, --wait           Wait for task completion and show progress")
+        console.print()
+        console.print("[bold]Examples:[/bold]")
+        console.print("  [dim]et remote-download https://example.com/file.zip[/dim]")
+        console.print("  [dim]et remote-download https://hf-mirror.com/gpt2/resolve/main/config.json[/dim]")
+        console.print("  [dim]et remote-download https://example.com/file.zip --sink tos[/dim]")
+        console.print("  [dim]et remote-download https://example.com/file.zip --sink tos -w[/dim]")
+        return
+
+    server = _get_server_url()
+    token = token or _get_token()
+
     headers: dict = {}
     if token:
         headers[AUTH_HEADER] = token
+        headers["Authorization"] = f"Bearer {token}"
 
     body: dict = {"source_url": url, "retention": retention}
     if sink:
@@ -2087,13 +2245,39 @@ def remote_download(
         body["retention_ttl"] = retention_ttl
 
     try:
-        resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=30)
+        resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=60)
         resp.raise_for_status()
         data = resp.json()
-        print_success(f"Task created: {data.get('task_id', '')[:12]}...")
-        console.print(f"  Source: {data.get('source_plugin', '?')}")
-        console.print(f"  Sink:   {data.get('sink_plugin') or 'local'}")
-        console.print(f"  Status: {data.get('status')}")
+
+        if data.get("batch"):
+            total = data.get("total_files", 0)
+            created = data.get("created_tasks", 0)
+            folder = data.get("folder_name", "?")
+            repo = data.get("repo", "?")
+            total_size = data.get("total_size", 0)
+            print_success(f"Batch download: {repo}")
+            console.print(f"  [dim]Folder: {folder} | Files: {created}/{total} | Size: {format_size(total_size)}[/dim]")
+            if sink:
+                console.print(f"  [dim]Sink: {sink}[/dim]")
+            console.print(f"  [dim]Track: [bold]et tasks[/bold][/dim]")
+
+            if wait:
+                tasks_list = data.get("tasks", [])
+                for t in tasks_list:
+                    tid = t.get("task_id", "")
+                    fn = t.get("filename") or t.get("source_url", "").split("/")[-1]
+                    console.print(f"\n  [cyan]Waiting: {fn}[/cyan]")
+                    _wait_for_task(server, headers, tid)
+        else:
+            task_id = data.get("task_id", "")
+            print_success(f"Task created: {task_id[:12]}...")
+            console.print(f"  [dim]Source: {data.get('source_plugin', '?')}[/dim]")
+            console.print(f"  [dim]Target: {data.get('sink_plugin') or 'server (暂存)'}[/dim]")
+            console.print(f"  [dim]Status: {data.get('status')}[/dim]")
+
+            if wait and task_id:
+                _wait_for_task(server, headers, task_id)
+
     except httpx.HTTPStatusError as e:
         print_error(f"Server error: {e.response.text}")
         raise typer.Exit(1)
@@ -2102,15 +2286,217 @@ def remote_download(
         raise typer.Exit(1)
 
 
-@app.command("plugins")
-def list_plugins_cmd(
-    server: str = typer.Option(f"http://localhost:{DEFAULT_SERVER_PORT}", "--server", "-s"),
-    token: Optional[str] = typer.Option(None, "--token", "-t"),
+def _wait_for_task(server: str, headers: dict, task_id: str) -> None:
+    """Poll a task until it completes, showing progress."""
+    console.print()
+    status_labels = {
+        "pending": "等待中", "downloading": "下载中", "pushing": "推送中",
+        "completed": "完成", "failed": "失败", "cancelled": "已取消",
+    }
+    with create_transfer_progress() as progress:
+        ptask = progress.add_task("[cyan]Working", total=100)
+        while True:
+            time.sleep(2)
+            try:
+                r = httpx.get(f"{server}/api/tasks/{task_id}", headers=headers, timeout=10)
+                if r.status_code != 200:
+                    break
+                d = r.json()
+                status = d.get("status", "")
+                pct = int(d.get("progress", 0) * 100)
+                label = status_labels.get(status, status)
+                progress.update(ptask, completed=pct, description=f"[cyan]{label}")
+                if status in ("completed", "failed", "cancelled"):
+                    break
+            except Exception:
+                break
+
+    if status == "completed":
+        print_success("Task completed!")
+        fn = d.get("filename", "")
+        fs = d.get("file_size", 0)
+        if fn:
+            console.print(f"  [dim]File: {fn} ({format_size(fs)})[/dim]")
+        fid = d.get("file_id")
+        if fid:
+            console.print(f"  [dim]Download: [bold]et download {fid[:8]}[/bold][/dim]")
+    elif status == "failed":
+        print_error(f"Task failed: {d.get('error', 'unknown')}")
+    else:
+        print_warning(f"Task {status}")
+
+
+def _push_file_to_sink(
+    server: str,
+    token: Optional[str],
+    file_id: str,
+    sink_plugin: str,
+    sink_config_str: Optional[str] = None,
 ) -> None:
-    """List available Source and Sink plugins on the server."""
+    """Push an uploaded file to a sink plugin."""
+    console.print()
+    print_info(f"Pushing to sink: {sink_plugin}...")
+
     headers: dict = {}
     if token:
         headers[AUTH_HEADER] = token
+        headers["Authorization"] = f"Bearer {token}"
+
+    body: dict = {"sink_plugin": sink_plugin}
+    if sink_config_str:
+        body["sink_config"] = json.loads(sink_config_str)
+
+    try:
+        resp = httpx.post(
+            f"{server.rstrip('/')}/api/files/{file_id}/push",
+            json=body, headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        task_id = data.get("task_id", "")
+        print_success(f"Push task created: {task_id[:12]}...")
+        console.print(f"   [dim]Track: [bold]et tasks[/bold][/dim]")
+
+        _wait_for_task(server, headers, task_id)
+    except httpx.HTTPStatusError as e:
+        print_error(f"Push failed: {e.response.text}")
+    except Exception as e:
+        print_error(f"Push failed: {e}")
+
+
+@app.command()
+def push(
+    file_id: str = typer.Argument(..., help="File ID (or short prefix) to push"),
+    sink: str = typer.Option(..., "--sink", help="Sink plugin name (e.g. tos)"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    sink_config_arg: Optional[str] = typer.Option(
+        None, "--sink-config", help="Sink config JSON (overrides preset)"
+    ),
+) -> None:
+    """Push an uploaded file to a sink (推送已上传文件).
+
+    Takes a file already on the server and pushes it to object storage.
+    Uses the server preset config if --sink-config is not provided.
+
+    Examples:
+        et push 6a9111db --sink tos
+        et push 6a9111db --sink tos --sink-config '{"bucket":"my-bucket"}'
+    """
+    server = _get_server_url()
+    token = token or _get_token()
+    resolved_id = _resolve_file_id(file_id, server, token)
+    _push_file_to_sink(server, token, resolved_id, sink, sink_config_arg)
+
+
+@app.command()
+def tasks(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    status_filter: Optional[str] = typer.Option(
+        None, "--status", "-s",
+        help="Filter by status: pending, downloading, pushing, completed, failed, cancelled",
+    ),
+) -> None:
+    """List remote download / push tasks (任务列表).
+
+    Shows all tasks on the server with their status and progress.
+
+    Examples:
+        et tasks
+        et tasks -s downloading
+    """
+    server = _get_server_url()
+    token = token or _get_token()
+
+    headers: dict = {}
+    if token:
+        headers[AUTH_HEADER] = token
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        resp = httpx.get(f"{server.rstrip('/')}/api/tasks", headers=headers, timeout=15)
+        resp.raise_for_status()
+        all_tasks = resp.json()
+    except httpx.HTTPStatusError as e:
+        print_error(f"Failed: {e.response.text}")
+        raise typer.Exit(1)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    if status_filter:
+        all_tasks = [t for t in all_tasks if t.get("status") == status_filter]
+
+    if not all_tasks:
+        print_info("No tasks found")
+        return
+
+    all_tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+
+    table = Table(
+        title="[bold cyan]Tasks[/bold cyan]",
+        show_header=True, header_style="bold magenta", border_style="cyan",
+    )
+    table.add_column("ID", style="dim", width=8)
+    table.add_column("File", style="white", max_width=30, overflow="ellipsis")
+    table.add_column("Source", width=12)
+    table.add_column("Sink", width=8)
+    table.add_column("Size", justify="right", width=9)
+    table.add_column("Progress", width=16)
+    table.add_column("Status", width=10)
+
+    status_styles = {
+        "completed": "[green]✓ 完成[/green]",
+        "failed": "[red]✗ 失败[/red]",
+        "cancelled": "[yellow]✗ 取消[/yellow]",
+        "downloading": "[cyan]↓ 下载中[/cyan]",
+        "pushing": "[cyan]↑ 推送中[/cyan]",
+        "pending": "[dim]· 等待[/dim]",
+    }
+
+    for t in all_tasks:
+        tid = t.get("task_id", "")[:6] + ".."
+        fn = t.get("filename") or t.get("source_url", "?").split("/")[-1]
+        src = t.get("source_plugin", "?")
+        snk = t.get("sink_plugin") or "server"
+        size = format_size(t.get("file_size") or 0) if t.get("file_size") else "-"
+        pct = int(t.get("progress", 0) * 100)
+        bar_w = 8
+        filled = int(bar_w * pct / 100)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        progress_str = f"{bar} {pct}%"
+        status = status_styles.get(t.get("status", ""), t.get("status", "?"))
+
+        table.add_row(tid, fn[:30], src, snk, size, progress_str, status)
+
+    console.print()
+    console.print(table)
+    console.print(f"[dim]{len(all_tasks)} task(s)[/dim]")
+
+
+@app.command("plugins")
+def list_plugins_cmd(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """List available Source and Sink plugins on the server."""
+    server = _get_server_url()
+    token = token or _get_token()
+
+    headers: dict = {}
+    if token:
+        headers[AUTH_HEADER] = token
+        headers["Authorization"] = f"Bearer {token}"
 
     try:
         sources_resp = httpx.get(f"{server.rstrip('/')}/api/plugins/sources", headers=headers, timeout=15)

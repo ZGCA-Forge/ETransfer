@@ -47,9 +47,9 @@ class DirectLinkSource(BaseSource):
 
         return RemoteFileInfo(
             filename=filename,
-            size=int(content_length) if content_length else None,
-            mime_type=content_type,
-            etag=etag,
+            size=int(content_length) if content_length else 0,
+            mime_type=content_type or "application/octet-stream",
+            etag=etag or "",
         )
 
     async def download(
@@ -59,6 +59,13 @@ class DirectLinkSource(BaseSource):
         on_progress: Optional[Callable[[int, Optional[int]], Any]] = None,
     ) -> Path:
         dest.mkdir(parents=True, exist_ok=True)
+
+        # Prefer aria2c for multi-connection download
+        from etransfer.plugins import aria2
+
+        if aria2.is_available():
+            logger.info("Using aria2c for download: %s", url)
+            return await aria2.download(url, dest, on_progress=on_progress)
 
         async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30, read=300)) as client:
             async with client.stream("GET", url) as resp:

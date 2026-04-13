@@ -115,9 +115,12 @@ class UserDB:
 
             if existing:
                 existing.username = username
-                existing.display_name = display_name
-                existing.email = email
-                existing.avatar_url = avatar_url
+                if display_name:
+                    existing.display_name = display_name
+                if email:
+                    existing.email = email
+                if avatar_url:
+                    existing.avatar_url = avatar_url
                 existing.is_admin = is_admin
                 existing.updated_at = now
                 session.add(existing)

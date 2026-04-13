@@ -121,4 +121,11 @@ class TosSink(BaseSink):
             "ak": {"type": "string", "required": True, "secret": True, "description": "Access Key"},  # nosec B105
             "sk": {"type": "string", "required": True, "secret": True, "description": "Secret Key"},  # nosec B105
             "prefix": {"type": "string", "required": False, "description": "Object key prefix"},
+            "storage_class": {
+                "type": "select",
+                "required": False,
+                "description": "Storage class",
+                "options": ["STANDARD", "IA", "ARCHIVE_FR", "INTELLIGENT_TIERING", "COLD_ARCHIVE"],
+            },
+            "callback_url": {"type": "string", "required": False, "description": "Upload callback URL"},
         }

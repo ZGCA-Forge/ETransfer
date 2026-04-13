@@ -159,6 +159,10 @@ class StateManager:
         """Set key expiration."""
         return await self._backend.expire(key, seconds)  # type: ignore[union-attr]
 
+    async def keys(self, pattern: str) -> list[str]:
+        """Get all keys matching a glob-style pattern."""
+        return await self.scan_keys(pattern)
+
     async def scan_keys(self, pattern: str) -> list[str]:
         """Scan keys matching pattern."""
         keys = []  # type: ignore[var-annotated]

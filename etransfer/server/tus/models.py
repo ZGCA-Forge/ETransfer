@@ -20,13 +20,15 @@ class TusMetadata(BaseModel):
     """TUS Upload Metadata parsed from Upload-Metadata header."""
 
     filename: str = Field(..., description="Original filename")
-    filetype: Optional[str] = Field(None, description="MIME type")
-    checksum: Optional[str] = Field(None, description="File checksum")
-    retention: Optional[str] = Field(None, description="Retention policy: permanent/download_once/ttl")
-    retention_ttl: Optional[int] = Field(None, description="TTL in seconds (for ttl policy)")
-    relative_path: Optional[str] = Field(None, description="Relative path for folder uploads")
-    sink: Optional[str] = Field(None, description="Sink plugin name for upload forwarding")
-    sink_config: Optional[str] = Field(None, description="Base64-encoded JSON sink config")
+    filetype: str = Field("application/octet-stream", description="MIME type")
+    checksum: str = Field("", description="File checksum")
+    retention: str = Field("download_once", description="Retention policy: permanent/download_once/ttl")
+    retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
+    relative_path: str = Field("", description="Relative path for folder uploads")
+    folder_id: str = Field("", description="Folder group ID for folder uploads")
+    folder_name: str = Field("", description="Original folder name")
+    sink: str = Field("", description="Sink plugin name for upload forwarding")
+    sink_config: str = Field("", description="Base64-encoded JSON sink config")
 
     @classmethod
     def from_header(cls, header_value: str) -> "TusMetadata":
@@ -61,13 +63,15 @@ class TusMetadata(BaseModel):
 
         return cls(
             filename=metadata.get("filename", ""),
-            filetype=metadata.get("filetype"),
-            checksum=metadata.get("checksum"),
-            retention=metadata.get("retention"),
-            retention_ttl=(int(metadata["retention_ttl"]) if metadata.get("retention_ttl") else None),
-            relative_path=metadata.get("relativePath") or metadata.get("relative_path"),
-            sink=metadata.get("sink"),
-            sink_config=metadata.get("sink_config"),
+            filetype=metadata.get("filetype", "application/octet-stream"),
+            checksum=metadata.get("checksum", ""),
+            retention=metadata.get("retention", "download_once"),
+            retention_ttl=(int(metadata["retention_ttl"]) if metadata.get("retention_ttl") else 0),
+            relative_path=metadata.get("relativePath") or metadata.get("relative_path", ""),
+            folder_id=metadata.get("folderId") or metadata.get("folder_id", ""),
+            folder_name=metadata.get("folderName") or metadata.get("folder_name", ""),
+            sink=metadata.get("sink", ""),
+            sink_config=metadata.get("sink_config", ""),
         )
 
     def to_header(self) -> str:
@@ -84,11 +88,17 @@ class TusMetadata(BaseModel):
         if self.retention:
             items.append(f"retention {base64.b64encode(self.retention.encode()).decode()}")
 
-        if self.retention_ttl is not None:
+        if self.retention_ttl:
             items.append(f"retention_ttl {base64.b64encode(str(self.retention_ttl).encode()).decode()}")
 
         if self.relative_path:
             items.append(f"relativePath {base64.b64encode(self.relative_path.encode()).decode()}")
+
+        if self.folder_id:
+            items.append(f"folderId {base64.b64encode(self.folder_id.encode()).decode()}")
+
+        if self.folder_name:
+            items.append(f"folderName {base64.b64encode(self.folder_name.encode()).decode()}")
 
         if self.sink:
             items.append(f"sink {base64.b64encode(self.sink.encode()).decode()}")
@@ -112,12 +122,12 @@ class TusUpload(BaseModel):
     expires_at: Optional[datetime] = Field(None, description="Upload expiration time")
     is_final: bool = Field(False, description="Whether upload is complete")
     storage_path: str = Field(..., description="Path to stored file")
-    checksum: Optional[str] = Field(None, description="File checksum")
-    mime_type: Optional[str] = Field(None, description="MIME type")
+    checksum: str = Field("", description="File checksum")
+    mime_type: str = Field("application/octet-stream", description="MIME type")
 
     # Retention policy
-    retention: str = Field("permanent", description="Retention: permanent/download_once/ttl")
-    retention_ttl: Optional[int] = Field(None, description="TTL in seconds (for ttl policy)")
+    retention: str = Field("download_once", description="Retention: permanent/download_once/ttl")
+    retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
     retention_expires_at: Optional[datetime] = Field(
         None, description="When the file should be deleted (set after upload completes)"
     )
@@ -141,19 +151,24 @@ class TusUpload(BaseModel):
 
     # Finalization fields (populated when is_final = True)
     available_size: int = Field(0, description="Bytes available for download")
-    completed_at: Optional[str] = Field(None, description="ISO timestamp when upload completed")
+    completed_at: str = Field("", description="ISO timestamp when upload completed")
     total_chunks: int = Field(0, description="Total number of chunks (0 = non-chunked)")
 
     # download_once consumption tracking
     chunks_consumed: int = Field(0, description="Number of chunks downloaded+deleted (download_once)")
 
     # Sink forwarding state
-    sink_plugin: Optional[str] = Field(None, description="Sink plugin name for forwarding")
-    sink_session_id: Optional[str] = Field(None, description="Sink multipart session ID")
+    sink_plugin: str = Field("", description="Sink plugin name for forwarding")
+    sink_session_id: str = Field("", description="Sink multipart session ID")
     sink_parts: list[dict] = Field(default_factory=list, description="Completed sink part results")
+    sink_part_size: int = Field(0, description="Coalesced sink part size in bytes (0 = 1:1 with TUS chunk)")
+    sink_flush_cursor: int = Field(0, description="Bytes already flushed to sink")
+    sink_parts_pushed: int = Field(0, description="Number of sink parts successfully pushed")
 
     # Folder upload
-    relative_path: Optional[str] = Field(None, description="Relative path for folder uploads")
+    relative_path: str = Field("", description="Relative path for folder uploads")
+    folder_id: str = Field("", description="Folder group ID")
+    folder_name: str = Field("", description="Original folder name")
 
     def _merge_range(self, start: int, end: int) -> None:
         """Merge a new [start, end) range into received_ranges (sorted, coalesced)."""
@@ -173,7 +188,6 @@ class TusUpload(BaseModel):
         if not inserted:
             merged.append(new)
         self.received_ranges = merged
-        # Update contiguous offset (for standard TUS HEAD compatibility)
         if self.received_ranges and self.received_ranges[0][0] == 0:
             self.offset = self.received_ranges[0][1]
 
@@ -207,18 +221,25 @@ class TusUpload(BaseModel):
             data["expires_at"] = self.expires_at.isoformat()
         if self.retention_expires_at:
             data["retention_expires_at"] = self.retention_expires_at.isoformat()
-        # Include computed property so callers can see total received bytes
         data["received_bytes"] = self.received_bytes
         return data
 
     @classmethod
     def from_redis_dict(cls, data: dict) -> "TusUpload":
         """Create from Redis dict."""
-        # Strip computed properties that are not model fields
         data.pop("received_bytes", None)
         for dt_field in ("created_at", "updated_at", "expires_at", "retention_expires_at"):
             if data.get(dt_field) and isinstance(data[dt_field], str):
                 data[dt_field] = datetime.fromisoformat(data[dt_field])
+        _str_fields = (
+            "checksum", "mime_type", "completed_at", "sink_plugin",
+            "sink_session_id", "relative_path", "folder_id", "folder_name",
+        )
+        for f in _str_fields:
+            if f in data and data[f] is None:
+                data[f] = ""
+        if "retention_ttl" in data and data["retention_ttl"] is None:
+            data["retention_ttl"] = 0
         return cls(**data)
 
 
@@ -235,7 +256,7 @@ class TusCapabilities(BaseModel):
             "expiration",
         ]
     )
-    max_size: Optional[int] = Field(None, description="Maximum upload size")
+    max_size: int = Field(0, description="Maximum upload size (0 = no limit)")
     checksum_algorithms: list[str] = Field(default_factory=lambda: ["sha1", "sha256", "md5"])
 
 

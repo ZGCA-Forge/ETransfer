@@ -319,27 +319,30 @@ class TusStorage:
         lock_key = self._lock_key(file_id)
         await self.state.delete(lock_key)
 
-    async def merge_range_atomic(self, file_id: str, offset: int, length: int) -> tuple[Optional["TusUpload"], bool]:
+    async def merge_range_atomic(
+        self,
+        file_id: str,
+        offset: int,
+        length: int,
+    ) -> tuple[Optional["TusUpload"], bool, list[tuple[int, int]]]:
         """Merge a received range into upload state under local asyncio lock.
 
-        Replaces the Redis distributed lock + get + merge + set + release
-        pattern with a single local lock and 2 Redis calls (get + set).
-
         Returns:
-            (upload, is_complete) — the updated upload and whether it's done.
-            upload is None if the upload record was not found.
+            (upload, is_complete, sink_flush) where sink_flush is a list of
+            (start_byte, end_byte) ranges that are ready to be coalesced and
+            pushed to the sink.  Empty when no sink is configured or no new
+            contiguous data is available.
         """
         async with self._local_locks[file_id]:
             upload = await self.get_upload(file_id)
             if not upload:
-                return None, False
+                return None, False, []
 
             new_end = offset + length
 
-            # Idempotent: already received?
             for r in upload.received_ranges:
                 if r[0] <= offset and new_end <= r[1]:
-                    return upload, False
+                    return upload, False, []
 
             upload._merge_range(offset, new_end)
             upload.updated_at = datetime.utcnow()
@@ -349,8 +352,38 @@ class TusStorage:
                 upload.is_final = True
                 completed = True
 
+            # Determine flushable sink parts from contiguous received data
+            sink_flush: list[tuple[int, int]] = []
+            if upload.sink_part_size > 0:
+                contiguous = upload.sink_flush_cursor
+                for r in upload.received_ranges:
+                    if r[0] <= contiguous:
+                        contiguous = max(contiguous, r[1])
+                    else:
+                        break
+
+                sps = upload.sink_part_size
+                while contiguous - upload.sink_flush_cursor >= sps:
+                    start = upload.sink_flush_cursor
+                    sink_flush.append((start, start + sps))
+                    upload.sink_flush_cursor = start + sps
+                    upload.sink_parts_pushed += 1
+
+                if completed and upload.sink_flush_cursor < upload.size:
+                    sink_flush.append((upload.sink_flush_cursor, upload.size))
+                    upload.sink_parts_pushed += 1
+                    upload.sink_flush_cursor = upload.size
+
             await self.update_upload(upload)
-            return upload, completed
+            return upload, completed, sink_flush
+
+    async def append_sink_part(self, file_id: str, part: dict) -> None:
+        """Atomically append a completed sink part result."""
+        async with self._local_locks[file_id]:
+            upload = await self.get_upload(file_id)
+            if upload:
+                upload.sink_parts.append(part)
+                await self.update_upload(upload)
 
     async def acquire_lock_with_retry(
         self,
@@ -410,6 +443,17 @@ class TusStorage:
             file_path = self.get_file_path(upload.file_id)
             async with aiofiles.open(file_path, "wb") as _:
                 pass  # Empty file; grows as chunks arrive
+
+        # Folder index: track which files belong to a folder
+        if upload.folder_id:
+            folder_key = f"et:folder:{upload.folder_id}"
+            raw = await self.state.get(folder_key)
+            file_ids = json.loads(raw) if raw else []
+            if upload.file_id not in file_ids:
+                file_ids.append(upload.file_id)
+            await self.state.set(folder_key, json.dumps(file_ids))
+            if upload.folder_name:
+                await self.state.set(f"{folder_key}:name", upload.folder_name)
 
     async def get_upload(self, file_id: str) -> Optional[TusUpload]:
         """Get upload record by ID.
@@ -839,7 +883,7 @@ class TusStorage:
             src_path = self.get_file_path(file_id)
 
             # Folder upload: respect relative_path for directory structure
-            rel = getattr(upload, "relative_path", None)
+            rel = upload.relative_path
             if rel:
                 dst_path = self.files_path / file_id / rel
                 dst_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1110,3 +1154,77 @@ class TusStorage:
         would_use = usage["used"] + additional_bytes
         allowed = would_use <= self.max_storage_size
         return allowed, usage  # type: ignore[no-any-return]
+
+    # ── Folder operations ─────────────────────────────────────
+
+    async def list_folders(self) -> list[dict]:
+        """List all folder groups with aggregated info."""
+        keys = await self.state.scan_keys("et:folder:*")
+        folders: dict[str, dict] = {}
+        for k in keys:
+            if k.endswith(":name"):
+                continue
+            folder_id = k.replace("et:folder:", "")
+            raw = await self.state.get(k)
+            if not raw:
+                continue
+            file_ids = json.loads(raw)
+            name_raw = await self.state.get(f"{k}:name")
+            folder_name = name_raw or folder_id[:8]
+
+            total_size = 0
+            file_count = 0
+            completed = 0
+            for fid in file_ids:
+                upload = await self.get_upload(fid)
+                if upload:
+                    file_count += 1
+                    total_size += upload.size
+                    if upload.is_final:
+                        completed += 1
+
+            folders[folder_id] = {
+                "folder_id": folder_id,
+                "folder_name": folder_name,
+                "file_count": file_count,
+                "completed": completed,
+                "total_size": total_size,
+            }
+        return sorted(folders.values(), key=lambda f: f["folder_name"])
+
+    async def get_folder_files(self, folder_id: str) -> list[dict]:
+        """Get all files in a folder."""
+        raw = await self.state.get(f"et:folder:{folder_id}")
+        if not raw:
+            return []
+        file_ids = json.loads(raw)
+        files = []
+        for fid in file_ids:
+            upload = await self.get_upload(fid)
+            if upload:
+                files.append({
+                    "file_id": fid,
+                    "filename": upload.filename,
+                    "relative_path": upload.relative_path or upload.filename,
+                    "size": upload.size,
+                    "status": "complete" if upload.is_final else "uploading",
+                    "is_final": upload.is_final,
+                })
+        return files
+
+    async def delete_folder(self, folder_id: str) -> int:
+        """Delete all files in a folder. Returns number of files deleted."""
+        raw = await self.state.get(f"et:folder:{folder_id}")
+        if not raw:
+            return 0
+        file_ids = json.loads(raw)
+        deleted = 0
+        for fid in file_ids:
+            try:
+                await self.delete_upload(fid)
+                deleted += 1
+            except Exception:
+                pass
+        await self.state.delete(f"et:folder:{folder_id}")
+        await self.state.delete(f"et:folder:{folder_id}:name")
+        return deleted

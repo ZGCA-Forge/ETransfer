@@ -69,8 +69,8 @@ class ServerSettings(BaseSettings):
 
     # Global default retention
     default_retention: str = Field(
-        "permanent",
-        description="Global default retention policy: permanent, download_once, ttl",
+        "download_once",
+        description="Global default retention policy: download_once, permanent, ttl",
     )
     default_retention_ttl: Optional[int] = Field(
         None,
@@ -115,6 +115,11 @@ class ServerSettings(BaseSettings):
     )
 
     # OIDC configuration
+    oidc_provider: str = Field(
+        "oidc",
+        description="Auth provider type: oidc (standard OIDC) or dingtalk. "
+        "Env: ETRANSFER_OIDC_PROVIDER",
+    )
     oidc_issuer_url: str = Field(
         "",
         description="OIDC issuer URL (e.g. https://auth.example.com). "
@@ -185,6 +190,14 @@ class ServerSettings(BaseSettings):
             },
         },
         description="Per-role quota defaults. Env: ETRANSFER_ROLE_QUOTAS as JSON.",
+    )
+
+    # Google API key (for Google Drive folder listing)
+    google_api_key: str = Field(
+        "",
+        description="Google API key for Drive folder listing. "
+        "Get from Google Cloud Console with Drive API enabled. "
+        "Env: ETRANSFER_GOOGLE_API_KEY",
     )
 
     # Sink presets (per-sink-plugin presets with role/group/default tiers)
@@ -298,6 +311,8 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
         if "role_quotas" in us:
             d["role_quotas"] = us["role_quotas"]
         oidc = us.get("oidc", {})
+        if "provider" in oidc:
+            d["oidc_provider"] = oidc["provider"]
         if "issuer_url" in oidc:
             d["oidc_issuer_url"] = oidc["issuer_url"]
         if "client_id" in oidc:
@@ -323,6 +338,10 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
         sinks_cfg = config["sinks"]
         if "presets" in sinks_cfg:
             d["sink_presets"] = sinks_cfg["presets"]
+
+    # Google API key
+    if "google_api_key" in config:
+        d["google_api_key"] = config["google_api_key"]
 
     # Logging — accept `logging.level` or top-level `log_level`
     if "logging" in config:

@@ -133,7 +133,7 @@ class RoleQuota(BaseModel):
     download_speed_limit: Optional[int] = PydanticField(
         None, description="Download speed limit in bytes/sec (None = unlimited)"
     )
-    default_retention: str = PydanticField("permanent", description="Default retention policy")
+    default_retention: str = PydanticField("download_once", description="Default retention policy")
     default_retention_ttl: Optional[int] = PydanticField(None, description="Default TTL for ttl retention (seconds)")
 
 
@@ -142,9 +142,9 @@ class UserPublic(BaseModel):
 
     id: int
     username: str
-    display_name: Optional[str] = None
+    display_name: str = ""
     email: Optional[str] = None
-    avatar_url: Optional[str] = None
+    avatar_url: str = ""
     role: str
     is_active: bool
     is_admin: bool = False
@@ -157,12 +157,12 @@ class GroupCreate(BaseModel):
     """Request to create/update a group's quota config."""
 
     name: str
-    description: Optional[str] = None
+    description: str = ""
     max_storage_size: Optional[int] = None
     max_upload_size: Optional[int] = None
     upload_speed_limit: Optional[int] = None
     download_speed_limit: Optional[int] = None
-    default_retention: str = "permanent"
+    default_retention: str = "download_once"
     default_retention_ttl: Optional[int] = None
 
 
@@ -171,6 +171,6 @@ class GroupPublic(BaseModel):
 
     id: int
     name: str
-    description: Optional[str] = None
+    description: str = ""
     quota: RoleQuota
     member_count: int = 0

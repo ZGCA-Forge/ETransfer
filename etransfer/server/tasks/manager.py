@@ -3,29 +3,37 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import io
 import logging
 import math
-import os
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from etransfer.plugins.base_sink import BaseSink, PartResult, SinkContext
+import httpx
+
+from etransfer.common.fileutil import derive_sink_object_key
+from etransfer.plugins.base_sink import PartResult, SinkContext
 from etransfer.plugins.registry import PluginRegistry, plugin_registry
 from etransfer.server.tasks.models import TaskStatus, TransferTask
 
 logger = logging.getLogger("etransfer.server.tasks")
 
 _STATE_PREFIX = "et:task:"
+_CHUNK_SIZE = 128 * 1024 * 1024  # 128 MB — larger chunks reduce multipart overhead
 
 
 class TaskManager:
     """Manages the lifecycle of TransferTasks.
 
-    Each task runs as a background ``asyncio.Task``.  State is persisted
-    to the same ``StateManager`` used by ``TusStorage``.
+    Two pipeline modes:
+      - **Sink mode** (streaming): Source → HTTP stream → buffer chunks →
+        Sink multipart parts. Only one chunk in memory at a time.
+        Local disk usage: zero.
+      - **Local mode**: Source → aria2c/httpx download to disk →
+        register in TusStorage.
     """
 
     def __init__(
@@ -44,6 +52,9 @@ class TaskManager:
         self._sink_presets: dict = sink_presets or {}
         self._running: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._tasks: dict[str, TransferTask] = {}
+        self._prev_bytes: dict[str, int] = {}
+        self._prev_time: dict[str, datetime] = {}
+        self._shutting_down = False
 
     # ── Persistence helpers ───────────────────────────────────
 
@@ -51,10 +62,46 @@ class TaskManager:
         return f"{_STATE_PREFIX}{task_id}"
 
     async def _save(self, task: TransferTask) -> None:
-        task.updated_at = datetime.utcnow()
+        now = datetime.utcnow()
+        prev_t = self._prev_time.get(task.task_id)
+        if prev_t:
+            elapsed = (now - prev_t).total_seconds()
+            if elapsed > 0.3:
+                prev_b = self._prev_bytes.get(task.task_id, 0)
+                current_b = task.downloaded_bytes + (task.pushed_parts * _CHUNK_SIZE)
+                delta = current_b - prev_b
+                task.speed = max(0.0, delta / elapsed) if delta > 0 else task.speed * 0.5
+                self._prev_bytes[task.task_id] = current_b
+                self._prev_time[task.task_id] = now
+        else:
+            self._prev_time[task.task_id] = now
+            self._prev_bytes[task.task_id] = 0
+
+        task.updated_at = now
         self._tasks[task.task_id] = task
         data = task.model_dump_json()
         await self._state.set(self._key(task.task_id), data)
+
+    @staticmethod
+    def _sanitize_task_dict(d: dict) -> dict:
+        """Convert legacy None values to protocol-standard defaults."""
+        _str_defaults = {
+            "sink_plugin": "", "error": "", "filename": "", "file_id": "",
+            "sink_session_id": "", "sink_result_url": "", "source_plugin": "",
+            "superseded_by": "",
+        }
+        _int_defaults = {"file_size": 0, "retention_ttl": 0}
+        _float_defaults = {"speed": 0.0, "download_progress": 0.0, "push_progress": 0.0}
+        for k, v in _float_defaults.items():
+            if k in d and d[k] is None:
+                d[k] = v
+        for k, v in _str_defaults.items():
+            if k in d and d[k] is None:
+                d[k] = v
+        for k, v in _int_defaults.items():
+            if k in d and d[k] is None:
+                d[k] = v
+        return d
 
     async def _load(self, task_id: str) -> Optional[TransferTask]:
         if task_id in self._tasks:
@@ -62,7 +109,10 @@ class TaskManager:
         raw = await self._state.get(self._key(task_id))
         if raw is None:
             return None
-        task = TransferTask.model_validate_json(raw)
+        import json as _json
+        d = _json.loads(raw)
+        self._sanitize_task_dict(d)
+        task = TransferTask.model_validate(d)
         self._tasks[task_id] = task
         return task
 
@@ -71,16 +121,15 @@ class TaskManager:
     async def create_task(
         self,
         source_url: str,
-        sink_plugin: Optional[str] = None,
+        sink_plugin: str = "",
         sink_config: Optional[dict] = None,
-        retention: str = "permanent",
-        retention_ttl: Optional[int] = None,
+        retention: str = "download_once",
+        retention_ttl: int = 0,
         owner_id: Optional[int] = None,
         user: Any = None,
     ) -> TransferTask:
         source = await self._registry.resolve_source(source_url)
 
-        # Resolve sink config dynamically
         resolved_sink_config: dict = {}
         if sink_plugin:
             ctx = SinkContext(
@@ -103,6 +152,7 @@ class TaskManager:
             retention_ttl=retention_ttl,
             owner_id=owner_id,
         )
+        task._user = user  # transient, not serialized
         await self._save(task)
 
         bg = asyncio.create_task(self._run_pipeline(task))
@@ -119,7 +169,10 @@ class TaskManager:
         for k in keys:
             raw = await self._state.get(k)
             if raw:
-                tasks.append(TransferTask.model_validate_json(raw))
+                import json as _json
+                d = _json.loads(raw)
+                self._sanitize_task_dict(d)
+                tasks.append(TransferTask.model_validate(d))
         tasks.sort(key=lambda t: t.created_at)
         return tasks
 
@@ -139,24 +192,160 @@ class TaskManager:
         await self._save(task)
         return True
 
-    # ── Pipeline ──────────────────────────────────────────────
+    # ── Graceful shutdown ─────────────────────────────────────
+
+    async def shutdown(self) -> int:
+        """Gracefully stop all running tasks.
+
+        - Downloading tasks: cancel immediately (can restart from scratch)
+        - Pushing tasks: wait for current chunk to finish, then stop
+        - All interrupted tasks saved as PENDING for restart recovery
+        """
+        self._shutting_down = True
+        running_ids = list(self._running.keys())
+        count = len(running_ids)
+        if not count:
+            return 0
+
+        # Categorize: which are pushing (need to wait) vs downloading (can cancel now)
+        pushing = []
+        downloading = []
+        for tid in running_ids:
+            task = self._tasks.get(tid) or await self._load(tid)
+            if task and task.status.value == "pushing":
+                pushing.append(tid)
+            else:
+                downloading.append(tid)
+
+        logger.info(
+            "Shutdown: %d downloading (cancel now), %d pushing (wait for current chunk)",
+            len(downloading), len(pushing),
+        )
+
+        # Cancel downloading tasks immediately
+        for tid in downloading:
+            bg = self._running.get(tid)
+            if bg and not bg.done():
+                bg.cancel()
+
+        # Wait for pushing tasks to notice _shutting_down flag and finish current chunk
+        if pushing:
+            for _ in range(30):  # max 30s wait
+                still_running = [tid for tid in pushing if tid in self._running and not self._running[tid].done()]
+                if not still_running:
+                    break
+                await asyncio.sleep(1)
+            # Force-cancel any stragglers
+            for tid in pushing:
+                bg = self._running.get(tid)
+                if bg and not bg.done():
+                    bg.cancel()
+
+        await asyncio.sleep(1)
+
+        # Mark all interrupted tasks as PENDING for restart recovery
+        for tid in running_ids:
+            task = self._tasks.get(tid) or await self._load(tid)
+            if task and task.status.value in ("downloading", "pushing", "pending", "cancelled"):
+                task.status = TaskStatus.PENDING
+                task.error = "interrupted by shutdown"
+                task.speed = 0.0
+                await self._save(task)
+
+        logger.info("Shutdown complete: %d task(s) saved for restart recovery", count)
+        return count
+
+    # ── Startup recovery ──────────────────────────────────────
+
+    async def resume_interrupted(self) -> int:
+        """Resume tasks that were interrupted by a previous shutdown."""
+        all_tasks = await self.list_tasks()
+        pending = [t for t in all_tasks if t.status == TaskStatus.PENDING and t.error == "interrupted by shutdown"]
+        if not pending:
+            return 0
+
+        for task in pending:
+            task.status = TaskStatus.PENDING
+            task.progress = 0.0
+            task.download_progress = 0.0
+            task.push_progress = 0.0
+            task.downloaded_bytes = 0
+            task.pushed_parts = 0
+            task.error = ""
+            task.speed = 0.0
+            task.sink_session_id = ""
+            await self._save(task)
+            bg = asyncio.create_task(self._run_pipeline(task))
+            self._running[task.task_id] = bg
+
+        logger.info("Resumed %d interrupted task(s)", len(pending))
+        return len(pending)
+
+    async def push_file(
+        self,
+        file_path: Path,
+        filename: str,
+        file_size: int,
+        sink_plugin: str,
+        sink_config: Optional[dict] = None,
+        owner_id: Optional[int] = None,
+        user: Any = None,
+    ) -> TransferTask:
+        """Push an already-uploaded local file to a sink."""
+        resolved_sink_config: dict = {}
+        ctx = SinkContext(
+            user=user,
+            client_metadata={"sink_config": sink_config} if sink_config else {},
+            retention="permanent",
+            filename=filename,
+            file_size=file_size,
+        )
+        presets_for_sink = self._sink_presets.get(sink_plugin, {})
+        resolved_sink_config = self._registry.resolve_sink_config(sink_plugin, ctx, presets_for_sink)
+
+        task = TransferTask(  # type: ignore[call-arg]
+            task_id=uuid.uuid4().hex,
+            source_url=f"local://{file_path}",
+            source_plugin="upload",
+            sink_plugin=sink_plugin,
+            sink_config=resolved_sink_config,
+            filename=filename,
+            file_size=file_size,
+            owner_id=owner_id,
+        )
+        task._user = user  # transient, not serialized
+        await self._save(task)
+
+        bg = asyncio.create_task(self._pipeline_file_to_sink(task, file_path))
+        self._running[task.task_id] = bg
+        return task
+
+    # ── Pipeline dispatcher ───────────────────────────────────
 
     async def _run_pipeline(self, task: TransferTask) -> None:
         try:
-            await self._phase_download(task)
-            if task.status == TaskStatus.CANCELLED:
-                return
             if task.sink_plugin:
-                await self._phase_push(task)
-            await self._phase_register(task)
+                await self._pipeline_stream_to_sink(task)
+            else:
+                await self._pipeline_download_local(task)
+
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.utcnow()
             task.progress = 1.0
+            task.download_progress = 1.0
+            if task.sink_plugin:
+                task.push_progress = 1.0
             await self._save(task)
             logger.info("Task %s completed: %s", task.task_id[:8], task.filename)
         except asyncio.CancelledError:
-            task.status = TaskStatus.CANCELLED
-            task.error = "Cancelled"
+            if self._shutting_down:
+                task.status = TaskStatus.PENDING
+                task.error = "interrupted by shutdown"
+                task.speed = 0.0
+                logger.info("Task %s interrupted by shutdown, saved for resume", task.task_id[:8])
+            else:
+                task.status = TaskStatus.CANCELLED
+                task.error = "Cancelled"
             await self._save(task)
         except Exception as exc:
             task.status = TaskStatus.FAILED
@@ -166,12 +355,241 @@ class TaskManager:
         finally:
             self._running.pop(task.task_id, None)
 
+    # ── Local file → Sink pipeline ──────────────────────────────
+
+    async def _pipeline_file_to_sink(self, task: TransferTask, file_path: Path) -> None:
+        """Read a local file and push to sink via multipart upload."""
+        try:
+            sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
+            total_size = task.file_size or file_path.stat().st_size
+            task.status = TaskStatus.PUSHING
+            await self._save(task)
+
+            _user = getattr(task, "_user", None)
+            sink_key = derive_sink_object_key(task.filename or file_path.name, _user)
+            session_id = await sink.initialize_upload(
+                sink_key, {"task_id": task.task_id}
+            )
+            task.sink_session_id = session_id
+            await self._save(task)
+
+            parts: list[PartResult] = []
+            part_num = 0
+            pushed = 0
+
+            with open(file_path, "rb") as f:
+                while True:
+                    data = f.read(_CHUNK_SIZE)
+                    if not data:
+                        break
+                    part_num += 1
+                    result = await sink.upload_part(session_id, part_num, data)
+                    parts.append(result)
+                    pushed += len(data)
+                    task.pushed_parts = part_num
+                    task.downloaded_bytes = pushed
+                    task.download_progress = 1.0
+                    task.push_progress = pushed / total_size if total_size else 1.0
+                    task.progress = task.push_progress
+                    await self._save(task)
+
+                    if self._shutting_down:
+                        logger.info("Shutdown: task %s stopping after push part %d", task.task_id[:8], part_num)
+                        raise asyncio.CancelledError()
+
+            result_url = await sink.complete_upload(session_id, parts)
+            task.sink_result_url = result_url
+            task.progress = 1.0
+            task.download_progress = 1.0
+            task.push_progress = 1.0
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.utcnow()
+            await self._save(task)
+            logger.info("File push complete: %s -> %s (%d parts)", task.filename, result_url or "?", part_num)
+
+        except asyncio.CancelledError:
+            if self._shutting_down:
+                task.status = TaskStatus.PENDING
+                task.error = "interrupted by shutdown"
+                task.speed = 0.0
+            else:
+                task.status = TaskStatus.CANCELLED
+                task.error = "Cancelled"
+            await self._save(task)
+        except Exception as exc:
+            task.status = TaskStatus.FAILED
+            task.error = str(exc)
+            await self._save(task)
+            logger.exception("File push %s failed", task.task_id[:8])
+            try:
+                await sink.abort_upload(session_id)
+            except Exception:
+                pass
+        finally:
+            self._running.pop(task.task_id, None)
+
+    # ── Streaming pipeline: Source → HTTP stream → Sink ───────
+    # Only one chunk buffer in memory at a time — zero local disk.
+
+    async def _pipeline_stream_to_sink(self, task: TransferTask) -> None:
+        """Stream from source URL directly to sink via multipart upload.
+
+        Memory usage: ~1 chunk buffer (_CHUNK_SIZE, default 32 MB).
+        Disk usage: zero.
+        """
+        source = self._registry.get_source(task.source_plugin)
+        sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
+
+        # Get file info (filename, size)
+        task.status = TaskStatus.DOWNLOADING
+        await self._save(task)
+        info = await source.get_file_info(task.source_url)
+        task.filename = info.filename
+        task.file_size = info.size
+        await self._save(task)
+
+        total_size = info.size or 0
+        total_parts = math.ceil(total_size / _CHUNK_SIZE) if total_size else 0
+
+        # Resolve the actual download URL (handle GDrive confirm, HF blob→resolve)
+        dl_url = self._resolve_download_url(task.source_url, task.source_plugin)
+
+        # Initialize sink multipart
+        _user = getattr(task, "_user", None)
+        sink_key = derive_sink_object_key(task.filename or task.task_id, _user)
+        session_id = await sink.initialize_upload(
+            sink_key, {"task_id": task.task_id}
+        )
+        task.sink_session_id = session_id
+        task.status = TaskStatus.PUSHING
+        await self._save(task)
+
+        logger.info(
+            "Streaming %s -> sink '%s' (session %s, ~%d parts)",
+            task.source_url[:60], task.sink_plugin, session_id[:12],
+            total_parts or -1,
+        )
+
+        parts: list[PartResult] = []
+        part_num = 0
+        buf = bytearray()
+        downloaded = 0
+
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=httpx.Timeout(30, read=600)
+            ) as client:
+                async with client.stream("GET", dl_url) as resp:
+                    resp.raise_for_status()
+
+                    # Update filename from Content-Disposition if available
+                    cd = resp.headers.get("content-disposition", "")
+                    if "filename=" in cd:
+                        for p in cd.split(";"):
+                            p = p.strip()
+                            if p.startswith("filename="):
+                                task.filename = p[len("filename="):].strip().strip('"')
+
+                    if not total_size:
+                        cl = resp.headers.get("content-length")
+                        if cl:
+                            total_size = int(cl)
+                            task.file_size = total_size
+                            total_parts = math.ceil(total_size / _CHUNK_SIZE)
+
+                    _last_save = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                        buf.extend(chunk)
+                        downloaded += len(chunk)
+                        task.downloaded_bytes = downloaded
+
+                        # Update download progress every ~8MB without waiting for push
+                        if downloaded - _last_save >= 8 * 1024 * 1024:
+                            _last_save = downloaded
+                            if total_size > 0:
+                                task.download_progress = downloaded / total_size
+                                task.progress = downloaded / total_size
+                            await self._save(task)
+
+                        # Flush full chunks to sink
+                        while len(buf) >= _CHUNK_SIZE:
+                            part_num += 1
+                            data = bytes(buf[:_CHUNK_SIZE])
+                            del buf[:_CHUNK_SIZE]
+
+                            result = await sink.upload_part(session_id, part_num, data)
+                            parts.append(result)
+                            task.pushed_parts = part_num
+
+                            if total_size > 0:
+                                task.download_progress = downloaded / total_size
+                                pushed_bytes = part_num * _CHUNK_SIZE
+                                task.push_progress = pushed_bytes / total_size
+                                task.progress = downloaded / total_size
+                            await self._save(task)
+
+                            if self._shutting_down:
+                                logger.info("Shutdown: task %s stopping after push part %d", task.task_id[:8], part_num)
+                                raise asyncio.CancelledError()
+
+                # Flush remaining buffer as final part
+                if buf:
+                    part_num += 1
+                    result = await sink.upload_part(session_id, part_num, bytes(buf))
+                    parts.append(result)
+                    task.pushed_parts = part_num
+                    buf.clear()
+
+            result_url = await sink.complete_upload(session_id, parts)
+            task.sink_result_url = result_url
+            task.file_size = downloaded
+            task.progress = 1.0
+            task.download_progress = 1.0
+            task.push_progress = 1.0
+            await self._save(task)
+
+            logger.info(
+                "Stream complete: %s -> %s (%d parts, %d bytes)",
+                task.filename, result_url[:80] if result_url else "?",
+                part_num, downloaded,
+            )
+
+        except Exception:
+            # Abort sink upload on failure
+            try:
+                await sink.abort_upload(session_id)
+            except Exception:
+                logger.debug("Failed to abort sink session %s", session_id[:12])
+            raise
+
+    def _resolve_download_url(self, url: str, source_plugin: str) -> str:
+        """Convert a user-facing URL to a direct download URL."""
+        if source_plugin == "gdrive":
+            from etransfer.plugins.sources.gdrive import _extract_file_id, _DOWNLOAD_URL
+            file_id = _extract_file_id(url)
+            if file_id:
+                return f"{_DOWNLOAD_URL.format(file_id=file_id)}&confirm=t"
+        elif source_plugin == "huggingface":
+            from etransfer.plugins.sources.huggingface import _parse_hf_url, _to_resolve_url
+            parts = _parse_hf_url(url)
+            if parts:
+                return _to_resolve_url(parts)
+        return url
+
+    # ── Local pipeline: download to disk → register ───────────
+
+    async def _pipeline_download_local(self, task: TransferTask) -> None:
+        """Download file to local storage using aria2c/httpx, then register."""
+        await self._phase_download(task)
+        if task.status == TaskStatus.CANCELLED:
+            return
+        await self._phase_register(task)
+
     async def _phase_download(self, task: TransferTask) -> None:
         task.status = TaskStatus.DOWNLOADING
         await self._save(task)
 
         source = self._registry.get_source(task.source_plugin)
-
         info = await source.get_file_info(task.source_url)
         task.filename = info.filename
         task.file_size = info.size
@@ -183,8 +601,8 @@ class TaskManager:
         def _progress(downloaded: int, total: Optional[int]) -> None:
             task.downloaded_bytes = downloaded
             if total and total > 0:
-                ratio = downloaded / total
-                task.progress = ratio * (0.5 if task.sink_plugin else 1.0)
+                task.download_progress = downloaded / total
+                task.progress = downloaded / total
 
         file_path = await source.download(task.source_url, dest_dir, on_progress=_progress)
         task.filename = file_path.name
@@ -192,38 +610,8 @@ class TaskManager:
         task.downloaded_bytes = task.file_size
         await self._save(task)
 
-    async def _phase_push(self, task: TransferTask) -> None:
-        task.status = TaskStatus.PUSHING
-        await self._save(task)
-
-        sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
-        file_path = self._download_dir / task.task_id / (task.filename or "download")
-        chunk_size = 32 * 1024 * 1024  # 32 MB
-        file_size = file_path.stat().st_size
-        total_parts = math.ceil(file_size / chunk_size)
-
-        session_id = await sink.initialize_upload(task.filename or task.task_id, {"task_id": task.task_id})
-        task.sink_session_id = session_id
-        await self._save(task)
-
-        parts: list[PartResult] = []
-        with open(file_path, "rb") as f:
-            for part_num in range(1, total_parts + 1):
-                data = f.read(chunk_size)
-                if not data:
-                    break
-                result = await sink.upload_part(session_id, part_num, data)
-                parts.append(result)
-                task.pushed_parts = part_num
-                task.progress = 0.5 + 0.5 * (part_num / total_parts)
-                await self._save(task)
-
-        result_url = await sink.complete_upload(session_id, parts)
-        task.sink_result_url = result_url
-        await self._save(task)
-
     async def _phase_register(self, task: TransferTask) -> None:
-        """Register downloaded file in TusStorage with the chosen retention."""
+        """Register downloaded file in TusStorage."""
         file_path = self._download_dir / task.task_id / (task.filename or "download")
         if not file_path.exists():
             return
@@ -232,9 +620,7 @@ class TaskManager:
 
         file_id = uuid.uuid4().hex
         file_size = file_path.stat().st_size
-
         use_chunked = task.retention == "download_once"
-        chunk_size = 32 * 1024 * 1024
 
         if use_chunked:
             chunk_dir = self._storage.get_chunk_dir(file_id)
@@ -242,22 +628,16 @@ class TaskManager:
             idx = 0
             with open(file_path, "rb") as f:
                 while True:
-                    data = f.read(chunk_size)
+                    data = f.read(_CHUNK_SIZE)
                     if not data:
                         break
-                    chunk_path = chunk_dir / f"chunk_{idx:06d}"
-                    chunk_path.write_bytes(data)
+                    (chunk_dir / f"chunk_{idx:06d}").write_bytes(data)
                     await self._storage.mark_chunk_available(file_id, idx)
                     idx += 1
             storage_path = str(chunk_dir)
             total_chunks = idx
         else:
-            final_path = self._storage.get_file_path(file_id)
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            import shutil
-
-            shutil.move(str(file_path), str(final_path))
-            storage_path = str(final_path)
+            storage_path = str(self._storage.get_file_path(file_id))
             total_chunks = 0
 
         upload = TusUpload(  # type: ignore[call-arg]
@@ -271,13 +651,16 @@ class TaskManager:
             retention_ttl=task.retention_ttl,
             owner_id=task.owner_id,
             chunked_storage=use_chunked,
-            chunk_size=chunk_size,
+            chunk_size=_CHUNK_SIZE,
             available_size=file_size,
             total_chunks=total_chunks,
             received_ranges=[[0, file_size]],
         )
         await self._storage.create_upload(upload)
-        await self._storage.finalize_upload(file_id)
 
+        if not use_chunked:
+            shutil.move(str(file_path), str(self._storage.get_file_path(file_id)))
+
+        await self._storage.finalize_upload(file_id)
         task.file_id = file_id
         await self._save(task)

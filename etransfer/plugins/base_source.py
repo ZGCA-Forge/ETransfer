@@ -12,9 +12,9 @@ class RemoteFileInfo(BaseModel):
     """Metadata about a remote file before downloading."""
 
     filename: str = Field(..., description="Remote filename")
-    size: Optional[int] = Field(None, description="File size in bytes (None if unknown)")
-    mime_type: Optional[str] = Field(None, description="MIME type")
-    etag: Optional[str] = Field(None, description="ETag or checksum")
+    size: int = Field(0, description="File size in bytes (0 = unknown)")
+    mime_type: str = Field("application/octet-stream", description="MIME type")
+    etag: str = Field("", description="ETag or checksum")
     extra: dict = Field(default_factory=dict, description="Source-specific metadata")
 
 

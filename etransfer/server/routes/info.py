@@ -64,23 +64,69 @@ def create_info_router(
         return {"status": "healthy"}
 
     @router.get("/stats")
-    async def get_stats() -> dict[str, Any]:
+    async def get_stats(request: Request) -> dict[str, Any]:
         """Get detailed server statistics."""
         # Get per-endpoint traffic
         all_eps = await tracker.get_all_endpoints()
+
+        total_up = sum(ep.get("bytes_recv", 0) for ep in all_eps)
+        total_down = sum(ep.get("bytes_sent", 0) for ep in all_eps)
 
         # Get file stats
         files = await storage.list_files()
         uploads = await storage.list_uploads(include_completed=False)
 
+        # User count (if user system enabled)
+        user_count = 0
+        user_db = getattr(request.app.state, "user_db", None)
+        if user_db:
+            try:
+                users = await user_db.list_users()
+                user_count = len(users)
+            except Exception:
+                pass
+
+        # Task-level traffic (offline downloads + sink pushes)
+        task_mgr = getattr(request.app.state, "task_manager", None)
+        task_download_bytes = 0
+        task_push_bytes = 0
+        task_total = 0
+        task_completed = 0
+        task_active = 0
+        if task_mgr:
+            try:
+                tasks = await task_mgr.list_tasks()
+                task_total = len(tasks)
+                for t in tasks:
+                    task_download_bytes += t.downloaded_bytes
+                    if t.sink_plugin and t.file_size:
+                        if t.status.value == "completed":
+                            task_push_bytes += t.file_size
+                        elif t.status.value == "pushing":
+                            task_push_bytes += t.pushed_parts * 128 * 1024 * 1024
+                    if t.status.value == "completed":
+                        task_completed += 1
+                    elif t.status.value in ("downloading", "pushing", "pending"):
+                        task_active += 1
+            except Exception:
+                pass
+
         return {
             "traffic": {ep["endpoint"]: ep for ep in all_eps},
+            "total_upload_bytes": total_up,
+            "total_download_bytes": total_down,
+            "task_download_bytes": task_download_bytes,
+            "task_push_bytes": task_push_bytes,
+            "task_total": task_total,
+            "task_completed": task_completed,
+            "task_active": task_active,
             "files": {
                 "completed": len(files),
                 "in_progress": len(uploads),
                 "total_size": sum(f.get("size", 0) for f in files),
                 "uploading_size": sum(u.offset for u in uploads),
             },
+            "user_count": user_count,
         }
 
     @router.get("/endpoints")
