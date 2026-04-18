@@ -29,7 +29,7 @@ def create_info_router(
     router = APIRouter(prefix="/api", tags=["Server Info"])
 
     @router.get("/info", response_model=ServerInfo)
-    async def get_server_info() -> ServerInfo:
+    async def get_server_info(request: Request) -> ServerInfo:
         """Get server information.
 
         Returns server capabilities, endpoint traffic stats, and storage stats.
@@ -47,6 +47,14 @@ def create_info_router(
         total_size = sum(f.get("size", 0) for f in files)
         total_size += sum(u.offset for u in uploads)
 
+        # Effective retention policy advertised to clients.
+        settings = getattr(request.app.state, "settings", None)
+        default_retention = getattr(settings, "default_retention", "download_once") if settings else "download_once"
+        allow_permanent = bool(getattr(settings, "allow_permanent_retention", True)) if settings else True
+        policies = ["download_once", "ttl"]
+        if allow_permanent:
+            policies.append("permanent")
+
         return ServerInfo(
             version=__version__,
             tus_version=TUS_VERSION,
@@ -56,6 +64,8 @@ def create_info_router(
             endpoints=endpoints,
             total_files=total_files,
             total_size=total_size,
+            retention_policies=policies,
+            default_retention=default_retention,
         )
 
     @router.get("/health")

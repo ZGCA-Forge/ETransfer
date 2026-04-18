@@ -80,7 +80,8 @@ def test_config():
     assert settings.port == 8765
     assert settings.chunk_size == 32 * 1024 * 1024
     assert settings.state_backend == "file"
-    assert settings.default_retention == "permanent"
+    assert settings.default_retention == "download_once"
+    assert settings.allow_permanent_retention is True
     assert settings.config_watch is False
     assert settings.config_watch_interval == 30
 
@@ -180,8 +181,9 @@ def test_tus_metadata():
 
     assert metadata.filename == "test.txt"
     assert metadata.filetype == "text/plain"
-    assert metadata.retention is None  # 未指定时为 None
-    assert metadata.retention_ttl is None
+    # Default retention is "download_once" when client does not specify one.
+    assert metadata.retention == "download_once"
+    assert metadata.retention_ttl == 0
 
     # 测试转换回 header
     header = metadata.to_header()
@@ -192,7 +194,7 @@ def test_tus_metadata():
     header_with_retention = f"filename {filename}," f"retention {retention_val}"
     meta2 = TusMetadata.from_header(header_with_retention)
     assert meta2.retention == "download_once"
-    assert meta2.retention_ttl is None
+    assert meta2.retention_ttl == 0
 
     # 测试带 TTL 的元数据解析
     ttl_val = base64.b64encode(b"3600").decode()

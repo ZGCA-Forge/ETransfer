@@ -77,6 +77,15 @@ class ServerInfo(BaseModel):
     endpoints: list[EndpointInfo] = Field(default_factory=list, description="Server endpoints")
     total_files: int = Field(0, description="Total files on server")
     total_size: int = Field(0, description="Total storage used")
+    retention_policies: list[str] = Field(
+        default_factory=lambda: ["download_once", "ttl", "permanent"],
+        description="Retention policies available to ordinary clients. "
+        "'permanent' is omitted when the server disables it.",
+    )
+    default_retention: str = Field(
+        "download_once",
+        description="Default retention applied when the client does not specify one.",
+    )
 
 
 class FileListResponse(BaseModel):

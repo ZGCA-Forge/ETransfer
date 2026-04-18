@@ -20,6 +20,7 @@ from etransfer.common.constants import (
     TusHeaders,
 )
 from etransfer.server.auth.models import RoleQuota
+from etransfer.server.auth.privilege import enforce_retention_policy
 from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
 from etransfer.server.tus.models import TusCapabilities, TusErrors, TusMetadata, TusUpload
 from etransfer.server.tus.quota import QuotaService
@@ -207,6 +208,11 @@ def create_tus_router(
 
         if retention not in ("permanent", "download_once", "ttl"):
             retention = "permanent"
+
+        # Enforce server policy: non-privileged callers may be blocked from
+        # requesting permanent retention when ``allow_permanent_retention``
+        # is False.  Falls back silently for privileged callers.
+        enforce_retention_policy(request, retention)
 
         # Chunk-based storage for download_once (streaming relay) or sink forwarding
         use_chunked = retention == "download_once" or bool(tus_metadata.sink)

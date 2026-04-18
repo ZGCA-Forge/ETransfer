@@ -53,7 +53,7 @@ class InstanceTrafficTracker:
         self._redis = redis_client
         self._pid = os.getpid()
 
-        # Accumulator for the current second
+        # Accumulator for the current second (middleware-reported)
         self._current_upload: int = 0
         self._current_download: int = 0
 
@@ -63,6 +63,12 @@ class InstanceTrafficTracker:
         # Lifetime counters
         self.total_bytes_sent: int = 0
         self.total_bytes_recv: int = 0
+
+        # psutil baseline for network counters
+        import psutil
+        _net = psutil.net_io_counters()
+        self._prev_net_sent: int = _net.bytes_sent
+        self._prev_net_recv: int = _net.bytes_recv
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -207,17 +213,33 @@ class InstanceTrafficTracker:
                 await asyncio.sleep(_SAMPLE_INTERVAL)
 
     def _commit_sample(self) -> None:
-        """Move current accumulators into a committed sample."""
+        """Commit a sample using OS-level network counters (psutil).
+
+        This captures ALL traffic including offline download tasks,
+        not just TUS protocol traffic from the middleware.
+        """
+        import psutil
         now = time.monotonic()
+        _net = psutil.net_io_counters()
+
+        sent_delta = _net.bytes_sent - self._prev_net_sent
+        recv_delta = _net.bytes_recv - self._prev_net_recv
+        self._prev_net_sent = _net.bytes_sent
+        self._prev_net_recv = _net.bytes_recv
+
+        # Also include middleware-reported bytes in lifetime counters
+        self.total_bytes_sent += self._current_download
+        self.total_bytes_recv += self._current_upload
+        self._current_upload = 0
+        self._current_download = 0
+
         self._samples.append(
             _Sample(
                 timestamp=now,
-                upload_bytes=self._current_upload,
-                download_bytes=self._current_download,
+                upload_bytes=sent_delta,
+                download_bytes=recv_delta,
             )
         )
-        self._current_upload = 0
-        self._current_download = 0
 
         # Trim old samples
         cutoff = now - _WINDOW_SECONDS - 1

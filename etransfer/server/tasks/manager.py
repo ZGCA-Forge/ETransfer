@@ -7,6 +7,7 @@ import io
 import logging
 import math
 import shutil
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,9 @@ logger = logging.getLogger("etransfer.server.tasks")
 
 _STATE_PREFIX = "et:task:"
 _CHUNK_SIZE = 128 * 1024 * 1024  # 128 MB — larger chunks reduce multipart overhead
+_MAX_CONCURRENT_DOWNLOADS = 5
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = (5, 15, 30)  # seconds between retries
 
 
 class TaskManager:
@@ -52,9 +56,11 @@ class TaskManager:
         self._sink_presets: dict = sink_presets or {}
         self._running: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
         self._tasks: dict[str, TransferTask] = {}
-        self._prev_bytes: dict[str, int] = {}
+        self._prev_dl: dict[str, int] = {}
+        self._prev_push: dict[str, int] = {}
         self._prev_time: dict[str, datetime] = {}
         self._shutting_down = False
+        self._download_sem = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
 
     # ── Persistence helpers ───────────────────────────────────
 
@@ -67,15 +73,26 @@ class TaskManager:
         if prev_t:
             elapsed = (now - prev_t).total_seconds()
             if elapsed > 0.3:
-                prev_b = self._prev_bytes.get(task.task_id, 0)
-                current_b = task.downloaded_bytes + (task.pushed_parts * _CHUNK_SIZE)
-                delta = current_b - prev_b
-                task.speed = max(0.0, delta / elapsed) if delta > 0 else task.speed * 0.5
-                self._prev_bytes[task.task_id] = current_b
+                # Download speed: delta-based (downloaded_bytes updates frequently)
+                dl_prev = self._prev_dl.get(task.task_id, 0)
+                dl_delta = task.downloaded_bytes - dl_prev
+                task.download_speed = max(0.0, dl_delta / elapsed) if dl_delta > 0 else task.download_speed * 0.5
+
+                # Push speed: set directly by pipeline via upload_part timing;
+                # here we only decay when no push activity.
+                push_bytes = task.pushed_parts * _CHUNK_SIZE
+                push_prev = self._prev_push.get(task.task_id, 0)
+                if push_bytes == push_prev:
+                    task.push_speed *= 0.8
+
+                task.speed = max(task.download_speed, task.push_speed)
+                self._prev_dl[task.task_id] = task.downloaded_bytes
+                self._prev_push[task.task_id] = push_bytes
                 self._prev_time[task.task_id] = now
         else:
             self._prev_time[task.task_id] = now
-            self._prev_bytes[task.task_id] = 0
+            self._prev_dl[task.task_id] = 0
+            self._prev_push[task.task_id] = 0
 
         task.updated_at = now
         self._tasks[task.task_id] = task
@@ -91,7 +108,7 @@ class TaskManager:
             "superseded_by": "",
         }
         _int_defaults = {"file_size": 0, "retention_ttl": 0}
-        _float_defaults = {"speed": 0.0, "download_progress": 0.0, "push_progress": 0.0}
+        _float_defaults = {"speed": 0.0, "download_speed": 0.0, "push_speed": 0.0, "download_progress": 0.0, "push_progress": 0.0}
         for k, v in _float_defaults.items():
             if k in d and d[k] is None:
                 d[k] = v
@@ -127,6 +144,7 @@ class TaskManager:
         retention_ttl: int = 0,
         owner_id: Optional[int] = None,
         user: Any = None,
+        filename: str = "",
     ) -> TransferTask:
         source = await self._registry.resolve_source(source_url)
 
@@ -136,7 +154,7 @@ class TaskManager:
                 user=user,
                 client_metadata={"sink_config": sink_config} if sink_config else {},
                 retention=retention,
-                filename="",
+                filename=filename,
                 file_size=None,
             )
             presets_for_sink = self._sink_presets.get(sink_plugin, {})
@@ -151,6 +169,7 @@ class TaskManager:
             retention=retention,
             retention_ttl=retention_ttl,
             owner_id=owner_id,
+            filename=filename,
         )
         task._user = user  # transient, not serialized
         await self._save(task)
@@ -187,8 +206,19 @@ class TaskManager:
         if bg and not bg.done():
             bg.cancel()
 
+        # Best-effort abort of any open sink multipart session so we do not
+        # leak parts on the remote bucket (e.g. TOS keeps them for ~7 days).
+        session_id = getattr(task, "sink_session_id", "") or ""
+        if session_id and task.sink_plugin:
+            try:
+                sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
+                await sink.abort_upload(session_id)
+            except Exception:
+                logger.debug("Failed to abort sink session %s on cancel", session_id[:12])
+
         task.status = TaskStatus.CANCELLED
         task.error = "Cancelled by user"
+        task.sink_session_id = ""
         await self._save(task)
         return True
 
@@ -250,6 +280,8 @@ class TaskManager:
                 task.status = TaskStatus.PENDING
                 task.error = "interrupted by shutdown"
                 task.speed = 0.0
+                task.download_speed = 0.0
+                task.push_speed = 0.0
                 await self._save(task)
 
         logger.info("Shutdown complete: %d task(s) saved for restart recovery", count)
@@ -258,13 +290,23 @@ class TaskManager:
     # ── Startup recovery ──────────────────────────────────────
 
     async def resume_interrupted(self) -> int:
-        """Resume tasks that were interrupted by a previous shutdown."""
+        """Resume tasks left over from a previous run.
+
+        At process startup ``self._running`` is always empty, so any task whose
+        persisted status is still in a "running" state (PENDING / DOWNLOADING /
+        PUSHING) is by definition a zombie that must be revived.  This is
+        broader than the historical "PENDING + interrupted-by-shutdown"
+        signature, which missed tasks left behind by hard-kill / OOM / crash
+        scenarios where ``shutdown()`` never had the chance to rewrite their
+        status.
+        """
         all_tasks = await self.list_tasks()
-        pending = [t for t in all_tasks if t.status == TaskStatus.PENDING and t.error == "interrupted by shutdown"]
-        if not pending:
+        zombie_states = {TaskStatus.PENDING, TaskStatus.DOWNLOADING, TaskStatus.PUSHING}
+        zombies = [t for t in all_tasks if t.status in zombie_states]
+        if not zombies:
             return 0
 
-        for task in pending:
+        for task in zombies:
             task.status = TaskStatus.PENDING
             task.progress = 0.0
             task.download_progress = 0.0
@@ -273,13 +315,15 @@ class TaskManager:
             task.pushed_parts = 0
             task.error = ""
             task.speed = 0.0
+            task.download_speed = 0.0
+            task.push_speed = 0.0
             task.sink_session_id = ""
             await self._save(task)
             bg = asyncio.create_task(self._run_pipeline(task))
             self._running[task.task_id] = bg
 
-        logger.info("Resumed %d interrupted task(s)", len(pending))
-        return len(pending)
+        logger.info("Resumed %d interrupted task(s)", len(zombies))
+        return len(zombies)
 
     async def push_file(
         self,
@@ -324,10 +368,11 @@ class TaskManager:
 
     async def _run_pipeline(self, task: TransferTask) -> None:
         try:
-            if task.sink_plugin:
-                await self._pipeline_stream_to_sink(task)
-            else:
-                await self._pipeline_download_local(task)
+            async with self._download_sem:
+                if task.sink_plugin:
+                    await self._pipeline_stream_to_sink(task)
+                else:
+                    await self._pipeline_download_local(task)
 
             task.status = TaskStatus.COMPLETED
             task.completed_at = datetime.utcnow()
@@ -342,6 +387,8 @@ class TaskManager:
                 task.status = TaskStatus.PENDING
                 task.error = "interrupted by shutdown"
                 task.speed = 0.0
+                task.download_speed = 0.0
+                task.push_speed = 0.0
                 logger.info("Task %s interrupted by shutdown, saved for resume", task.task_id[:8])
             else:
                 task.status = TaskStatus.CANCELLED
@@ -412,6 +459,8 @@ class TaskManager:
                 task.status = TaskStatus.PENDING
                 task.error = "interrupted by shutdown"
                 task.speed = 0.0
+                task.download_speed = 0.0
+                task.push_speed = 0.0
             else:
                 task.status = TaskStatus.CANCELLED
                 task.error = "Cancelled"
@@ -440,19 +489,24 @@ class TaskManager:
         source = self._registry.get_source(task.source_plugin)
         sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
 
-        # Get file info (filename, size)
+        # Get file info (filename, size) — skip if already pre-set from batch
         task.status = TaskStatus.DOWNLOADING
         await self._save(task)
-        info = await source.get_file_info(task.source_url)
-        task.filename = info.filename
-        task.file_size = info.size
+        info = await self._retry(source.get_file_info, task.source_url, label=f"get_file_info({task.task_id[:8]})")
+        if not task.filename:
+            task.filename = info.filename
+        if info.size:
+            task.file_size = info.size
         await self._save(task)
 
         total_size = info.size or 0
         total_parts = math.ceil(total_size / _CHUNK_SIZE) if total_size else 0
 
         # Resolve the actual download URL (handle GDrive confirm, HF blob→resolve)
-        dl_url = self._resolve_download_url(task.source_url, task.source_plugin)
+        dl_url, dl_cookies = await self._retry(
+            self._resolve_download_url, task.source_url, task.source_plugin,
+            label=f"resolve_url({task.task_id[:8]})",
+        )
 
         # Initialize sink multipart
         _user = getattr(task, "_user", None)
@@ -475,9 +529,20 @@ class TaskManager:
         buf = bytearray()
         downloaded = 0
 
+        # Google Drive requires a browser-like User-Agent, otherwise it
+        # returns a small HTML error page instead of the actual file.
+        stream_headers: dict[str, str] = {}
+        if task.source_plugin == "gdrive":
+            stream_headers["User-Agent"] = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/39.0.2171.95 Safari/537.36"
+            )
+
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True, timeout=httpx.Timeout(30, read=600)
+                follow_redirects=True, timeout=httpx.Timeout(30, read=600),
+                cookies=dl_cookies or None, headers=stream_headers or None,
             ) as client:
                 async with client.stream("GET", dl_url) as resp:
                     resp.raise_for_status()
@@ -517,7 +582,11 @@ class TaskManager:
                             data = bytes(buf[:_CHUNK_SIZE])
                             del buf[:_CHUNK_SIZE]
 
+                            t0 = time.monotonic()
                             result = await sink.upload_part(session_id, part_num, data)
+                            push_elapsed = time.monotonic() - t0
+                            if push_elapsed > 0:
+                                task.push_speed = len(data) / push_elapsed
                             parts.append(result)
                             task.pushed_parts = part_num
 
@@ -535,7 +604,12 @@ class TaskManager:
                 # Flush remaining buffer as final part
                 if buf:
                     part_num += 1
-                    result = await sink.upload_part(session_id, part_num, bytes(buf))
+                    final_data = bytes(buf)
+                    t0 = time.monotonic()
+                    result = await sink.upload_part(session_id, part_num, final_data)
+                    push_elapsed = time.monotonic() - t0
+                    if push_elapsed > 0:
+                        task.push_speed = len(final_data) / push_elapsed
                     parts.append(result)
                     task.pushed_parts = part_num
                     buf.clear()
@@ -562,19 +636,41 @@ class TaskManager:
                 logger.debug("Failed to abort sink session %s", session_id[:12])
             raise
 
-    def _resolve_download_url(self, url: str, source_plugin: str) -> str:
-        """Convert a user-facing URL to a direct download URL."""
+    async def _retry(self, fn, *args, label: str = "", **kwargs):
+        """Retry an async callable with exponential backoff on transient errors."""
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                return await fn(*args, **kwargs)
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout,
+                    httpx.PoolTimeout, ConnectionError, OSError) as exc:
+                last_exc = exc
+                delay = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+                logger.warning(
+                    "Retry %d/%d for %s: %s — waiting %ds",
+                    attempt + 1, _MAX_RETRIES, label or fn.__name__,
+                    type(exc).__name__, delay,
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    async def _resolve_download_url(
+        self, url: str, source_plugin: str,
+    ) -> tuple[str, dict[str, str]]:
+        """Convert a user-facing URL to a direct download URL.
+
+        Returns (resolved_url, cookies). Cookies are required for sources
+        like Google Drive that gate downloads behind a confirmation page.
+        """
         if source_plugin == "gdrive":
-            from etransfer.plugins.sources.gdrive import _extract_file_id, _DOWNLOAD_URL
-            file_id = _extract_file_id(url)
-            if file_id:
-                return f"{_DOWNLOAD_URL.format(file_id=file_id)}&confirm=t"
+            source = self._registry.get_source("gdrive")
+            return await source.resolve_download_url(url)
         elif source_plugin == "huggingface":
             from etransfer.plugins.sources.huggingface import _parse_hf_url, _to_resolve_url
             parts = _parse_hf_url(url)
             if parts:
-                return _to_resolve_url(parts)
-        return url
+                return _to_resolve_url(parts), {}
+        return url, {}
 
     # ── Local pipeline: download to disk → register ───────────
 
@@ -590,9 +686,11 @@ class TaskManager:
         await self._save(task)
 
         source = self._registry.get_source(task.source_plugin)
-        info = await source.get_file_info(task.source_url)
-        task.filename = info.filename
-        task.file_size = info.size
+        info = await self._retry(source.get_file_info, task.source_url, label=f"get_file_info({task.task_id[:8]})")
+        if not task.filename:
+            task.filename = info.filename
+        if info.size:
+            task.file_size = info.size
         await self._save(task)
 
         dest_dir = self._download_dir / task.task_id
@@ -604,7 +702,7 @@ class TaskManager:
                 task.download_progress = downloaded / total
                 task.progress = downloaded / total
 
-        file_path = await source.download(task.source_url, dest_dir, on_progress=_progress)
+        file_path = await self._retry(source.download, task.source_url, dest_dir, on_progress=_progress, label=f"download({task.task_id[:8]})")
         task.filename = file_path.name
         task.file_size = file_path.stat().st_size
         task.downloaded_bytes = task.file_size

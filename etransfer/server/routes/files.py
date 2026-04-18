@@ -610,9 +610,9 @@ def create_files_router(storage: TusStorage) -> APIRouter:
             mime_type=info.get("mime_type") or "application/octet-stream",
             checksum=info.get("checksum") or "",
             chunked_storage=is_chunked,
-            chunk_size=chunk_size,
-            total_chunks=total_chunks,
-            available_chunks=available_chunks,
+            chunk_size=chunk_size or 0,
+            total_chunks=total_chunks or 0,
+            available_chunks=available_chunks or [],
             chunks_consumed=chunks_consumed,
             upload_active=upload_active,
         )

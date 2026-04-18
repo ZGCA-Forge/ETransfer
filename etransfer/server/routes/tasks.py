@@ -8,6 +8,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from etransfer.server.auth.privilege import enforce_retention_policy
 from etransfer.server.tasks.models import CreateTaskRequest, TaskResponse, TaskStatus
 
 logger = logging.getLogger("etransfer.server.tasks")
@@ -50,6 +51,10 @@ def create_tasks_router() -> APIRouter:
         user = getattr(request.state, "user", None)
         owner_id = getattr(user, "id", None) if user else None
 
+        # Enforce server policy on requested retention.  Raises 403 for
+        # non-privileged callers when permanent retention is disabled.
+        enforce_retention_policy(request, body.retention)
+
         # Check if this is a repo/folder URL → batch expand
         try:
             from etransfer.plugins.registry import plugin_registry
@@ -82,6 +87,7 @@ def create_tasks_router() -> APIRouter:
                 retention_ttl=body.retention_ttl,
                 owner_id=owner_id,
                 user=user,
+                filename=body.filename,
             )
         except ValueError as e:
             raise HTTPException(400, str(e))
@@ -122,6 +128,7 @@ def create_tasks_router() -> APIRouter:
                     retention_ttl=body.retention_ttl,
                     owner_id=owner_id,
                     user=user,
+                    filename=f["path"],
                 )
                 tasks.append(TaskResponse(**task.model_dump()))
             except Exception as e:
@@ -268,8 +275,17 @@ def create_tasks_router() -> APIRouter:
             user=user,
         )
 
-        old.superseded_by = task.task_id
-        await mgr._save(old)
+        # Mark ALL old tasks with same source_url that are failed/cancelled as superseded
+        all_tasks = await mgr.list_tasks()
+        for t in all_tasks:
+            if (
+                t.source_url == old.source_url
+                and t.task_id != task.task_id
+                and not t.superseded_by
+                and t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
+            ):
+                t.superseded_by = task.task_id
+                await mgr._save(t)
 
         return TaskResponse(**task.model_dump())
 

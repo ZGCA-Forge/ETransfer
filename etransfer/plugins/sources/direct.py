@@ -35,19 +35,27 @@ class DirectLinkSource(BaseSource):
         return scheme in ("http", "https")
 
     async def get_file_info(self, url: str) -> RemoteFileInfo:
+        """Fetch file metadata via HEAD, falling back to ranged GET.
+
+        Some servers (notably S3 pre-signed URLs signed for GET only)
+        reject HEAD with 403.  When that happens we fall back to a
+        tiny ranged GET and read Content-Range to discover the real size.
+        """
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
             resp = await client.head(url)
+            if resp.status_code in (403, 405, 501):
+                logger.info("HEAD %s returned %d, falling back to ranged GET", url, resp.status_code)
+                resp = await client.get(url, headers={"Range": "bytes=0-0"})
             resp.raise_for_status()
 
-        content_length = resp.headers.get("content-length")
         content_type = resp.headers.get("content-type")
         etag = resp.headers.get("etag")
-
+        size = _extract_total_size(resp.headers)
         filename = _extract_filename(url, resp.headers)
 
         return RemoteFileInfo(
             filename=filename,
-            size=int(content_length) if content_length else 0,
+            size=size,
             mime_type=content_type or "application/octet-stream",
             etag=etag or "",
         )
@@ -102,3 +110,16 @@ def _extract_filename(url: str, headers: httpx.Headers) -> str:
     path = urlparse(url).path
     name = unquote(path.rsplit("/", 1)[-1]) if "/" in path else ""
     return name or "download"
+
+
+def _extract_total_size(headers: httpx.Headers) -> int:
+    """Prefer Content-Range total (for ranged GET); fall back to Content-Length."""
+    cr = headers.get("content-range", "")
+    if "/" in cr:
+        tail = cr.rsplit("/", 1)[-1].strip()
+        if tail.isdigit():
+            return int(tail)
+    cl = headers.get("content-length")
+    if cl and cl.isdigit():
+        return int(cl)
+    return 0

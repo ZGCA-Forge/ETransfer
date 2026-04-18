@@ -32,6 +32,9 @@ auth:
 retention:
   default: download_once # download_once / permanent / ttl
   # default_ttl: 86400  # Default TTL in seconds (for ttl policy)
+  # allow_permanent: true   # Set to false to forbid ordinary users from
+  #                         # requesting permanent retention. Static API-token
+  #                         # holders and admin users are still allowed.
   # token_policies:
   #   guest-token:
   #     default_retention: download_once

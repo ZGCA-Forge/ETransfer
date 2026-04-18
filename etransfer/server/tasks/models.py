@@ -47,7 +47,9 @@ class TransferTask(BaseModel):
 
     owner_id: Optional[int] = Field(None, description="Owning user ID")
 
-    speed: float = Field(0.0, description="Current speed in bytes/sec")
+    speed: float = Field(0.0, description="Current overall speed in bytes/sec")
+    download_speed: float = Field(0.0, description="Download speed in bytes/sec")
+    push_speed: float = Field(0.0, description="Push speed in bytes/sec")
     download_progress: float = Field(0.0, description="Download phase progress 0.0-1.0")
     push_progress: float = Field(0.0, description="Push phase progress 0.0-1.0")
 
@@ -60,6 +62,7 @@ class CreateTaskRequest(BaseModel):
     """REST request body for creating a transfer task."""
 
     source_url: str = Field(..., description="URL to download")
+    filename: str = Field("", description="Override filename (empty = auto-detect)")
     sink_plugin: str = Field("", description="Sink plugin name (empty = no push)")
     sink_config: dict = Field(default_factory=dict, description="Explicit sink config (overrides presets)")
     retention: str = Field("download_once", description="download_once / permanent / ttl")
@@ -84,6 +87,8 @@ class TaskResponse(BaseModel):
     retention: str
     retention_ttl: int
     speed: float
+    download_speed: float
+    push_speed: float
     download_progress: float
     push_progress: float
     sink_result_url: str

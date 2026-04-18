@@ -236,7 +236,7 @@ class RetentionTester:
 
         # Download #1
         print("  Downloading file (attempt 1)...")
-        dl1 = tempfile.mktemp(suffix=".bin")
+        dl1 = tempfile.mkstemp(suffix=".bin")[1]
         status, headers = self.download_file(file_id, dl1)
         assert status == 200, f"Download failed with {status}"
         assert (
@@ -248,7 +248,7 @@ class RetentionTester:
 
         # Download #2
         print("  Downloading file (attempt 2)...")
-        dl2 = tempfile.mktemp(suffix=".bin")
+        dl2 = tempfile.mkstemp(suffix=".bin")[1]
         status, headers = self.download_file(file_id, dl2)
         assert status == 200, f"Second download failed with {status}"
         dl2_md5 = md5_file(dl2)
@@ -287,7 +287,7 @@ class RetentionTester:
 
         # Download #1 - should succeed
         print("  Downloading file (first download)...")
-        dl1 = tempfile.mktemp(suffix=".bin")
+        dl1 = tempfile.mkstemp(suffix=".bin")[1]
         status, headers = self.download_file(file_id, dl1)
         assert status == 200, f"First download failed with {status}"
         assert headers.get("x-retention-policy") == "download_once"
@@ -302,7 +302,7 @@ class RetentionTester:
 
         # Download #2 - should fail (file deleted)
         print("  Attempting second download (should fail)...")
-        dl2 = tempfile.mktemp(suffix=".bin")
+        dl2 = tempfile.mkstemp(suffix=".bin")[1]
         try:
             status, headers = self.download_file(file_id, dl2)
             # If we got a status, check it's 404
@@ -349,7 +349,7 @@ class RetentionTester:
 
         # Download before expiry - should succeed
         print("  Downloading before TTL expiry...")
-        dl1 = tempfile.mktemp(suffix=".bin")
+        dl1 = tempfile.mkstemp(suffix=".bin")[1]
         status, headers = self.download_file(file_id, dl1)
         assert status == 200, f"Download failed with {status}"
         assert headers.get("x-retention-policy") == "ttl"
@@ -429,7 +429,7 @@ class RetentionTester:
 
         # Download - should trigger deletion
         print("  Downloading file...")
-        dl1 = tempfile.mktemp(suffix=".bin")
+        dl1 = tempfile.mkstemp(suffix=".bin")[1]
         status, headers = self.download_file(file_id, dl1)
         assert status == 200
         assert headers.get("x-retention-policy") == "download_once"
@@ -479,7 +479,7 @@ class RetentionTester:
 
         # Download twice - file should persist
         for i in range(2):
-            dl = tempfile.mktemp(suffix=".bin")
+            dl = tempfile.mkstemp(suffix=".bin")[1]
             status, _ = self.download_file(file_id, dl)
             assert status == 200
             os.unlink(dl)

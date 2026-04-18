@@ -72,8 +72,9 @@ auth:
     - "your-api-token-here"
 
 retention:
-  default: permanent # permanent / download_once / ttl
+  default: download_once # permanent / download_once / ttl
   # default_ttl: 86400
+  allow_permanent: true # false 时普通用户无法选择 permanent，API token / admin 不受限
   # token_policies:
   #   guest-token:
   #     default_retention: download_once
@@ -116,7 +117,8 @@ cors:
 | `ETRANSFER_MAX_STORAGE_SIZE`     | 总存储配额         | 不限                       |
 | `ETRANSFER_CHUNK_SIZE`           | 切片大小           | `4194304` (4MB)            |
 | `ETRANSFER_ADVERTISED_ENDPOINTS` | 广播 IP 列表       | 自动检测                   |
-| `ETRANSFER_DEFAULT_RETENTION`    | 默认文件策略       | `permanent`                |
+| `ETRANSFER_DEFAULT_RETENTION`    | 默认文件策略       | `download_once`            |
+| `ETRANSFER_ALLOW_PERMANENT_RETENTION` | 是否允许普通用户使用 permanent | `true` |
 | `ETRANSFER_CORS_ORIGINS`         | CORS 来源          | `["*"]`                    |
 
 ## 配置热重载
@@ -140,11 +142,47 @@ curl -X POST http://localhost:8765/api/admin/reload-config \
 
 | 策略            | 说明                       | 场景                 |
 | --------------- | -------------------------- | -------------------- |
-| `permanent`     | 永久保存                   | 默认                 |
-| `download_once` | 下载后自动删除（阅后即焚） | 一次性分享、敏感文件 |
+| `download_once` | 下载后自动删除（阅后即焚） | 一次性分享、敏感文件、默认 |
 | `ttl`           | 按时间自动过期             | 临时文件、限时分享   |
+| `permanent`     | 永久保存（可由服务端关闭） | 团队公共资料库       |
 
-优先级：客户端显式指定 > Token 级策略 > 全局默认
+优先级：客户端显式指定 > Token 级策略 > 全局默认。
+
+如果服务端配置 `retention.allow_permanent: false`：
+
+- `/api/info` 不再向普通用户暴露 `permanent`
+- 前端 Upload 页 / Guide 页隐藏该选项并提示「无权限」
+- 普通会话用户提交 `retention=permanent` 收到 `HTTP 403`
+- 管理员 / API token 调用方不受限制（CLI `--token` 即视为 admin）
+
+## 插件架构（Source / Sink）
+
+ETransfer 内置三类来源与两类目标，均可通过 Python `entry_points` 扩展：
+
+```toml
+# 第三方包的 pyproject.toml
+[project.entry-points."etransfer.sources"]
+my_source = "myorg.sources:MySource"
+
+[project.entry-points."etransfer.sinks"]
+my_sink = "myorg.sinks:MySink"
+```
+
+服务端启动时自动发现并注册。`et plugins` / `et sources` / `et sinks` 可查看当前安装的插件。
+`et upload --sink <name>` 把文件直接转发到目标存储，`et remote-download --sink <name>`
+则把外部 URL 的内容流式落到目标存储。
+
+`config.yaml` 中的 `sink_presets` 提供「无需客户端传敏感凭证」的预设模式，例如：
+
+```yaml
+sink_presets:
+  tos:
+    default:
+      endpoint: tos-cn-beijing.volces.com
+      bucket: my-team-default
+    admin:
+      bucket: my-team-archive
+```
 
 ## 存储配额
 

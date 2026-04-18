@@ -20,6 +20,7 @@ HOT_RELOADABLE_FIELDS = frozenset(
         "token_retention_policies",
         "default_retention",
         "default_retention_ttl",
+        "allow_permanent_retention",
         "advertised_endpoints",
         "max_storage_size",
     }
@@ -75,6 +76,16 @@ class ServerSettings(BaseSettings):
     default_retention_ttl: Optional[int] = Field(
         None,
         description="Global default TTL in seconds (for ttl retention). " "Env: ETRANSFER_DEFAULT_RETENTION_TTL",
+    )
+
+    # Policy flag: whether non-privileged clients may request permanent retention.
+    # When False, API-token holders and admin users can still upload permanent
+    # files (via CLI / admin UI); regular users are forced to download_once / ttl.
+    allow_permanent_retention: bool = Field(
+        True,
+        description="Allow ordinary users to request permanent retention. "
+        "When False, only privileged callers (static API token or admin) can. "
+        "Env: ETRANSFER_ALLOW_PERMANENT_RETENTION",
     )
 
     # Network
@@ -304,6 +315,8 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
             d["default_retention_ttl"] = rt["default_ttl"]
         if "token_policies" in rt:
             d["token_retention_policies"] = rt["token_policies"]
+        if "allow_permanent" in rt:
+            d["allow_permanent_retention"] = bool(rt["allow_permanent"])
     if "user_system" in config:
         us = config["user_system"]
         if "enabled" in us:

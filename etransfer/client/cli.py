@@ -45,9 +45,17 @@ app = typer.Typer(
 
 console = Console()
 
+# Help-panel groupings (controls the order/category shown in `et --help`).
+PANEL_SETUP = "Setup & Session"
+PANEL_FILES = "Files"
+PANEL_OFFLINE = "Offline Download & Tasks"
+PANEL_FOLDERS = "Folders"
+PANEL_PLUGINS = "Plugins"
+PANEL_SERVER = "Server"
+
 # Server subcommand
 server_app = typer.Typer(help="Server management commands", add_completion=False)
-app.add_typer(server_app, name="server")
+app.add_typer(server_app, name="server", rich_help_panel=PANEL_SERVER)
 
 # ---------------------------------------------------------------------------
 # Client config helpers  (~/.etransfer/client.json)
@@ -239,7 +247,7 @@ def _select_endpoint(server: str, token: Optional[str], for_upload: bool = True)
         return server
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_SETUP)
 def setup(
     address: str = typer.Argument(
         ...,
@@ -311,7 +319,7 @@ def setup(
         print_info("Run [bold]etransfer login[/bold] to authenticate.")
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_FILES)
 def upload(
     file_path: Optional[Path] = typer.Argument(None, help="Path to file to upload"),
     token: Optional[str] = typer.Option(
@@ -625,7 +633,7 @@ def upload(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_FILES)
 def reupload(
     file_id: str = typer.Argument(..., help="File ID (or short prefix) of the partial upload to resume"),
     file_path: Path = typer.Argument(..., help="Path to the local file (must match server record)"),
@@ -816,7 +824,7 @@ def _resolve_file_id(prefix: str, server: str, token: Optional[str]) -> str:
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_FILES)
 def download(
     file_id: Optional[str] = typer.Argument(None, help="File ID (or short prefix) to download"),
     token: Optional[str] = typer.Option(
@@ -1115,7 +1123,7 @@ def download(
         raise typer.Exit(1)
 
 
-@app.command("list")
+@app.command("list", rich_help_panel=PANEL_FILES)
 def list_files(
     token: Optional[str] = typer.Option(
         None,
@@ -1260,7 +1268,7 @@ def list_files(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_FILES)
 def delete(
     file_id: str = typer.Argument(..., help="File ID (or short prefix) to delete"),
     token: Optional[str] = typer.Option(
@@ -1303,7 +1311,7 @@ def delete(
         raise typer.Exit(1)
 
 
-@app.command("delete-all")
+@app.command("delete-all", rich_help_panel=PANEL_FILES)
 def delete_all(
     token: Optional[str] = typer.Option(
         None,
@@ -1366,7 +1374,7 @@ def delete_all(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_SETUP)
 def info(
     token: Optional[str] = typer.Option(
         None,
@@ -1490,7 +1498,7 @@ def info(
     console.print("\n[dim]⭐ Like EasyTransfer? Star us → [bold]https://github.com/ZGCA-Forge/ETransfer[/bold][/dim]")
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_SETUP)
 def login(
     timeout: int = typer.Option(
         300,
@@ -1674,7 +1682,7 @@ def login(
         raise typer.Exit(1)
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_SETUP)
 def logout() -> None:
     """Logout and invalidate session."""
     cfg = _load_client_config()
@@ -2185,13 +2193,75 @@ cors:
         console.print(Panel(config_content, title="[bold cyan]Sample Config[/bold cyan]", border_style="cyan"))
 
 
-@app.command("remote-download")
+def _read_urls_from_source(urls_file: Optional[Path]) -> list[str]:
+    """Read a list of URLs from a file or stdin.
+
+    - ``urls_file=Path('-')`` or ``None`` with non-TTY stdin → read stdin.
+    - ``urls_file`` otherwise → read that file.
+    Blank lines and ``#`` comments are ignored.
+    """
+    import io
+
+    urls: list[str] = []
+
+    def _consume(stream: "io.TextIOBase") -> None:
+        for raw in stream:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            urls.append(line)
+
+    if urls_file is not None:
+        if str(urls_file) == "-":
+            _consume(sys.stdin)  # type: ignore[arg-type]
+        else:
+            if not urls_file.exists():
+                print_error(f"URLs file not found: {urls_file}")
+                raise typer.Exit(1)
+            with urls_file.open("r", encoding="utf-8") as fh:
+                _consume(fh)  # type: ignore[arg-type]
+    elif not sys.stdin.isatty():
+        _consume(sys.stdin)  # type: ignore[arg-type]
+    return urls
+
+
+def _submit_remote_download(
+    server: str,
+    headers: dict,
+    url: str,
+    *,
+    output: Optional[str],
+    sink: Optional[str],
+    sink_config_json: Optional[str],
+    retention: str,
+    retention_ttl: Optional[int],
+) -> dict:
+    body: dict = {"source_url": url, "retention": retention}
+    if output:
+        body["filename"] = output
+    if sink:
+        body["sink_plugin"] = sink
+    if sink_config_json:
+        body["sink_config"] = json.loads(sink_config_json)
+    if retention_ttl is not None:
+        body["retention_ttl"] = retention_ttl
+    resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp.json()  # type: ignore[no-any-return]
+
+
+@app.command("remote-download", rich_help_panel=PANEL_OFFLINE)
 def remote_download(
     url: Optional[str] = typer.Argument(None, help="URL to download on the server"),
+    output: Optional[str] = typer.Option(None, "--output", "-o", help="Override saved filename"),
     token: Optional[str] = typer.Option(
         None, "--token", "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
+    ),
+    urls_file: Optional[Path] = typer.Option(
+        None, "--urls-file", "-f",
+        help="Read URLs from file (one per line; '-' for stdin). Overrides URL argument.",
     ),
     sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos). Omit = save to server"),
     sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
@@ -2204,86 +2274,142 @@ def remote_download(
     Downloads a URL on the server side. Optionally pushes to a sink (e.g. TOS).
     If --sink is provided without --sink-config, the server preset is used.
 
+    Batch mode: pass ``--urls-file <path>`` (or pipe URLs via stdin) to submit
+    many URLs in one go.  Each non-blank, non-comment line is treated as a URL.
+
     Examples:
         et remote-download https://example.com/file.zip
+        et remote-download https://example.com/file.zip -o model.bin
         et remote-download https://hf-mirror.com/gpt2/resolve/main/config.json
         et remote-download https://example.com/file.zip --sink tos
         et remote-download https://example.com/file.zip --sink tos -w
+        et remote-download --urls-file urls.txt --sink tos
+        cat urls.txt | et remote-download -f - --sink tos
     """
-    if url is None:
+    batch_urls: list[str] = []
+    if urls_file is not None:
+        batch_urls = _read_urls_from_source(urls_file)
+    elif url is None and not sys.stdin.isatty():
+        batch_urls = _read_urls_from_source(None)
+
+    if url is None and not batch_urls:
         console.print()
         console.print("[bold cyan]et remote-download[/bold cyan] — 离线下载 (server-side download)\n")
         console.print("[bold]Usage:[/bold]  et remote-download <URL> [OPTIONS]\n")
         console.print("[bold]Options:[/bold]")
+        console.print("  -o, --output TEXT    Override saved filename")
+        console.print("  -f, --urls-file PATH Batch URLs file (one per line; '-' = stdin)")
         console.print("  --sink TEXT          Push to sink plugin (e.g. tos). Omit = save to server")
         console.print("  --sink-config JSON   Explicit sink config JSON (overrides preset)")
-        console.print("  -r, --retention TEXT  permanent (default) / download_once / ttl")
+        console.print("  -r, --retention TEXT download_once (default) / permanent / ttl")
         console.print("  --retention-ttl INT  TTL seconds (for --retention ttl)")
         console.print("  -w, --wait           Wait for task completion and show progress")
         console.print()
         console.print("[bold]Examples:[/bold]")
         console.print("  [dim]et remote-download https://example.com/file.zip[/dim]")
-        console.print("  [dim]et remote-download https://hf-mirror.com/gpt2/resolve/main/config.json[/dim]")
-        console.print("  [dim]et remote-download https://example.com/file.zip --sink tos[/dim]")
-        console.print("  [dim]et remote-download https://example.com/file.zip --sink tos -w[/dim]")
+        console.print("  [dim]et remote-download https://example.com/file.zip -o model.bin[/dim]")
+        console.print("  [dim]et remote-download --urls-file urls.txt --sink tos[/dim]")
+        console.print("  [dim]cat urls.txt | et remote-download -f - --sink tos[/dim]")
         return
 
     server = _get_server_url()
     token = token or _get_token()
+    headers = _auth_headers(token)
 
-    headers: dict = {}
-    if token:
-        headers[AUTH_HEADER] = token
-        headers["Authorization"] = f"Bearer {token}"
-
-    body: dict = {"source_url": url, "retention": retention}
-    if sink:
-        body["sink_plugin"] = sink
-    if sink_config:
-        body["sink_config"] = json.loads(sink_config)
-    if retention_ttl is not None:
-        body["retention_ttl"] = retention_ttl
-
-    try:
-        resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("batch"):
-            total = data.get("total_files", 0)
-            created = data.get("created_tasks", 0)
-            folder = data.get("folder_name", "?")
-            repo = data.get("repo", "?")
-            total_size = data.get("total_size", 0)
-            print_success(f"Batch download: {repo}")
-            console.print(f"  [dim]Folder: {folder} | Files: {created}/{total} | Size: {format_size(total_size)}[/dim]")
-            if sink:
-                console.print(f"  [dim]Sink: {sink}[/dim]")
-            console.print(f"  [dim]Track: [bold]et tasks[/bold][/dim]")
-
-            if wait:
-                tasks_list = data.get("tasks", [])
-                for t in tasks_list:
+    # ── Batch mode ────────────────────────────────────────────
+    if batch_urls:
+        if url is not None:
+            batch_urls.insert(0, url)
+        print_info(f"Submitting {len(batch_urls)} URL(s)...")
+        created_ids: list[str] = []
+        failed = 0
+        for u in batch_urls:
+            try:
+                data = _submit_remote_download(
+                    server, headers, u,
+                    output=None,  # per-URL rename not meaningful in batch
+                    sink=sink,
+                    sink_config_json=sink_config,
+                    retention=retention,
+                    retention_ttl=retention_ttl,
+                )
+            except httpx.HTTPStatusError as e:
+                print_error(f"  ✗ {u}: {e.response.status_code} {e.response.text}")
+                failed += 1
+                continue
+            except Exception as e:
+                print_error(f"  ✗ {u}: {e}")
+                failed += 1
+                continue
+            if data.get("batch"):
+                for t in data.get("tasks", []):
                     tid = t.get("task_id", "")
-                    fn = t.get("filename") or t.get("source_url", "").split("/")[-1]
-                    console.print(f"\n  [cyan]Waiting: {fn}[/cyan]")
-                    _wait_for_task(server, headers, tid)
-        else:
-            task_id = data.get("task_id", "")
-            print_success(f"Task created: {task_id[:12]}...")
-            console.print(f"  [dim]Source: {data.get('source_plugin', '?')}[/dim]")
-            console.print(f"  [dim]Target: {data.get('sink_plugin') or 'server (暂存)'}[/dim]")
-            console.print(f"  [dim]Status: {data.get('status')}[/dim]")
+                    if tid:
+                        created_ids.append(tid)
+                console.print(
+                    f"  [green]✓[/green] {u} → batch "
+                    f"({data.get('created_tasks', 0)}/{data.get('total_files', 0)} tasks)"
+                )
+            else:
+                tid = data.get("task_id", "")
+                if tid:
+                    created_ids.append(tid)
+                console.print(f"  [green]✓[/green] {u} → {tid[:8]}..")
+        print_success(f"Submitted {len(created_ids)} task(s){' (' + str(failed) + ' failed)' if failed else ''}")
+        if wait and created_ids:
+            console.print(f"[dim]Waiting for {len(created_ids)} task(s) to finish...[/dim]")
+            for tid in created_ids:
+                console.print(f"\n  [cyan]Waiting: {tid[:8]}[/cyan]")
+                _wait_for_task(server, headers, tid)
+        if failed:
+            raise typer.Exit(1)
+        return
 
-            if wait and task_id:
-                _wait_for_task(server, headers, task_id)
-
+    # ── Single URL mode ───────────────────────────────────────
+    assert url is not None
+    try:
+        data = _submit_remote_download(
+            server, headers, url,
+            output=output, sink=sink,
+            sink_config_json=sink_config,
+            retention=retention,
+            retention_ttl=retention_ttl,
+        )
     except httpx.HTTPStatusError as e:
         print_error(f"Server error: {e.response.text}")
         raise typer.Exit(1)
     except Exception as e:
         print_error(str(e))
         raise typer.Exit(1)
+
+    if data.get("batch"):
+        total = data.get("total_files", 0)
+        created = data.get("created_tasks", 0)
+        folder = data.get("folder_name", "?")
+        repo = data.get("repo", "?")
+        total_size = data.get("total_size", 0)
+        print_success(f"Batch download: {repo}")
+        console.print(f"  [dim]Folder: {folder} | Files: {created}/{total} | Size: {format_size(total_size)}[/dim]")
+        if sink:
+            console.print(f"  [dim]Sink: {sink}[/dim]")
+        console.print("  [dim]Track: [bold]et tasks[/bold][/dim]")
+
+        if wait:
+            tasks_list = data.get("tasks", [])
+            for t in tasks_list:
+                tid = t.get("task_id", "")
+                fn = t.get("filename") or t.get("source_url", "").split("/")[-1]
+                console.print(f"\n  [cyan]Waiting: {fn}[/cyan]")
+                _wait_for_task(server, headers, tid)
+    else:
+        task_id = data.get("task_id", "")
+        print_success(f"Task created: {task_id[:12]}...")
+        console.print(f"  [dim]Source: {data.get('source_plugin', '?')}[/dim]")
+        console.print(f"  [dim]Target: {data.get('sink_plugin') or 'server (暂存)'}[/dim]")
+        console.print(f"  [dim]Status: {data.get('status')}[/dim]")
+
+        if wait and task_id:
+            _wait_for_task(server, headers, task_id)
 
 
 def _wait_for_task(server: str, headers: dict, task_id: str) -> None:
@@ -2364,7 +2490,7 @@ def _push_file_to_sink(
         print_error(f"Push failed: {e}")
 
 
-@app.command()
+@app.command(rich_help_panel=PANEL_OFFLINE)
 def push(
     file_id: str = typer.Argument(..., help="File ID (or short prefix) to push"),
     sink: str = typer.Option(..., "--sink", help="Sink plugin name (e.g. tos)"),
@@ -2392,8 +2518,95 @@ def push(
     _push_file_to_sink(server, token, resolved_id, sink, sink_config_arg)
 
 
-@app.command()
-def tasks(
+# ─────────────────────────────────────────────────────────────
+# Task subcommand group
+# ─────────────────────────────────────────────────────────────
+
+tasks_app = typer.Typer(
+    name="tasks",
+    help="Remote download / push task management (任务管理).",
+    no_args_is_help=False,
+    add_completion=False,
+    invoke_without_command=True,
+)
+app.add_typer(tasks_app, name="tasks", rich_help_panel=PANEL_OFFLINE)
+
+
+def _auth_headers(token: Optional[str]) -> dict:
+    """Build auth headers from a token (API + Bearer for compat)."""
+    headers: dict = {}
+    if token:
+        headers[AUTH_HEADER] = token
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+_STATUS_STYLES = {
+    "completed": "[green]✓ 完成[/green]",
+    "failed": "[red]✗ 失败[/red]",
+    "cancelled": "[yellow]✗ 取消[/yellow]",
+    "downloading": "[cyan]↓ 下载中[/cyan]",
+    "pushing": "[cyan]↑ 推送中[/cyan]",
+    "pending": "[dim]· 等待[/dim]",
+}
+
+
+def _build_tasks_table(all_tasks: list, title: str = "Tasks") -> Table:
+    table = Table(
+        title=f"[bold cyan]{title}[/bold cyan]",
+        show_header=True, header_style="bold magenta", border_style="cyan",
+    )
+    table.add_column("ID", style="dim", width=8)
+    table.add_column("File", style="white", max_width=30, overflow="ellipsis")
+    table.add_column("Source", width=12)
+    table.add_column("Sink", width=8)
+    table.add_column("Size", justify="right", width=9)
+    table.add_column("Progress", width=16)
+    table.add_column("Status", width=10)
+
+    for t in all_tasks:
+        tid = t.get("task_id", "")[:6] + ".."
+        fn = t.get("filename") or t.get("source_url", "?").split("/")[-1]
+        src = t.get("source_plugin", "?")
+        snk = t.get("sink_plugin") or "server"
+        size = format_size(t.get("file_size") or 0) if t.get("file_size") else "-"
+        pct = int(t.get("progress", 0) * 100)
+        bar_w = 8
+        filled = int(bar_w * pct / 100)
+        bar = "█" * filled + "░" * (bar_w - filled)
+        progress_str = f"{bar} {pct}%"
+        status = _STATUS_STYLES.get(t.get("status", ""), t.get("status", "?"))
+        table.add_row(tid, fn[:30], src, snk, size, progress_str, status)
+    return table
+
+
+def _fetch_tasks(server: str, token: Optional[str]) -> list:
+    headers = _auth_headers(token)
+    resp = httpx.get(f"{server.rstrip('/')}/api/tasks", headers=headers, timeout=15)
+    resp.raise_for_status()
+    return resp.json()  # type: ignore[no-any-return]
+
+
+def _resolve_task_id(prefix: str, server: str, token: Optional[str]) -> str:
+    """Resolve a short task ID prefix to a unique full ID."""
+    if len(prefix) >= 32:
+        return prefix
+    tasks_all = _fetch_tasks(server, token)
+    matches = [t["task_id"] for t in tasks_all if t.get("task_id", "").startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        print_error(f"No task matches prefix [bold]{prefix}[/bold]")
+        raise typer.Exit(1)
+    print_error(f"Ambiguous task prefix [bold]{prefix}[/bold] — {len(matches)} matches")
+    for m in matches[:10]:
+        console.print(f"  [dim]{m[:8]}..  {m}[/dim]")
+    raise typer.Exit(1)
+
+
+@tasks_app.callback()
+def _tasks_root(
+    ctx: typer.Context,
     token: Optional[str] = typer.Option(
         None, "--token", "-t",
         help="API token (overrides saved session)",
@@ -2404,26 +2617,36 @@ def tasks(
         help="Filter by status: pending, downloading, pushing, completed, failed, cancelled",
     ),
 ) -> None:
-    """List remote download / push tasks (任务列表).
+    """List or manage remote download / push tasks.
 
-    Shows all tasks on the server with their status and progress.
-
-    Examples:
-        et tasks
-        et tasks -s downloading
+    When invoked without a subcommand, lists all tasks (same as ``et tasks list``).
     """
+    ctx.obj = {"token": token, "status_filter": status_filter}
+    if ctx.invoked_subcommand is None:
+        _tasks_list_impl(token=token, status_filter=status_filter)
+
+
+@tasks_app.command("list")
+def tasks_list(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    status_filter: Optional[str] = typer.Option(
+        None, "--status", "-s",
+        help="Filter by status: pending, downloading, pushing, completed, failed, cancelled",
+    ),
+) -> None:
+    """List all tasks (任务列表)."""
+    _tasks_list_impl(token=token, status_filter=status_filter)
+
+
+def _tasks_list_impl(token: Optional[str], status_filter: Optional[str]) -> None:
     server = _get_server_url()
     token = token or _get_token()
-
-    headers: dict = {}
-    if token:
-        headers[AUTH_HEADER] = token
-        headers["Authorization"] = f"Bearer {token}"
-
     try:
-        resp = httpx.get(f"{server.rstrip('/')}/api/tasks", headers=headers, timeout=15)
-        resp.raise_for_status()
-        all_tasks = resp.json()
+        all_tasks = _fetch_tasks(server, token)
     except httpx.HTTPStatusError as e:
         print_error(f"Failed: {e.response.text}")
         raise typer.Exit(1)
@@ -2439,49 +2662,432 @@ def tasks(
         return
 
     all_tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
-
-    table = Table(
-        title="[bold cyan]Tasks[/bold cyan]",
-        show_header=True, header_style="bold magenta", border_style="cyan",
-    )
-    table.add_column("ID", style="dim", width=8)
-    table.add_column("File", style="white", max_width=30, overflow="ellipsis")
-    table.add_column("Source", width=12)
-    table.add_column("Sink", width=8)
-    table.add_column("Size", justify="right", width=9)
-    table.add_column("Progress", width=16)
-    table.add_column("Status", width=10)
-
-    status_styles = {
-        "completed": "[green]✓ 完成[/green]",
-        "failed": "[red]✗ 失败[/red]",
-        "cancelled": "[yellow]✗ 取消[/yellow]",
-        "downloading": "[cyan]↓ 下载中[/cyan]",
-        "pushing": "[cyan]↑ 推送中[/cyan]",
-        "pending": "[dim]· 等待[/dim]",
-    }
-
-    for t in all_tasks:
-        tid = t.get("task_id", "")[:6] + ".."
-        fn = t.get("filename") or t.get("source_url", "?").split("/")[-1]
-        src = t.get("source_plugin", "?")
-        snk = t.get("sink_plugin") or "server"
-        size = format_size(t.get("file_size") or 0) if t.get("file_size") else "-"
-        pct = int(t.get("progress", 0) * 100)
-        bar_w = 8
-        filled = int(bar_w * pct / 100)
-        bar = "█" * filled + "░" * (bar_w - filled)
-        progress_str = f"{bar} {pct}%"
-        status = status_styles.get(t.get("status", ""), t.get("status", "?"))
-
-        table.add_row(tid, fn[:30], src, snk, size, progress_str, status)
-
     console.print()
-    console.print(table)
+    console.print(_build_tasks_table(all_tasks))
     console.print(f"[dim]{len(all_tasks)} task(s)[/dim]")
 
 
-@app.command("plugins")
+@tasks_app.command("cancel")
+def tasks_cancel(
+    task_ids: list[str] = typer.Argument(..., help="Task ID(s) or short prefix(es) to cancel"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Cancel one or more running tasks.
+
+    Examples:
+        et tasks cancel a1b2c3d4
+        et tasks cancel a1b2c3 d4e5f6 a7b8c9
+    """
+    server = _get_server_url()
+    token = token or _get_token()
+    headers = _auth_headers(token)
+    ok = fail = 0
+    for tid_in in task_ids:
+        try:
+            tid = _resolve_task_id(tid_in, server, token)
+        except typer.Exit:
+            fail += 1
+            continue
+        try:
+            resp = httpx.delete(f"{server.rstrip('/')}/api/tasks/{tid}", headers=headers, timeout=15)
+            if resp.status_code == 200:
+                print_success(f"Cancelled [bold]{tid[:8]}[/bold]..")
+                ok += 1
+            else:
+                print_error(f"Cancel {tid[:8]}.. failed: {resp.status_code} {resp.text}")
+                fail += 1
+        except Exception as e:
+            print_error(f"Cancel {tid[:8]}.. failed: {e}")
+            fail += 1
+    if fail:
+        raise typer.Exit(1)
+    console.print(f"[dim]{ok} task(s) cancelled[/dim]")
+
+
+@tasks_app.command("retry")
+def tasks_retry(
+    task_ids: list[str] = typer.Argument(..., help="Task ID(s) or short prefix(es) to retry"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    wait: bool = typer.Option(False, "--wait", "-w", help="Wait for retried tasks to complete"),
+) -> None:
+    """Retry one or more failed / cancelled tasks.
+
+    Examples:
+        et tasks retry a1b2c3d4
+        et tasks retry a1b2c3 d4e5f6 --wait
+    """
+    server = _get_server_url()
+    token = token or _get_token()
+    headers = _auth_headers(token)
+    new_ids: list[str] = []
+    fail = 0
+    for tid_in in task_ids:
+        try:
+            tid = _resolve_task_id(tid_in, server, token)
+        except typer.Exit:
+            fail += 1
+            continue
+        try:
+            resp = httpx.post(f"{server.rstrip('/')}/api/tasks/{tid}/retry", headers=headers, timeout=30)
+            if resp.status_code == 201:
+                data = resp.json()
+                nid = data.get("task_id", "")
+                new_ids.append(nid)
+                print_success(f"Retried [bold]{tid[:8]}[/bold].. → [bold]{nid[:8]}[/bold]..")
+            else:
+                print_error(f"Retry {tid[:8]}.. failed: {resp.status_code} {resp.text}")
+                fail += 1
+        except Exception as e:
+            print_error(f"Retry {tid[:8]}.. failed: {e}")
+            fail += 1
+    if wait:
+        for nid in new_ids:
+            console.print(f"\n  [cyan]Waiting: {nid[:8]}[/cyan]")
+            _wait_for_task(server, headers, nid)
+    if fail:
+        raise typer.Exit(1)
+
+
+@tasks_app.command("wait")
+def tasks_wait(
+    task_id: str = typer.Argument(..., help="Task ID (or short prefix) to wait for"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    timeout: Optional[int] = typer.Option(
+        None, "--timeout",
+        help="Maximum wait in seconds (default: no timeout)",
+    ),
+) -> None:
+    """Block until a single task completes and print its result.
+
+    Exit code:
+      0 - task completed successfully
+      1 - task failed
+      2 - task cancelled
+      130 - interrupted by user (Ctrl+C)
+    """
+    server = _get_server_url()
+    token = token or _get_token()
+    headers = _auth_headers(token)
+    tid = _resolve_task_id(task_id, server, token)
+
+    start = time.time()
+    try:
+        with create_transfer_progress() as progress:
+            ptask = progress.add_task("[cyan]Working", total=100)
+            while True:
+                if timeout is not None and (time.time() - start) > timeout:
+                    console.print()
+                    print_warning(f"Wait timed out after {timeout}s")
+                    raise typer.Exit(1)
+                time.sleep(2)
+                r = httpx.get(f"{server}/api/tasks/{tid}", headers=headers, timeout=10)
+                if r.status_code != 200:
+                    console.print()
+                    print_error(f"Server returned {r.status_code}: {r.text}")
+                    raise typer.Exit(1)
+                d = r.json()
+                status = d.get("status", "")
+                pct = int(d.get("progress", 0) * 100)
+                labels = {
+                    "pending": "等待中", "downloading": "下载中", "pushing": "推送中",
+                    "completed": "完成", "failed": "失败", "cancelled": "已取消",
+                }
+                progress.update(ptask, completed=pct, description=f"[cyan]{labels.get(status, status)}")
+                if status == "completed":
+                    console.print()
+                    print_success(f"Task [bold]{tid[:8]}[/bold].. completed")
+                    fid = d.get("file_id")
+                    if fid:
+                        console.print(f"   [dim]Download: [bold]et download {fid[:8]}[/bold][/dim]")
+                    return
+                if status == "failed":
+                    console.print()
+                    print_error(f"Task [bold]{tid[:8]}[/bold].. failed: {d.get('error', 'unknown')}")
+                    raise typer.Exit(1)
+                if status == "cancelled":
+                    console.print()
+                    print_warning(f"Task [bold]{tid[:8]}[/bold].. cancelled")
+                    raise typer.Exit(2)
+    except KeyboardInterrupt:
+        console.print()
+        print_warning("Wait cancelled by user")
+        raise typer.Exit(130)
+
+
+@tasks_app.command("watch")
+def tasks_watch(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh interval in seconds"),
+    status_filter: Optional[str] = typer.Option(
+        None, "--status", "-s", help="Filter by status",
+    ),
+) -> None:
+    """Live task dashboard: refresh the task table every N seconds until all done.
+
+    Exits automatically when no active tasks remain, or on Ctrl+C.
+    """
+    from rich.live import Live
+
+    server = _get_server_url()
+    token = token or _get_token()
+
+    try:
+        with Live(console=console, refresh_per_second=4, screen=False) as live:
+            while True:
+                try:
+                    all_tasks = _fetch_tasks(server, token)
+                except Exception as e:
+                    live.update(Panel(f"[red]Fetch failed: {e}[/red]"))
+                    time.sleep(max(1.0, interval))
+                    continue
+                display_tasks = list(all_tasks)
+                if status_filter:
+                    display_tasks = [t for t in display_tasks if t.get("status") == status_filter]
+                display_tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
+                display_tasks = display_tasks[:40]  # cap rows for responsive UI
+
+                active = any(
+                    t.get("status") in ("pending", "downloading", "pushing") for t in all_tasks
+                )
+                title = "Tasks · live"
+                if not active:
+                    title += "  (all done — press Ctrl+C to exit)"
+                live.update(_build_tasks_table(display_tasks, title=title))
+
+                if not active:
+                    time.sleep(max(1.0, interval))
+                else:
+                    time.sleep(max(0.5, interval))
+    except KeyboardInterrupt:
+        console.print()
+        print_info("Watch stopped")
+
+
+# ─────────────────────────────────────────────────────────────
+# Folder subcommands
+# ─────────────────────────────────────────────────────────────
+
+folders_app = typer.Typer(
+    help="Folder management (文件夹管理).", add_completion=False, no_args_is_help=True,
+)
+app.add_typer(folders_app, name="folders", rich_help_panel=PANEL_FOLDERS)
+
+
+def _resolve_folder_id(prefix: str, server: str, token: Optional[str]) -> str:
+    """Resolve a short folder ID prefix to a unique full ID."""
+    if len(prefix) >= 32:
+        return prefix
+    headers = _auth_headers(token)
+    resp = httpx.get(f"{server.rstrip('/')}/api/folders", headers=headers, timeout=15)
+    resp.raise_for_status()
+    all_folders = resp.json().get("folders", [])
+    matches = [f["folder_id"] for f in all_folders if f.get("folder_id", "").startswith(prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        print_error(f"No folder matches prefix [bold]{prefix}[/bold]")
+        raise typer.Exit(1)
+    print_error(f"Ambiguous folder prefix [bold]{prefix}[/bold] — {len(matches)} matches")
+    raise typer.Exit(1)
+
+
+@folders_app.command("list")
+def folders_list(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """List folders on the server."""
+    server = _get_server_url()
+    token = token or _get_token()
+    headers = _auth_headers(token)
+    try:
+        resp = httpx.get(f"{server.rstrip('/')}/api/folders", headers=headers, timeout=15)
+        resp.raise_for_status()
+        folders = resp.json().get("folders", [])
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    if not folders:
+        print_info("No folders found")
+        return
+
+    table = Table(title="[bold cyan]Folders[/bold cyan]", border_style="cyan")
+    table.add_column("ID", style="dim", width=10)
+    table.add_column("Name")
+    table.add_column("Files", justify="right")
+    table.add_column("Completed", justify="right")
+    table.add_column("Total Size", justify="right", style="green")
+
+    for f in folders:
+        table.add_row(
+            f.get("folder_id", "")[:8] + "..",
+            f.get("folder_name", ""),
+            str(f.get("file_count", 0)),
+            f"{f.get('completed', 0)}/{f.get('file_count', 0)}",
+            format_size(f.get("total_size", 0)),
+        )
+    console.print()
+    console.print(table)
+    console.print(f"[dim]{len(folders)} folder(s)[/dim]")
+
+
+@folders_app.command("get")
+def folders_get(
+    folder_id: str = typer.Argument(..., help="Folder ID (or short prefix)"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Show folder details and the files it contains."""
+    server = _get_server_url()
+    token = token or _get_token()
+    resolved = _resolve_folder_id(folder_id, server, token)
+    headers = _auth_headers(token)
+    try:
+        resp = httpx.get(f"{server.rstrip('/')}/api/folders/{resolved}", headers=headers, timeout=15)
+        resp.raise_for_status()
+        folder = resp.json()
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    console.print()
+    panel = Panel(
+        f"[bold]{folder.get('folder_name', '')}[/bold]\n"
+        f"[dim]ID: {folder.get('folder_id', '')}[/dim]\n"
+        f"[dim]Files: {folder.get('file_count', 0)} | "
+        f"Completed: {folder.get('completed', 0)} | "
+        f"Size: {format_size(folder.get('total_size', 0))}[/dim]",
+        title="[bold cyan]Folder[/bold cyan]", border_style="cyan",
+    )
+    console.print(panel)
+
+    files = folder.get("files", [])
+    if files:
+        table = Table(title="Files", border_style="cyan")
+        table.add_column("Path")
+        table.add_column("Size", justify="right", style="green")
+        table.add_column("Status")
+        for fi in files:
+            table.add_row(
+                fi.get("relative_path", fi.get("filename", "")),
+                format_size(fi.get("size", 0)),
+                fi.get("status", "?"),
+            )
+        console.print(table)
+
+
+@folders_app.command("delete")
+def folders_delete(
+    folder_id: str = typer.Argument(..., help="Folder ID (or short prefix)"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
+) -> None:
+    """Delete a folder (and all its files) from the server."""
+    server = _get_server_url()
+    token = token or _get_token()
+    resolved = _resolve_folder_id(folder_id, server, token)
+
+    if not force:
+        confirm = typer.confirm(f"Delete folder {resolved[:8]}..? This cannot be undone")
+        if not confirm:
+            print_warning("Cancelled.")
+            raise typer.Exit(0)
+
+    headers = _auth_headers(token)
+    try:
+        resp = httpx.delete(f"{server.rstrip('/')}/api/folders/{resolved}", headers=headers, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+    print_success(f"Folder [bold]{resolved[:8]}[/bold].. deleted")
+
+
+@folders_app.command("download")
+def folders_download(
+    folder_id: str = typer.Argument(..., help="Folder ID (or short prefix)"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Output ZIP file path (default: <folder_name>.zip)",
+    ),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Download an entire folder as a ZIP archive."""
+    server = _get_server_url()
+    token = token or _get_token()
+    resolved = _resolve_folder_id(folder_id, server, token)
+    headers = _auth_headers(token)
+    url = f"{server.rstrip('/')}/api/folders/{resolved}/download"
+
+    try:
+        with httpx.stream("GET", url, headers=headers, timeout=None) as r:
+            r.raise_for_status()
+            cd = r.headers.get("content-disposition", "")
+            import re as _re
+
+            m = _re.search(r'filename="?([^"\n;]+)"?', cd)
+            default_name = m.group(1) if m else f"{resolved[:8]}.zip"
+            out_path = output or Path.cwd() / default_name
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            total = int(r.headers.get("content-length", 0))
+            with create_transfer_progress() as progress:
+                ptask = progress.add_task("[cyan]Downloading", total=total or None)
+                with out_path.open("wb") as fh:
+                    for chunk in r.iter_bytes(chunk_size=1024 * 256):
+                        fh.write(chunk)
+                        progress.update(ptask, advance=len(chunk))
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    print_success(f"Folder downloaded to [bold]{out_path}[/bold]")
+
+
+# ─────────────────────────────────────────────────────────────
+# Plugin & sink commands
+# ─────────────────────────────────────────────────────────────
+
+
+def _fetch_plugins(server: str, token: Optional[str]) -> tuple[list, list]:
+    headers = _auth_headers(token)
+    src = httpx.get(f"{server.rstrip('/')}/api/plugins/sources", headers=headers, timeout=15)
+    src.raise_for_status()
+    snk = httpx.get(f"{server.rstrip('/')}/api/plugins/sinks", headers=headers, timeout=15)
+    snk.raise_for_status()
+    return src.json(), snk.json()
+
+
+@app.command("plugins", rich_help_panel=PANEL_PLUGINS)
 def list_plugins_cmd(
     token: Optional[str] = typer.Option(
         None, "--token", "-t",
@@ -2493,35 +3099,107 @@ def list_plugins_cmd(
     server = _get_server_url()
     token = token or _get_token()
 
-    headers: dict = {}
-    if token:
-        headers[AUTH_HEADER] = token
-        headers["Authorization"] = f"Bearer {token}"
-
     try:
-        sources_resp = httpx.get(f"{server.rstrip('/')}/api/plugins/sources", headers=headers, timeout=15)
-        sinks_resp = httpx.get(f"{server.rstrip('/')}/api/plugins/sinks", headers=headers, timeout=15)
-
-        table = Table(title="Source Plugins")
-        table.add_column("Name")
-        table.add_column("Display")
-        table.add_column("Hosts")
-        table.add_column("Priority")
-        for s in sources_resp.json():
-            hosts = ", ".join(s.get("supported_hosts", [])) or "*"
-            table.add_row(s["name"], s["display_name"], hosts, str(s.get("priority", 0)))
-        console.print(table)
-
-        table2 = Table(title="Sink Plugins")
-        table2.add_column("Name")
-        table2.add_column("Display")
-        table2.add_column("Multipart")
-        for s in sinks_resp.json():
-            table2.add_row(s["name"], s["display_name"], "Yes" if s.get("supports_multipart") else "No")
-        console.print(table2)
+        sources, sinks_ = _fetch_plugins(server, token)
     except Exception as e:
         print_error(str(e))
         raise typer.Exit(1)
+
+    table = Table(title="Source Plugins", border_style="cyan")
+    table.add_column("Name")
+    table.add_column("Display")
+    table.add_column("Hosts")
+    table.add_column("Priority")
+    for s in sources:
+        hosts = ", ".join(s.get("supported_hosts", [])) or "*"
+        table.add_row(s["name"], s["display_name"], hosts, str(s.get("priority", 0)))
+    console.print(table)
+
+    table2 = Table(title="Sink Plugins", border_style="cyan")
+    table2.add_column("Name")
+    table2.add_column("Display")
+    table2.add_column("Multipart")
+    table2.add_column("Preset")
+    for s in sinks_:
+        table2.add_row(
+            s["name"], s["display_name"],
+            "Yes" if s.get("supports_multipart") else "No",
+            "Yes" if s.get("has_preset") else "No",
+        )
+    console.print(table2)
+
+
+@app.command("sinks", rich_help_panel=PANEL_PLUGINS)
+def sinks_cmd(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Shortcut for listing only Sink plugins."""
+    server = _get_server_url()
+    token = token or _get_token()
+    try:
+        _, sinks_ = _fetch_plugins(server, token)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    if not sinks_:
+        print_info("No sinks registered on server")
+        return
+
+    table = Table(title="Sink Plugins", border_style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Display")
+    table.add_column("Multipart")
+    table.add_column("Preset")
+    table.add_column("Config Keys")
+    for s in sinks_:
+        schema = s.get("config_schema") or {}
+        keys = ", ".join(schema.keys()) if isinstance(schema, dict) else ""
+        table.add_row(
+            s["name"], s["display_name"],
+            "Yes" if s.get("supports_multipart") else "No",
+            "Yes" if s.get("has_preset") else "No",
+            keys,
+        )
+    console.print()
+    console.print(table)
+
+
+@app.command("sources", rich_help_panel=PANEL_PLUGINS)
+def sources_cmd(
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="API token (overrides saved session)",
+        envvar="ETRANSFER_TOKEN",
+    ),
+) -> None:
+    """Shortcut for listing only Source plugins."""
+    server = _get_server_url()
+    token = token or _get_token()
+    try:
+        sources, _ = _fetch_plugins(server, token)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+
+    if not sources:
+        print_info("No sources registered on server")
+        return
+
+    table = Table(title="Source Plugins", border_style="cyan")
+    table.add_column("Name", style="bold")
+    table.add_column("Display")
+    table.add_column("Hosts")
+    table.add_column("Priority")
+    for s in sources:
+        hosts = ", ".join(s.get("supported_hosts", [])) or "*"
+        table.add_row(s["name"], s["display_name"], hosts, str(s.get("priority", 0)))
+    console.print()
+    console.print(table)
 
 
 if __name__ == "__main__":

@@ -494,7 +494,7 @@ def build_database_url(
     mysql_host: str = "127.0.0.1",
     mysql_port: int = 3306,
     mysql_user: str = "root",
-    mysql_password: str = "",  # nosec B107
+    mysql_password: Optional[str] = None,
     mysql_database: str = "etransfer",
 ) -> str:
     """Build SQLAlchemy async database URL from config fields.
@@ -505,13 +505,20 @@ def build_database_url(
         storage_path: Fallback base path for SQLite
         mysql_*: MySQL connection parameters
     """
-    if backend == "mysql":
-        password_part = f":{mysql_password}" if mysql_password else ""
-        return f"mysql+aiomysql://{mysql_user}{password_part}" f"@{mysql_host}:{mysql_port}/{mysql_database}"
-    elif backend == "postgresql":
-        password_part = f":{mysql_password}" if mysql_password else ""
-        return f"postgresql+asyncpg://{mysql_user}{password_part}" f"@{mysql_host}:{mysql_port}/{mysql_database}"
-    else:
-        path = sqlite_path or str(Path(storage_path) / "users.db")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        return f"sqlite+aiosqlite:///{path}"
+    from sqlalchemy.engine import URL
+
+    _DRIVERS = {"mysql": "mysql+aiomysql", "postgresql": "postgresql+asyncpg"}
+
+    if backend in _DRIVERS:
+        return URL.create(
+            drivername=_DRIVERS[backend],
+            username=mysql_user,
+            password=mysql_password or None,
+            host=mysql_host,
+            port=mysql_port,
+            database=mysql_database,
+        ).render_as_string(hide_password=False)
+
+    path = sqlite_path or str(Path(storage_path) / "users.db")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite+aiosqlite:///{path}"

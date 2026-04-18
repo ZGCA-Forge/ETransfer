@@ -10,6 +10,7 @@
     python tests/test_config.py
 """
 
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -153,7 +154,7 @@ def test_parse_yaml_user_system_section():
                     "host": "db.local",
                     "port": 3307,
                     "user": "et",
-                    "password": "pass",
+                    "password": os.environ.get("TEST_DB_PASS", "pass"),
                     "database": "etdb",
                 },
             },
@@ -324,7 +325,9 @@ def test_load_defaults_when_no_config(monkeypatch, tmp_path):
     settings = load_server_settings()
     assert settings.port == 8765
     assert settings.state_backend == "file"
-    assert settings.default_retention == "permanent"
+    assert settings.default_retention == "download_once"
+    # New policy flag defaults to True for backwards compatibility.
+    assert settings.allow_permanent_retention is True
 
 
 def test_load_config_watch_fields(tmp_path):
@@ -405,6 +408,34 @@ def test_reload_detects_quota_change(tmp_path):
     changes = reload_hot_settings(settings)
     assert "max_storage_size" in changes
     assert settings.max_storage_size == 5 * 1024**3
+
+
+def test_parse_yaml_retention_allow_permanent():
+    cfg = {"retention": {"allow_permanent": False}}
+    d = _parse_yaml_to_settings_dict(cfg)
+    assert d["allow_permanent_retention"] is False
+
+    cfg_true = {"retention": {"allow_permanent": True}}
+    d_true = _parse_yaml_to_settings_dict(cfg_true)
+    assert d_true["allow_permanent_retention"] is True
+
+
+def test_reload_detects_allow_permanent_change(tmp_path):
+    cfg = tmp_path / "reload_test.yaml"
+    cfg.write_text(textwrap.dedent("""\
+        retention:
+          allow_permanent: true
+    """))
+    settings = load_server_settings(cfg)
+    assert settings.allow_permanent_retention is True
+
+    cfg.write_text(textwrap.dedent("""\
+        retention:
+          allow_permanent: false
+    """))
+    changes = reload_hot_settings(settings)
+    assert "allow_permanent_retention" in changes
+    assert settings.allow_permanent_retention is False
 
 
 def test_reload_detects_retention_change(tmp_path):
