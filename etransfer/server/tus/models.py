@@ -237,8 +237,14 @@ class TusUpload(BaseModel):
             if data.get(dt_field) and isinstance(data[dt_field], str):
                 data[dt_field] = datetime.fromisoformat(data[dt_field])
         _str_fields = (
-            "checksum", "mime_type", "completed_at", "sink_plugin",
-            "sink_session_id", "relative_path", "folder_id", "folder_name",
+            "checksum",
+            "mime_type",
+            "completed_at",
+            "sink_plugin",
+            "sink_session_id",
+            "relative_path",
+            "folder_id",
+            "folder_name",
         )
         for f in _str_fields:
             if f in data and data[f] is None:

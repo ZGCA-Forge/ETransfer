@@ -88,8 +88,7 @@ class ServerInfo(BaseModel):
     )
     max_concurrent_tasks: int = Field(
         0,
-        description="Server-wide cap on concurrent offline-download / sink-push tasks. "
-        "0 = unknown (older servers).",
+        description="Server-wide cap on concurrent offline-download / sink-push tasks. " "0 = unknown (older servers).",
     )
 
 

@@ -47,11 +47,13 @@ async def download(
         "--file-allocation=none",
         f"-x{connections}",
         f"-s{connections}",
-        "-k", "1M",
+        "-k",
+        "1M",
         "--continue=true",
         "--auto-file-renaming=false",
         "--allow-overwrite=true",
-        f"-d", str(dest),
+        "-d",
+        str(dest),
     ]
 
     if filename:
@@ -124,12 +126,16 @@ def _parse_size(s: str) -> int:
     """Parse aria2c size strings like '100MiB', '1.5GiB', '500KiB'."""
     s = s.strip()
     multipliers = {
-        "GiB": 1024**3, "MiB": 1024**2, "KiB": 1024,
-        "GB": 1000**3, "MB": 1000**2, "KB": 1000,
+        "GiB": 1024**3,
+        "MiB": 1024**2,
+        "KiB": 1024,
+        "GB": 1000**3,
+        "MB": 1000**2,
+        "KB": 1000,
         "B": 1,
     }
     for suffix, mult in multipliers.items():
         if s.endswith(suffix):
-            num = s[:-len(suffix)]
+            num = s[: -len(suffix)]
             return int(float(num) * mult)
     return int(float(s))

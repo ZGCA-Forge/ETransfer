@@ -140,8 +140,7 @@ class ServerSettings(BaseSettings):
     # OIDC configuration
     oidc_provider: str = Field(
         "oidc",
-        description="Auth provider type: oidc (standard OIDC) or dingtalk. "
-        "Env: ETRANSFER_OIDC_PROVIDER",
+        description="Auth provider type: oidc (standard OIDC) or dingtalk. " "Env: ETRANSFER_OIDC_PROVIDER",
     )
     oidc_issuer_url: str = Field(
         "",

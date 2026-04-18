@@ -11,7 +11,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -45,6 +45,7 @@ _RETRY_BACKOFF = (5, 15, 30)  # seconds between retries
 
 class _RangeNotSupportedError(Exception):
     """Internal signal: the source ignored our Range header, restart fresh."""
+
     pass
 
 
@@ -200,21 +201,32 @@ class TaskManager:
     def _sanitize_task_dict(d: dict) -> dict:
         """Convert legacy None values to protocol-standard defaults."""
         _str_defaults = {
-            "sink_plugin": "", "error": "", "filename": "", "file_id": "",
-            "sink_session_id": "", "sink_result_url": "", "source_plugin": "",
+            "sink_plugin": "",
+            "error": "",
+            "filename": "",
+            "file_id": "",
+            "sink_session_id": "",
+            "sink_result_url": "",
+            "source_plugin": "",
             "superseded_by": "",
         }
         _int_defaults = {"file_size": 0, "retention_ttl": 0}
-        _float_defaults = {"speed": 0.0, "download_speed": 0.0, "push_speed": 0.0, "download_progress": 0.0, "push_progress": 0.0}
-        for k, v in _float_defaults.items():
-            if k in d and d[k] is None:
-                d[k] = v
-        for k, v in _str_defaults.items():
-            if k in d and d[k] is None:
-                d[k] = v
-        for k, v in _int_defaults.items():
-            if k in d and d[k] is None:
-                d[k] = v
+        _float_defaults = {
+            "speed": 0.0,
+            "download_speed": 0.0,
+            "push_speed": 0.0,
+            "download_progress": 0.0,
+            "push_progress": 0.0,
+        }
+        for fk, fv in _float_defaults.items():
+            if fk in d and d[fk] is None:
+                d[fk] = fv
+        for sk, sv in _str_defaults.items():
+            if sk in d and d[sk] is None:
+                d[sk] = sv
+        for ik, iv in _int_defaults.items():
+            if ik in d and d[ik] is None:
+                d[ik] = iv
         return d
 
     async def _load(self, task_id: str) -> Optional[TransferTask]:
@@ -224,6 +236,7 @@ class TaskManager:
         if raw is None:
             return None
         import json as _json
+
         d = _json.loads(raw)
         self._sanitize_task_dict(d)
         task = TransferTask.model_validate(d)
@@ -293,6 +306,7 @@ class TaskManager:
             raw = await self._state.get(k)
             if raw:
                 import json as _json
+
                 d = _json.loads(raw)
                 self._sanitize_task_dict(d)
                 tasks.append(TransferTask.model_validate(d))
@@ -353,7 +367,8 @@ class TaskManager:
 
         logger.info(
             "Shutdown: %d downloading (cancel now), %d pushing (wait for current chunk)",
-            len(downloading), len(pushing),
+            len(downloading),
+            len(pushing),
         )
 
         # Cancel downloading tasks immediately
@@ -530,9 +545,7 @@ class TaskManager:
 
             _user = getattr(task, "_user", None)
             sink_key = derive_sink_object_key(task.filename or file_path.name, _user)
-            session_id = await sink.initialize_upload(
-                sink_key, {"task_id": task.task_id}
-            )
+            session_id = await sink.initialize_upload(sink_key, {"task_id": task.task_id})
             task.sink_session_id = session_id
             await self._save(task)
 
@@ -629,7 +642,9 @@ class TaskManager:
 
         # Resolve the actual download URL (handle GDrive confirm, HF blob→resolve)
         dl_url, dl_cookies = await self._retry(
-            self._resolve_download_url, task.source_url, task.source_plugin,
+            self._resolve_download_url,
+            task.source_url,
+            task.source_plugin,
             label=f"resolve_url({task.task_id[:8]})",
         )
 
@@ -652,8 +667,11 @@ class TaskManager:
                 downloaded = resume_offset
                 logger.info(
                     "Resuming stream %s -> sink '%s' (session %s, from byte %d / part %d)",
-                    task.source_url[:60], task.sink_plugin, session_id[:12],
-                    resume_offset, part_num,
+                    task.source_url[:60],
+                    task.sink_plugin,
+                    session_id[:12],
+                    resume_offset,
+                    part_num,
                 )
                 task.status = TaskStatus.PUSHING
                 await self._save(task)
@@ -671,7 +689,8 @@ class TaskManager:
                     await self._save(task)
                     logger.info(
                         "Resume completed (all parts pre-uploaded): %s -> %s",
-                        task.filename, result_url[:80] if result_url else "?",
+                        task.filename,
+                        result_url[:80] if result_url else "?",
                     )
                     return
             else:
@@ -679,7 +698,9 @@ class TaskManager:
                 # abandon the old session and re-upload.
                 logger.warning(
                     "Task %s has pushed_parts=%d but %d persisted parts — restarting",
-                    task.task_id[:8], task.pushed_parts, len(parts),
+                    task.task_id[:8],
+                    task.pushed_parts,
+                    len(parts),
                 )
                 try:
                     await sink.abort_upload(task.sink_session_id)
@@ -704,7 +725,9 @@ class TaskManager:
             await self._save(task)
             logger.info(
                 "Streaming %s -> sink '%s' (session %s, ~%d parts)",
-                task.source_url[:60], task.sink_plugin, session_id[:12],
+                task.source_url[:60],
+                task.sink_plugin,
+                session_id[:12],
                 total_parts or -1,
             )
 
@@ -724,8 +747,10 @@ class TaskManager:
 
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True, timeout=httpx.Timeout(30, read=600),
-                cookies=dl_cookies or None, headers=stream_headers or None,
+                follow_redirects=True,
+                timeout=httpx.Timeout(30, read=600),
+                cookies=dl_cookies or None,
+                headers=stream_headers or None,
             ) as client:
                 async with client.stream("GET", dl_url) as resp:
                     # Detect source ignoring our Range header: status 200 + full length
@@ -754,7 +779,7 @@ class TaskManager:
                         for p in cd.split(";"):
                             p = p.strip()
                             if p.startswith("filename="):
-                                task.filename = p[len("filename="):].strip().strip('"')
+                                task.filename = p[len("filename=") :].strip().strip('"')
 
                     # Only trust Content-Length for total size on a *fresh*
                     # (non-Range) request.  For 206 responses Content-Length
@@ -838,8 +863,10 @@ class TaskManager:
 
             logger.info(
                 "Stream complete: %s -> %s (%d parts, %d bytes)",
-                task.filename, result_url[:80] if result_url else "?",
-                part_num, downloaded,
+                task.filename,
+                result_url[:80] if result_url else "?",
+                part_num,
+                downloaded,
             )
 
         except _RangeNotSupportedError:
@@ -860,26 +887,37 @@ class TaskManager:
             task.uploaded_parts = []
             raise
 
-    async def _retry(self, fn, *args, label: str = "", **kwargs):
+    async def _retry(self, fn: Callable[..., Any], *args: Any, label: str = "", **kwargs: Any) -> Any:
         """Retry an async callable with exponential backoff on transient errors."""
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
                 return await fn(*args, **kwargs)
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout,
-                    httpx.PoolTimeout, ConnectionError, OSError) as exc:
+            except (
+                httpx.ConnectTimeout,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+                httpx.PoolTimeout,
+                ConnectionError,
+                OSError,
+            ) as exc:
                 last_exc = exc
                 delay = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
                 logger.warning(
                     "Retry %d/%d for %s: %s — waiting %ds",
-                    attempt + 1, _MAX_RETRIES, label or fn.__name__,
-                    type(exc).__name__, delay,
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    label or fn.__name__,
+                    type(exc).__name__,
+                    delay,
                 )
                 await asyncio.sleep(delay)
         raise last_exc  # type: ignore[misc]
 
     async def _resolve_download_url(
-        self, url: str, source_plugin: str,
+        self,
+        url: str,
+        source_plugin: str,
     ) -> tuple[str, dict[str, str]]:
         """Convert a user-facing URL to a direct download URL.
 
@@ -888,9 +926,13 @@ class TaskManager:
         """
         if source_plugin == "gdrive":
             source = self._registry.get_source("gdrive")
-            return await source.resolve_download_url(url)
+            resolver = getattr(source, "resolve_download_url", None)
+            if resolver is not None:
+                return await resolver(url)
+            return url, {}
         elif source_plugin == "huggingface":
             from etransfer.plugins.sources.huggingface import _parse_hf_url, _to_resolve_url
+
             parts = _parse_hf_url(url)
             if parts:
                 return _to_resolve_url(parts), {}
@@ -926,7 +968,9 @@ class TaskManager:
                 task.download_progress = downloaded / total
                 task.progress = downloaded / total
 
-        file_path = await self._retry(source.download, task.source_url, dest_dir, on_progress=_progress, label=f"download({task.task_id[:8]})")
+        file_path = await self._retry(
+            source.download, task.source_url, dest_dir, on_progress=_progress, label=f"download({task.task_id[:8]})"
+        )
         task.filename = file_path.name
         task.file_size = file_path.stat().st_size
         task.downloaded_bytes = task.file_size

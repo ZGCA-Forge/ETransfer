@@ -43,10 +43,8 @@ from etransfer.client import cli as cli_module
 from etransfer.plugins.registry import plugin_registry
 from etransfer.server.config import ServerSettings
 from etransfer.server.main import create_app
-
 from tests._fake_bucket import create_fake_bucket_app
 from tests._fake_bucket_sink import FakeBucketSink
-
 
 TEST_TOKEN = "test-token-12345"
 TEST_BUCKET = "test-bucket"

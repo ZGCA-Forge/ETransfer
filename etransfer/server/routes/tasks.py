@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from etransfer.server.auth.privilege import enforce_retention_policy
-from etransfer.server.tasks.models import CreateTaskRequest, TaskResponse, TaskStatus
+from etransfer.server.tasks.models import CreateTaskRequest, TaskResponse, TaskStatus, TransferTask
 
 logger = logging.getLogger("etransfer.server.tasks")
 
@@ -67,9 +67,13 @@ def create_tasks_router() -> APIRouter:
                     _settings = getattr(request.app.state, "settings", None)
                     api_key = getattr(_settings, "google_api_key", None)
                     if api_key:
-                        source.google_api_key = api_key
+                        setattr(source, "google_api_key", api_key)
                 return await _create_batch_from_repo(
-                    mgr, source, body, owner_id, user,
+                    mgr,
+                    source,
+                    body,
+                    owner_id,
+                    user,
                 )
         except HTTPException:
             raise
@@ -102,8 +106,11 @@ def create_tasks_router() -> APIRouter:
         return TaskResponse(**task.model_dump())
 
     async def _create_batch_from_repo(
-        mgr: Any, source: Any, body: CreateTaskRequest,
-        owner_id: Optional[int], user: Any,
+        mgr: Any,
+        source: Any,
+        body: CreateTaskRequest,
+        owner_id: Optional[int],
+        user: Any,
     ) -> dict:
         """Expand a repo/folder URL into multiple download tasks."""
         try:
@@ -120,7 +127,9 @@ def create_tasks_router() -> APIRouter:
         total_size = 0
         for f in files:
             file_url = source.build_file_url(
-                meta, f["path"], gdrive_id=f.get("gdrive_id", ""),
+                meta,
+                f["path"],
+                gdrive_id=f.get("gdrive_id", ""),
             )
             total_size += f.get("size", 0)
             try:
@@ -208,24 +217,26 @@ def create_tasks_router() -> APIRouter:
 
         items: list[QueueItem] = []
         for t in tasks:
-            items.append(QueueItem(
-                task_id=t.task_id,
-                owner_name=await _resolve_name(t.owner_id),
-                source_plugin=t.source_plugin,
-                sink_plugin=t.sink_plugin,
-                filename=t.filename,
-                file_size=t.file_size,
-                status=t.status,
-                progress=t.progress,
-                downloaded_bytes=t.downloaded_bytes,
-                pushed_parts=t.pushed_parts,
-                created_at=t.created_at.isoformat(),
-                updated_at=t.updated_at.isoformat(),
-            ))
+            items.append(
+                QueueItem(
+                    task_id=t.task_id,
+                    owner_name=await _resolve_name(t.owner_id),
+                    source_plugin=t.source_plugin,
+                    sink_plugin=t.sink_plugin,
+                    filename=t.filename,
+                    file_size=t.file_size,
+                    status=t.status,
+                    progress=t.progress,
+                    downloaded_bytes=t.downloaded_bytes,
+                    pushed_parts=t.pushed_parts,
+                    created_at=t.created_at.isoformat(),
+                    updated_at=t.updated_at.isoformat(),
+                )
+            )
         items.sort(key=lambda i: i.updated_at, reverse=True)
         return items
 
-    def _check_task_access(task, request: Request) -> None:
+    def _check_task_access(task: TransferTask, request: Request) -> None:
         """Raise 404 if non-admin session user doesn't own the task."""
         user = getattr(request.state, "user", None)
         if not user:

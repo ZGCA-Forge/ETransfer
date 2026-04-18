@@ -100,8 +100,7 @@ class BaseSink(ABC):
         if preset_name:
             if preset_name not in server_presets:
                 raise KeyError(
-                    f"sink preset '{preset_name}' not found "
-                    f"(available: {sorted(server_presets.keys()) or 'none'})"
+                    f"sink preset '{preset_name}' not found " f"(available: {sorted(server_presets.keys()) or 'none'})"
                 )
             return dict(server_presets[preset_name])
 

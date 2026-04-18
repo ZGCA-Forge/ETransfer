@@ -17,7 +17,9 @@ logger = logging.getLogger("etransfer.server.auth")
 import httpx
 
 _DINGTALK_AUTHORIZE = "https://login.dingtalk.com/oauth2/auth"
-_DINGTALK_TOKEN = "https://api.dingtalk.com/v1.0/oauth2/userAccessToken"
+_DINGTALK_TOKEN = (
+    "https://api.dingtalk.com/v1.0/oauth2/userAccessToken"  # nosec B105 - OAuth token endpoint URL, not a secret
+)
 _DINGTALK_USERINFO = "https://api.dingtalk.com/v1.0/contact/users/me"
 
 
@@ -188,7 +190,6 @@ class OIDCProvider:
                 "corp_id": data.get("corpId", ""),
                 "_jwt_claims": user_claims,
             }
-
 
     async def get_user_info(self, access_token: str) -> dict:
         """Fetch user profile from userinfo endpoint."""

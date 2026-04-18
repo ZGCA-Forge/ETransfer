@@ -66,6 +66,7 @@ class InstanceTrafficTracker:
 
         # psutil baseline for network counters
         import psutil
+
         _net = psutil.net_io_counters()
         self._prev_net_sent: int = _net.bytes_sent
         self._prev_net_recv: int = _net.bytes_recv
@@ -219,6 +220,7 @@ class InstanceTrafficTracker:
         not just TUS protocol traffic from the middleware.
         """
         import psutil
+
         now = time.monotonic()
         _net = psutil.net_io_counters()
 

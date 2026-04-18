@@ -45,10 +45,7 @@ def create_plugins_router() -> APIRouter:
             if presets:
                 # Multi-preset metadata. The frontend uses this to render one
                 # entry per preset and to populate the CLI's --sink-preset arg.
-                d["presets"] = [
-                    {"name": name, "preview": _safe_preview(cfg)}
-                    for name, cfg in presets.items()
-                ]
+                d["presets"] = [{"name": name, "preview": _safe_preview(cfg)} for name, cfg in presets.items()]
                 # Back-compat: existing fields that older frontends rely on.
                 default_preset = presets.get("default") or next(iter(presets.values()))
                 d["preset_preview"] = _safe_preview(default_preset)

@@ -27,7 +27,6 @@ from etransfer.server.config import (
 )
 from etransfer.server.tasks.manager import _DynamicTaskGate
 
-
 # ── Gate behaviour ──────────────────────────────────────────────
 
 

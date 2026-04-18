@@ -6,7 +6,7 @@ import asyncio
 import io
 import logging
 import zipfile
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -84,7 +84,7 @@ def create_folders_router(storage: TusStorage) -> APIRouter:
         raw = await storage.state.get(f"et:folder:{folder_id}:name")
         folder_name = raw or folder_id[:8]
 
-        async def _stream_zip():
+        async def _stream_zip() -> AsyncIterator[bytes]:
             buf = io.BytesIO()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for f in files:

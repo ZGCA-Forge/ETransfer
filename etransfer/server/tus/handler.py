@@ -19,14 +19,13 @@ from etransfer.common.constants import (
     RedisKeys,
     TusHeaders,
 )
+from etransfer.common.fileutil import derive_sink_object_key
 from etransfer.server.auth.models import RoleQuota
 from etransfer.server.auth.privilege import enforce_retention_policy
 from etransfer.server.rate_limiter import get_rate_limiter, get_user_key
 from etransfer.server.tus.models import TusCapabilities, TusErrors, TusMetadata, TusUpload
 from etransfer.server.tus.quota import QuotaService
 from etransfer.server.tus.storage import TusStorage
-
-from etransfer.common.fileutil import derive_sink_object_key
 
 logger = logging.getLogger("etransfer.server.tus")
 
@@ -192,7 +191,7 @@ def create_tus_router(
         if not retention:
             _settings = getattr(request.app.state, "settings", None)
             _def_ret = getattr(_settings, "default_retention", "permanent")
-            _def_ttl = getattr(_settings, "default_retention_ttl", None)
+            _def_ttl = getattr(_settings, "default_retention_ttl", None) or 0
             _tok_pol = getattr(_settings, "token_retention_policies", None) or {}
 
             token = request.headers.get(AUTH_HEADER, "")
@@ -290,9 +289,7 @@ def create_tus_router(
                 )
                 sink_inst = plugin_registry.create_sink(tus_metadata.sink, config=resolved_cfg)
                 sink_key = derive_sink_object_key(tus_metadata.filename, user)
-                session_id = await sink_inst.initialize_upload(
-                    sink_key, {"file_id": file_id, "retention": retention}
-                )
+                session_id = await sink_inst.initialize_upload(sink_key, {"file_id": file_id, "retention": retention})
                 upload.sink_session_id = session_id
                 # Cache sink instance on app state for PATCH access
                 if not hasattr(request.app.state, "_sink_sessions"):
@@ -546,7 +543,9 @@ def create_tus_router(
 
         # ── Merge range + compute flushable sink parts ────────
         upload, completed, sink_flush = await storage.merge_range_atomic(
-            file_id, offset, written,
+            file_id,
+            offset,
+            written,
         )
         if upload is None:
             raise HTTPException(404, "Upload not found")
@@ -559,26 +558,33 @@ def create_tus_router(
                 _cs = upload.chunk_size
                 for flush_start, flush_end in sink_flush:
                     try:
-                        data = bytearray()
+                        buf = bytearray()
                         ci_start = flush_start // _cs
                         ci_end = (flush_end + _cs - 1) // _cs
                         for ci in range(ci_start, ci_end):
-                            data.extend(await storage.read_chunk_file(file_id, ci))
-                        data = bytes(data[:flush_end - flush_start])
+                            buf.extend(await storage.read_chunk_file(file_id, ci))
+                        data: bytes = bytes(buf[: flush_end - flush_start])
 
                         part_num = (flush_start // upload.sink_part_size) + 1
                         result = await _sink_inst.upload_part(
-                            upload.sink_session_id, part_num, data,
+                            upload.sink_session_id,
+                            part_num,
+                            data,
                         )
                         await storage.append_sink_part(file_id, result.model_dump())
                         logger.debug(
                             "Sink coalesced part %d: %d-%d (%d bytes)",
-                            part_num, flush_start, flush_end, len(data),
+                            part_num,
+                            flush_start,
+                            flush_end,
+                            len(data),
                         )
                     except Exception:
                         logger.exception(
                             "Sink flush failed: file=%s range=%d-%d",
-                            file_id[:8], flush_start, flush_end,
+                            file_id[:8],
+                            flush_start,
+                            flush_end,
                         )
 
         # ── Finalize if complete ─────────────────────────────
@@ -589,12 +595,17 @@ def create_tus_router(
                 await quota_svc.release(upload.owner_id, upload.size)
                 logger.debug(
                     "TUS FINALIZE %s: owner_id=%d size=%d quota +%d",
-                    file_id[:8], upload.owner_id, upload.size, upload.size,
+                    file_id[:8],
+                    upload.owner_id,
+                    upload.size,
+                    upload.size,
                 )
             else:
                 logger.debug(
                     "TUS FINALIZE %s: no quota update (owner_id=%r user_db=%s)",
-                    file_id[:8], upload.owner_id, "yes" if user_db else "no",
+                    file_id[:8],
+                    upload.owner_id,
+                    "yes" if user_db else "no",
                 )
             await storage.finalize_upload(file_id)
 
@@ -612,12 +623,15 @@ def create_tus_router(
                     if final_upload and final_upload.sink_parts:
                         try:
                             from etransfer.plugins.base_sink import PartResult as _PR
+
                             parts = [_PR(**p) for p in final_upload.sink_parts]
                             parts.sort(key=lambda p: p.part_number)
                             await _sink_inst.complete_upload(upload.sink_session_id, parts)
                             logger.info(
                                 "TUS FINALIZE %s: sink complete (%d parts, waited %d retries)",
-                                file_id[:8], len(parts), _retry,
+                                file_id[:8],
+                                len(parts),
+                                _retry,
                             )
                         except Exception:
                             logger.exception("Sink complete failed: %s", file_id[:8])

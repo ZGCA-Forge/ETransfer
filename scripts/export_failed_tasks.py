@@ -72,8 +72,9 @@ def _lookup_owner_map_mysql(dsn: str) -> dict[int, str]:
     DSN format: mysql://user:pass@host:port/db
     """
     try:
-        import pymysql  # type: ignore
         from urllib.parse import urlparse
+
+        import pymysql  # type: ignore
     except ImportError:
         return {}
 
@@ -193,8 +194,8 @@ def _write_markdown(path: Path, tasks: list[dict], owners: dict[int, str]) -> No
         size = _fmt_size(t.get("file_size") or 0)
         err = (t.get("error") or "").replace("\n", " ").replace("|", "\\|")[:140]
         lines.append(
-            f"| {t.get('updated_at','')[:19]} | `{tid}` | {owner} | "
-            f"{t.get('source_plugin','')}→{t.get('sink_plugin','') or '-'} | {fname} | {size} | {err} |"
+            f"| {t.get('updated_at', '')[:19]} | `{tid}` | {owner} | "
+            f"{t.get('source_plugin', '')}→{t.get('sink_plugin', '') or '-'} | {fname} | {size} | {err} |"
         )
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

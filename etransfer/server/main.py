@@ -17,8 +17,8 @@ from etransfer.server.middleware.auth import TokenAuthMiddleware
 from etransfer.server.middleware.traffic import TrafficCounterMiddleware
 from etransfer.server.routes.auth import create_auth_router
 from etransfer.server.routes.files import create_files_router
-from etransfer.server.routes.info import create_info_router
 from etransfer.server.routes.folders import create_folders_router
+from etransfer.server.routes.info import create_info_router
 from etransfer.server.routes.plugins import create_plugins_router
 from etransfer.server.routes.tasks import create_tasks_router
 from etransfer.server.services.instance_traffic import InstanceTrafficTracker

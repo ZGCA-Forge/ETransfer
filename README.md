@@ -111,7 +111,7 @@ downloader.download_file(file_id, "./output/large-model.bin")
 ```yaml
 retention:
   default: download_once
-  allow_permanent: false   # 普通用户被拒绝；API token / admin 可继续使用
+  allow_permanent: false # 普通用户被拒绝；API token / admin 可继续使用
 ```
 
 - `/api/info` 会自动从 `retention_policies` 中剔除 `permanent`
@@ -123,7 +123,7 @@ retention:
 
 ## 插件架构
 
-ETransfer 自带 *Source*（离线下载源）+ *Sink*（推送目标）两类插件：
+ETransfer 自带 _Source_（离线下载源）+ _Sink_（推送目标）两类插件：
 
 - 内置 Source：`direct`、`huggingface`、`gdrive`
 - 内置 Sink：`local`、`tos`（火山引擎 TOS）

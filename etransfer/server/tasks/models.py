@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class TaskStatus(str, Enum):
@@ -60,6 +60,9 @@ class TransferTask(BaseModel):
     # Parts already uploaded to the sink (persisted so we can resume across restart).
     # Each item is {"part_number": int, "etag": str, "extra": dict}.
     uploaded_parts: list[dict] = Field(default_factory=list, description="Persisted PartResult list for resume")
+
+    # Transient (not serialized) — authenticated user attached at runtime for sink key derivation.
+    _user: Any = PrivateAttr(default=None)
 
 
 class CreateTaskRequest(BaseModel):

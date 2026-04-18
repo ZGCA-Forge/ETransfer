@@ -25,7 +25,7 @@ def _group_to_public(g: GroupTable, member_count: int = 0) -> GroupPublic:
     return GroupPublic(
         id=g.id,  # type: ignore[arg-type]
         name=g.name,
-        description=g.description,
+        description=g.description or "",
         quota=RoleQuota(**quota_data),
         member_count=member_count,
     )
@@ -269,21 +269,23 @@ def create_user_router(
         # Fetch user profile (DingTalk: pass JWT claims for 403 fallback)
         jwt_claims = token_data.get("_jwt_claims")
         if jwt_claims:
-            oidc._jwt_claims = jwt_claims
+            setattr(oidc, "_jwt_claims", jwt_claims)
         try:
             userinfo = await oidc.get_user_info(access_token)
         except Exception as e:
             raise HTTPException(400, f"Failed to fetch user profile: {e}")
         finally:
             if hasattr(oidc, "_jwt_claims"):
-                del oidc._jwt_claims
+                delattr(oidc, "_jwt_claims")
 
         # Extract user claims (compatible with standard OIDC + DingTalk)
         # DingTalk old API uses lowercase (openid/unionid), new API uses camelCase
         oidc_sub = str(
             userinfo.get("sub")
-            or userinfo.get("openId") or userinfo.get("openid")
-            or userinfo.get("unionId") or userinfo.get("unionid")
+            or userinfo.get("openId")
+            or userinfo.get("openid")
+            or userinfo.get("unionId")
+            or userinfo.get("unionid")
             or userinfo.get("id")
             or "",
         )
@@ -298,13 +300,13 @@ def create_user_router(
             or oidc_sub
         )
         display_name = userinfo.get("displayName") or userinfo.get("nick") or userinfo.get("name")
-        email = (
-            userinfo.get("email")
-            or userinfo.get("org_email")
-            or userinfo.get("orgEmail")
-            or userinfo.get("mail")
+        email = userinfo.get("email") or userinfo.get("org_email") or userinfo.get("orgEmail") or userinfo.get("mail")
+        avatar_url = (
+            userinfo.get("picture")
+            or userinfo.get("avatar")
+            or userinfo.get("avatarUrl")
+            or userinfo.get("permanentAvatar")
         )
-        avatar_url = userinfo.get("picture") or userinfo.get("avatar") or userinfo.get("avatarUrl") or userinfo.get("permanentAvatar")
         is_admin = bool(userinfo.get("isAdmin", False))
 
         # Extract groups (provider-specific: array of strings or objects)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NoReturn, Optional
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -105,10 +105,11 @@ class HuggingFaceSource(BaseSource):
             filename=rel_path,
             size=int(size_str) if size_str else 0,
             mime_type=resp.headers.get("content-type") or "application/octet-stream",
+            etag=resp.headers.get("etag", ""),
             extra={"repo": parts["repo"], "revision": parts["revision"]},
         )
 
-    def _raise_repo_hint(self, url: str) -> None:
+    def _raise_repo_hint(self, url: str) -> NoReturn:
         """Raise a helpful error for repo/dataset page URLs."""
         parsed = urlparse(url)
         m = _HF_REPO_PATTERN.match(parsed.path)
@@ -156,10 +157,7 @@ class HuggingFaceSource(BaseSource):
         if not info:
             raise ValueError(f"Not a HF repo URL: {url}")
 
-        api_url = (
-            f"https://{info['host']}/api/{info['api_prefix']}"
-            f"/{info['repo']}/tree/{info['revision']}"
-        )
+        api_url = f"https://{info['host']}/api/{info['api_prefix']}" f"/{info['repo']}/tree/{info['revision']}"
         params: dict[str, str] = {"recursive": "true"}
         if info["subdir"]:
             api_url += f"/{info['subdir']}"
@@ -172,10 +170,12 @@ class HuggingFaceSource(BaseSource):
 
         for entry in entries:
             if entry.get("type") == "file":
-                all_files.append({
-                    "path": entry["path"],
-                    "size": entry.get("size", 0),
-                })
+                all_files.append(
+                    {
+                        "path": entry["path"],
+                        "size": entry.get("size", 0),
+                    }
+                )
 
         folder_name = info["repo"].split("/")[-1]
         meta = {**info, "folder_name": folder_name}
@@ -185,10 +185,7 @@ class HuggingFaceSource(BaseSource):
         """Build a resolve URL for a specific file in a repo."""
         prefix = meta.get("api_prefix", "models")
         path_prefix = "" if prefix == "models" else f"{prefix}/"
-        return (
-            f"https://{meta['host']}/{path_prefix}{meta['repo']}"
-            f"/resolve/{meta['revision']}/{file_path}"
-        )
+        return f"https://{meta['host']}/{path_prefix}{meta['repo']}" f"/resolve/{meta['revision']}/{file_path}"
 
     async def download(
         self,
@@ -221,7 +218,7 @@ class HuggingFaceSource(BaseSource):
                     for p in cd.split(";"):
                         p = p.strip()
                         if p.startswith("filename="):
-                            filename = p[len("filename="):].strip().strip('"')
+                            filename = p[len("filename=") :].strip().strip('"')
 
                 total_str = resp.headers.get("content-length")
                 total = int(total_str) if total_str else None

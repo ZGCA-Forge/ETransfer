@@ -1202,14 +1202,16 @@ class TusStorage:
         for fid in file_ids:
             upload = await self.get_upload(fid)
             if upload:
-                files.append({
-                    "file_id": fid,
-                    "filename": upload.filename,
-                    "relative_path": upload.relative_path or upload.filename,
-                    "size": upload.size,
-                    "status": "complete" if upload.is_final else "uploading",
-                    "is_final": upload.is_final,
-                })
+                files.append(
+                    {
+                        "file_id": fid,
+                        "filename": upload.filename,
+                        "relative_path": upload.relative_path or upload.filename,
+                        "size": upload.size,
+                        "status": "complete" if upload.is_final else "uploading",
+                        "is_final": upload.is_final,
+                    }
+                )
         return files
 
     async def delete_folder(self, folder_id: str) -> int:

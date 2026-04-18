@@ -143,10 +143,7 @@ def create_fake_bucket_app() -> FastAPI:
                 }
                 for sid, s in sessions.items()
             },
-            "objects": {
-                k: {"size": o["size"], "md5": o["md5"], "parts": len(o["parts"])}
-                for k, o in objects.items()
-            },
+            "objects": {k: {"size": o["size"], "md5": o["md5"], "parts": len(o["parts"])} for k, o in objects.items()},
         }
 
     return app

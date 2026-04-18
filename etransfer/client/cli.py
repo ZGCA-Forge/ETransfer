@@ -476,7 +476,9 @@ def upload(
             fsize = fp.stat().st_size
             total_bytes += fsize
             discovered = walk_count[0]
-            console.print(f"  [{idx}/{discovered}{'+'if not walk_done.is_set() else ''}] {rel} ({format_size(fsize)})", end="")
+            console.print(
+                f"  [{idx}/{discovered}{'+'if not walk_done.is_set() else ''}] {rel} ({format_size(fsize)})", end=""
+            )
 
             try:
                 c = EasyTransferClient(server, token=token, chunk_size=chunk_size)
@@ -488,9 +490,15 @@ def upload(
                     retention=retention,
                     retention_ttl=retention_ttl,
                     metadata={
-                        "folderId": folder_id, "folderName": folder_name, "relativePath": rel,
+                        "folderId": folder_id,
+                        "folderName": folder_name,
+                        "relativePath": rel,
                         **({"sink": sink} if sink else {}),
-                        **({"sink_config": __import__("base64").b64encode(sink_config_json.encode()).decode()} if sink and sink_config_json else {}),
+                        **(
+                            {"sink_config": __import__("base64").b64encode(sink_config_json.encode()).decode()}
+                            if sink and sink_config_json
+                            else {}
+                        ),
                         **({"sink_preset": sink_preset} if sink and sink_preset and not sink_config_json else {}),
                     },
                 )
@@ -532,6 +540,7 @@ def upload(
                 extra_meta["sink"] = sink
                 if sink_config_json:
                     import base64 as _b64
+
                     extra_meta["sink_config"] = _b64.b64encode(sink_config_json.encode()).decode()
                 elif sink_preset:
                     extra_meta["sink_preset"] = sink_preset
@@ -2266,18 +2275,23 @@ def remote_download(
     url: Optional[str] = typer.Argument(None, help="URL to download on the server"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Override saved filename"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
     urls_file: Optional[Path] = typer.Option(
-        None, "--urls-file", "-f",
+        None,
+        "--urls-file",
+        "-f",
         help="Read URLs from file (one per line; '-' for stdin). Overrides URL argument.",
     ),
     sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos). Omit = save to server"),
     sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
     sink_preset: Optional[str] = typer.Option(
-        None, "--sink-preset",
+        None,
+        "--sink-preset",
         help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
     ),
     retention: str = typer.Option("download_once", "--retention", "-r", help="download_once / permanent / ttl"),
@@ -2341,7 +2355,9 @@ def remote_download(
         for u in batch_urls:
             try:
                 data = _submit_remote_download(
-                    server, headers, u,
+                    server,
+                    headers,
+                    u,
                     output=None,  # per-URL rename not meaningful in batch
                     sink=sink,
                     sink_config_json=sink_config,
@@ -2385,8 +2401,11 @@ def remote_download(
     assert url is not None
     try:
         data = _submit_remote_download(
-            server, headers, url,
-            output=output, sink=sink,
+            server,
+            headers,
+            url,
+            output=output,
+            sink=sink,
             sink_config_json=sink_config,
             sink_preset=sink_preset,
             retention=retention,
@@ -2433,8 +2452,12 @@ def _wait_for_task(server: str, headers: dict, task_id: str) -> None:
     """Poll a task until it completes, showing progress."""
     console.print()
     status_labels = {
-        "pending": "等待中", "downloading": "下载中", "pushing": "推送中",
-        "completed": "完成", "failed": "失败", "cancelled": "已取消",
+        "pending": "等待中",
+        "downloading": "下载中",
+        "pushing": "推送中",
+        "completed": "完成",
+        "failed": "失败",
+        "cancelled": "已取消",
     }
     with create_transfer_progress() as progress:
         ptask = progress.add_task("[cyan]Working", total=100)
@@ -2495,13 +2518,15 @@ def _push_file_to_sink(
     try:
         resp = httpx.post(
             f"{server.rstrip('/')}/api/files/{file_id}/push",
-            json=body, headers=headers, timeout=30,
+            json=body,
+            headers=headers,
+            timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
         task_id = data.get("task_id", "")
         print_success(f"Push task created: {task_id[:12]}...")
-        console.print(f"   [dim]Track: [bold]et tasks[/bold][/dim]")
+        console.print("   [dim]Track: [bold]et tasks[/bold][/dim]")
 
         _wait_for_task(server, headers, task_id)
     except httpx.HTTPStatusError as e:
@@ -2515,15 +2540,16 @@ def push(
     file_id: str = typer.Argument(..., help="File ID (or short prefix) to push"),
     sink: str = typer.Option(..., "--sink", help="Sink plugin name (e.g. tos)"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
-    sink_config_arg: Optional[str] = typer.Option(
-        None, "--sink-config", help="Sink config JSON (overrides preset)"
-    ),
+    sink_config_arg: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
     sink_preset: Optional[str] = typer.Option(
-        None, "--sink-preset",
+        None,
+        "--sink-preset",
         help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
     ),
 ) -> None:
@@ -2579,7 +2605,9 @@ _STATUS_STYLES = {
 def _build_tasks_table(all_tasks: list, title: str = "Tasks") -> Table:
     table = Table(
         title=f"[bold cyan]{title}[/bold cyan]",
-        show_header=True, header_style="bold magenta", border_style="cyan",
+        show_header=True,
+        header_style="bold magenta",
+        border_style="cyan",
     )
     table.add_column("ID", style="dim", width=8)
     table.add_column("File", style="white", max_width=30, overflow="ellipsis")
@@ -2633,12 +2661,16 @@ def _resolve_task_id(prefix: str, server: str, token: Optional[str]) -> str:
 def _tasks_root(
     ctx: typer.Context,
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
     status_filter: Optional[str] = typer.Option(
-        None, "--status", "-s",
+        None,
+        "--status",
+        "-s",
         help="Filter by status: pending, downloading, pushing, completed, failed, cancelled",
     ),
 ) -> None:
@@ -2654,12 +2686,16 @@ def _tasks_root(
 @tasks_app.command("list")
 def tasks_list(
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
     status_filter: Optional[str] = typer.Option(
-        None, "--status", "-s",
+        None,
+        "--status",
+        "-s",
         help="Filter by status: pending, downloading, pushing, completed, failed, cancelled",
     ),
 ) -> None:
@@ -2696,7 +2732,9 @@ def _tasks_list_impl(token: Optional[str], status_filter: Optional[str]) -> None
 def tasks_cancel(
     task_ids: list[str] = typer.Argument(..., help="Task ID(s) or short prefix(es) to cancel"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -2737,7 +2775,9 @@ def tasks_cancel(
 def tasks_retry(
     task_ids: list[str] = typer.Argument(..., help="Task ID(s) or short prefix(es) to retry"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -2785,12 +2825,15 @@ def tasks_retry(
 def tasks_wait(
     task_id: str = typer.Argument(..., help="Task ID (or short prefix) to wait for"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
     timeout: Optional[int] = typer.Option(
-        None, "--timeout",
+        None,
+        "--timeout",
         help="Maximum wait in seconds (default: no timeout)",
     ),
 ) -> None:
@@ -2826,8 +2869,12 @@ def tasks_wait(
                 status = d.get("status", "")
                 pct = int(d.get("progress", 0) * 100)
                 labels = {
-                    "pending": "等待中", "downloading": "下载中", "pushing": "推送中",
-                    "completed": "完成", "failed": "失败", "cancelled": "已取消",
+                    "pending": "等待中",
+                    "downloading": "下载中",
+                    "pushing": "推送中",
+                    "completed": "完成",
+                    "failed": "失败",
+                    "cancelled": "已取消",
                 }
                 progress.update(ptask, completed=pct, description=f"[cyan]{labels.get(status, status)}")
                 if status == "completed":
@@ -2854,13 +2901,18 @@ def tasks_wait(
 @tasks_app.command("watch")
 def tasks_watch(
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
     interval: float = typer.Option(2.0, "--interval", "-i", help="Refresh interval in seconds"),
     status_filter: Optional[str] = typer.Option(
-        None, "--status", "-s", help="Filter by status",
+        None,
+        "--status",
+        "-s",
+        help="Filter by status",
     ),
 ) -> None:
     """Live task dashboard: refresh the task table every N seconds until all done.
@@ -2887,9 +2939,7 @@ def tasks_watch(
                 display_tasks.sort(key=lambda t: t.get("created_at", ""), reverse=True)
                 display_tasks = display_tasks[:40]  # cap rows for responsive UI
 
-                active = any(
-                    t.get("status") in ("pending", "downloading", "pushing") for t in all_tasks
-                )
+                active = any(t.get("status") in ("pending", "downloading", "pushing") for t in all_tasks)
                 title = "Tasks · live"
                 if not active:
                     title += "  (all done — press Ctrl+C to exit)"
@@ -2909,7 +2959,9 @@ def tasks_watch(
 # ─────────────────────────────────────────────────────────────
 
 folders_app = typer.Typer(
-    help="Folder management (文件夹管理).", add_completion=False, no_args_is_help=True,
+    help="Folder management (文件夹管理).",
+    add_completion=False,
+    no_args_is_help=True,
 )
 app.add_typer(folders_app, name="folders", rich_help_panel=PANEL_FOLDERS)
 
@@ -2935,7 +2987,9 @@ def _resolve_folder_id(prefix: str, server: str, token: Optional[str]) -> str:
 @folders_app.command("list")
 def folders_list(
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -2980,7 +3034,9 @@ def folders_list(
 def folders_get(
     folder_id: str = typer.Argument(..., help="Folder ID (or short prefix)"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -3005,7 +3061,8 @@ def folders_get(
         f"[dim]Files: {folder.get('file_count', 0)} | "
         f"Completed: {folder.get('completed', 0)} | "
         f"Size: {format_size(folder.get('total_size', 0))}[/dim]",
-        title="[bold cyan]Folder[/bold cyan]", border_style="cyan",
+        title="[bold cyan]Folder[/bold cyan]",
+        border_style="cyan",
     )
     console.print(panel)
 
@@ -3028,7 +3085,9 @@ def folders_get(
 def folders_delete(
     folder_id: str = typer.Argument(..., help="Folder ID (or short prefix)"),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -3059,10 +3118,15 @@ def folders_delete(
 def folders_download(
     folder_id: str = typer.Argument(..., help="Folder ID (or short prefix)"),
     output: Optional[Path] = typer.Option(
-        None, "--output", "-o", help="Output ZIP file path (default: <folder_name>.zip)",
+        None,
+        "--output",
+        "-o",
+        help="Output ZIP file path (default: <folder_name>.zip)",
     ),
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -3075,7 +3139,9 @@ def folders_download(
     url = f"{server.rstrip('/')}/api/folders/{resolved}/download"
 
     try:
-        with httpx.stream("GET", url, headers=headers, timeout=None) as r:
+        with httpx.stream(
+            "GET", url, headers=headers, timeout=None
+        ) as r:  # nosec B113 - streaming folder archive, size/time unbounded by design
             r.raise_for_status()
             cd = r.headers.get("content-disposition", "")
             import re as _re
@@ -3115,7 +3181,9 @@ def _fetch_plugins(server: str, token: Optional[str]) -> tuple[list, list]:
 @app.command("plugins", rich_help_panel=PANEL_PLUGINS)
 def list_plugins_cmd(
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -3147,7 +3215,8 @@ def list_plugins_cmd(
     table2.add_column("Preset")
     for s in sinks_:
         table2.add_row(
-            s["name"], s["display_name"],
+            s["name"],
+            s["display_name"],
             "Yes" if s.get("supports_multipart") else "No",
             "Yes" if s.get("has_preset") else "No",
         )
@@ -3157,7 +3226,9 @@ def list_plugins_cmd(
 @app.command("sinks", rich_help_panel=PANEL_PLUGINS)
 def sinks_cmd(
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
@@ -3185,7 +3256,8 @@ def sinks_cmd(
         schema = s.get("config_schema") or {}
         keys = ", ".join(schema.keys()) if isinstance(schema, dict) else ""
         table.add_row(
-            s["name"], s["display_name"],
+            s["name"],
+            s["display_name"],
             "Yes" if s.get("supports_multipart") else "No",
             "Yes" if s.get("has_preset") else "No",
             keys,
@@ -3197,7 +3269,9 @@ def sinks_cmd(
 @app.command("sources", rich_help_panel=PANEL_PLUGINS)
 def sources_cmd(
     token: Optional[str] = typer.Option(
-        None, "--token", "-t",
+        None,
+        "--token",
+        "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),

@@ -81,9 +81,7 @@ def test_non_permanent_retention_never_blocked(disabled_permanent):
         enforce_retention_policy(_fake_request(None, settings), r)
 
 
-def test_cli_upload_with_default_retention_still_works(
-    tmp_path, cli_env, run_cli, disabled_permanent
-):
+def test_cli_upload_with_default_retention_still_works(tmp_path, cli_env, run_cli, disabled_permanent):
     """The default flow (``download_once``) must continue to work."""
     src = tmp_path / "ok.bin"
     src.write_bytes(b"x" * 4096)

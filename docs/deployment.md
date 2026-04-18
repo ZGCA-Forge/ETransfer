@@ -104,22 +104,22 @@ cors:
 
 所有配置项均可通过 `ETRANSFER_` 前缀的环境变量覆盖：
 
-| 变量                             | 说明               | 默认值                     |
-| -------------------------------- | ------------------ | -------------------------- |
-| `ETRANSFER_HOST`                 | 绑定地址           | `0.0.0.0`                  |
-| `ETRANSFER_PORT`                 | 端口               | `8765`                     |
-| `ETRANSFER_STORAGE_PATH`         | 文件存储路径       | `./storage`                |
-| `ETRANSFER_STATE_BACKEND`        | 状态后端           | `file`                     |
-| `ETRANSFER_REDIS_URL`            | Redis 地址         | `redis://localhost:6379/0` |
-| `ETRANSFER_AUTH_ENABLED`         | 启用鉴权           | `true`                     |
-| `ETRANSFER_AUTH_TOKENS`          | Token 列表（JSON） | `[]`                       |
-| `ETRANSFER_MAX_UPLOAD_SIZE`      | 单文件大小限制     | 不限                       |
-| `ETRANSFER_MAX_STORAGE_SIZE`     | 总存储配额         | 不限                       |
-| `ETRANSFER_CHUNK_SIZE`           | 切片大小           | `4194304` (4MB)            |
-| `ETRANSFER_ADVERTISED_ENDPOINTS` | 广播 IP 列表       | 自动检测                   |
-| `ETRANSFER_DEFAULT_RETENTION`    | 默认文件策略       | `download_once`            |
-| `ETRANSFER_ALLOW_PERMANENT_RETENTION` | 是否允许普通用户使用 permanent | `true` |
-| `ETRANSFER_CORS_ORIGINS`         | CORS 来源          | `["*"]`                    |
+| 变量                                  | 说明                           | 默认值                     |
+| ------------------------------------- | ------------------------------ | -------------------------- |
+| `ETRANSFER_HOST`                      | 绑定地址                       | `0.0.0.0`                  |
+| `ETRANSFER_PORT`                      | 端口                           | `8765`                     |
+| `ETRANSFER_STORAGE_PATH`              | 文件存储路径                   | `./storage`                |
+| `ETRANSFER_STATE_BACKEND`             | 状态后端                       | `file`                     |
+| `ETRANSFER_REDIS_URL`                 | Redis 地址                     | `redis://localhost:6379/0` |
+| `ETRANSFER_AUTH_ENABLED`              | 启用鉴权                       | `true`                     |
+| `ETRANSFER_AUTH_TOKENS`               | Token 列表（JSON）             | `[]`                       |
+| `ETRANSFER_MAX_UPLOAD_SIZE`           | 单文件大小限制                 | 不限                       |
+| `ETRANSFER_MAX_STORAGE_SIZE`          | 总存储配额                     | 不限                       |
+| `ETRANSFER_CHUNK_SIZE`                | 切片大小                       | `4194304` (4MB)            |
+| `ETRANSFER_ADVERTISED_ENDPOINTS`      | 广播 IP 列表                   | 自动检测                   |
+| `ETRANSFER_DEFAULT_RETENTION`         | 默认文件策略                   | `download_once`            |
+| `ETRANSFER_ALLOW_PERMANENT_RETENTION` | 是否允许普通用户使用 permanent | `true`                     |
+| `ETRANSFER_CORS_ORIGINS`              | CORS 来源                      | `["*"]`                    |
 
 ## 配置热重载
 
@@ -140,11 +140,11 @@ curl -X POST http://localhost:8765/api/admin/reload-config \
 
 ## 文件策略
 
-| 策略            | 说明                       | 场景                 |
-| --------------- | -------------------------- | -------------------- |
+| 策略            | 说明                       | 场景                       |
+| --------------- | -------------------------- | -------------------------- |
 | `download_once` | 下载后自动删除（阅后即焚） | 一次性分享、敏感文件、默认 |
-| `ttl`           | 按时间自动过期             | 临时文件、限时分享   |
-| `permanent`     | 永久保存（可由服务端关闭） | 团队公共资料库       |
+| `ttl`           | 按时间自动过期             | 临时文件、限时分享         |
+| `permanent`     | 永久保存（可由服务端关闭） | 团队公共资料库             |
 
 优先级：客户端显式指定 > Token 级策略 > 全局默认。
 

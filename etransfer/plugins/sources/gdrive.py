@@ -30,9 +30,7 @@ _EMBEDDED_FOLDER_URL = "https://drive.google.com/embeddedfolderview?id={folder_i
 # id="entry-{item_id}", a href to the file/folder, and the name inside
 # <div class="flip-entry-title">{name}</div>.
 _RE_ENTRY = re.compile(
-    r'id="entry-([-\w]+)"[^>]*>.*?'
-    r'href="([^"]+)".*?'
-    r'class="flip-entry-title">([^<]+)</div>',
+    r'id="entry-([-\w]+)"[^>]*>.*?' r'href="([^"]+)".*?' r'class="flip-entry-title">([^<]+)</div>',
 )
 _RE_TITLE = re.compile(r"<title>([^<]+)</title>")
 
@@ -64,7 +62,8 @@ def _get_url_from_gdrive_confirmation(html: str) -> Optional[str]:
 
     # Strategy 2: <form id="download-form" action="URL"> + hidden inputs
     form_m = re.search(
-        r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', html,
+        r'<form[^>]+id="download-form"[^>]+action="([^"]+)"',
+        html,
     )
     if form_m:
         action = form_m.group(1).replace("&amp;", "&")
@@ -72,15 +71,13 @@ def _get_url_from_gdrive_confirmation(html: str) -> Optional[str]:
         parts = urlsplit(action)
         params.update(parse_qs(parts.query))
         for inp in re.finditer(
-            r'<input[^>]+type="hidden"[^>]*'
-            r'name="([^"]+)"[^>]*value="([^"]*)"',
+            r'<input[^>]+type="hidden"[^>]*' r'name="([^"]+)"[^>]*value="([^"]*)"',
             html,
         ):
             params[inp.group(1)] = [inp.group(2)]
         # Also handle value before name (attribute order varies)
         for inp in re.finditer(
-            r'<input[^>]+value="([^"]*)"[^>]*'
-            r'name="([^"]+)"[^>]*type="hidden"',
+            r'<input[^>]+value="([^"]*)"[^>]*' r'name="([^"]+)"[^>]*type="hidden"',
             html,
         ):
             params[inp.group(2)] = [inp.group(1)]
@@ -110,7 +107,7 @@ def _filename_from_cd(cd: str) -> Optional[str]:
     for part in cd.split(";"):
         part = part.strip()
         if part.startswith("filename="):
-            return part[len("filename="):].strip().strip('"').strip("'")
+            return part[len("filename=") :].strip().strip('"').strip("'")
     return None
 
 
@@ -188,17 +185,20 @@ async def _scrape_folder_recursive(
                 logger.warning("Skipping subfolder %s/%s — max depth reached", prefix, cname)
                 continue
             sub_files, _ = await _scrape_folder_recursive(
-                client, cid,
+                client,
+                cid,
                 prefix=f"{prefix}{cname}/" if prefix else f"{cname}/",
                 depth=depth + 1,
             )
             files.extend(sub_files)
         else:
-            files.append({
-                "path": f"{prefix}{cname}" if prefix else cname,
-                "size": 0,
-                "gdrive_id": cid,
-            })
+            files.append(
+                {
+                    "path": f"{prefix}{cname}" if prefix else cname,
+                    "size": 0,
+                    "gdrive_id": cid,
+                }
+            )
 
     return files, folder_name
 
@@ -210,7 +210,8 @@ async def _scrape_folder(folder_id: str) -> tuple[list[dict], str]:
     with simple <a> tags — much more stable than parsing the main folder page.
     """
     async with httpx.AsyncClient(
-        follow_redirects=True, timeout=30,
+        follow_redirects=True,
+        timeout=30,
         headers={"User-Agent": _UA_FOLDER},
     ) as client:
         return await _scrape_folder_recursive(client, folder_id)
@@ -272,7 +273,7 @@ class GoogleDriveSource(BaseSource):
             while True:
                 params: dict[str, str] = {
                     "q": f"'{folder_id}' in parents and trashed=false",
-                    "key": self.google_api_key,
+                    "key": self.google_api_key or "",
                     "fields": "nextPageToken,files(id,name,mimeType,size)",
                     "pageSize": "1000",
                 }
@@ -286,11 +287,13 @@ class GoogleDriveSource(BaseSource):
                 for f in data.get("files", []):
                     if f.get("mimeType") == _FOLDER_MIME:
                         continue
-                    all_files.append({
-                        "path": f["name"],
-                        "size": int(f.get("size", 0)),
-                        "gdrive_id": f["id"],
-                    })
+                    all_files.append(
+                        {
+                            "path": f["name"],
+                            "size": int(f.get("size", 0)),
+                            "gdrive_id": f["id"],
+                        }
+                    )
 
                 page_token = data.get("nextPageToken")
                 if not page_token:
@@ -334,7 +337,8 @@ class GoogleDriveSource(BaseSource):
         base_url = _UC_DOWNLOAD_URL.format(file_id=file_id)
 
         async with httpx.AsyncClient(
-            follow_redirects=False, timeout=30,
+            follow_redirects=False,
+            timeout=30,
             headers={"User-Agent": _UA_FILE},
         ) as client:
             resp = await client.get(base_url)
@@ -363,8 +367,10 @@ class GoogleDriveSource(BaseSource):
 
         dl_url, cookies = await self.resolve_download_url(url)
         async with httpx.AsyncClient(
-            follow_redirects=True, timeout=30,
-            headers={"User-Agent": _UA_FILE}, cookies=cookies,
+            follow_redirects=True,
+            timeout=30,
+            headers={"User-Agent": _UA_FILE},
+            cookies=cookies,
         ) as client:
             resp = await client.get(dl_url, headers={"Range": "bytes=0-0"})
 
@@ -387,6 +393,7 @@ class GoogleDriveSource(BaseSource):
             filename=filename,
             size=size,
             mime_type=resp.headers.get("content-type") or "application/octet-stream",
+            etag=resp.headers.get("etag", ""),
         )
 
     async def download(

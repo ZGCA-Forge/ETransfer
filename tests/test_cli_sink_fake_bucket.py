@@ -121,9 +121,7 @@ def test_push_existing_file_to_fake_bucket(tmp_path, cli_env, run_cli, memory_se
 # ── 3) remote-download --sink fake_bucket ────────────────────────
 
 
-def test_remote_download_streams_to_fake_bucket(
-    tmp_path, cli_env, run_cli, memory_server, host_file
-):
+def test_remote_download_streams_to_fake_bucket(tmp_path, cli_env, run_cli, memory_server, host_file):
     payload = b"remote-sink-bytes" * 4000
     md5_hex = hashlib.md5(payload, usedforsecurity=False).hexdigest()
     url = host_file("rd-sink/file.bin", payload)
@@ -131,8 +129,10 @@ def test_remote_download_streams_to_fake_bucket(
     result = run_cli(
         "remote-download",
         url,
-        "--sink", "fake_bucket",
-        "-r", "permanent",
+        "--sink",
+        "fake_bucket",
+        "-r",
+        "permanent",
         "--wait",
     )
     assert result.exit_code == 0, result.output
