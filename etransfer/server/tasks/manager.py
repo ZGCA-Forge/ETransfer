@@ -23,8 +23,22 @@ from etransfer.server.tasks.models import TaskStatus, TransferTask
 logger = logging.getLogger("etransfer.server.tasks")
 
 _STATE_PREFIX = "et:task:"
-_CHUNK_SIZE = 128 * 1024 * 1024  # 128 MB — larger chunks reduce multipart overhead
+# Part size for the streaming Source → Sink pipeline.
+#
+# This is the single biggest driver of steady-state RSS because every
+# concurrent stream-to-sink task holds roughly:
+#   buf (≤ _CHUNK_SIZE) + bytes(data) copy + TOS SDK request body
+# ≈ 3 × _CHUNK_SIZE in flight per task.
+#
+# At 128 MB this was ~400 MB per task, which on a 7.7 GB host OOM-killed the
+# server under a dozen concurrent tasks (observed 2026-04-18).  16 MB is the
+# upstream default for most S3-compatible SDKs and keeps a 14 GB object well
+# under TOS's 10 000-part limit (~900 parts for a 14 GB file).
+_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
 _DEFAULT_MAX_CONCURRENT_TASKS = 50
+# Stream-to-sink pipelines carry ≥ ``3 × _CHUNK_SIZE`` of resident memory each,
+# so they need a tighter cap than generic download-to-disk tasks.
+_DEFAULT_STREAM_SINK_CONCURRENCY = 4
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = (5, 15, 30)  # seconds between retries
 
@@ -129,6 +143,10 @@ class TaskManager:
         self._prev_time: dict[str, datetime] = {}
         self._shutting_down = False
         self._task_gate = _DynamicTaskGate(max_concurrent_tasks)
+        # Second-level gate for memory-heavy stream-to-sink pipelines only.
+        # Held *inside* the global _task_gate, so it never deadlocks the
+        # lighter download-to-disk path.
+        self._stream_sink_gate = _DynamicTaskGate(_DEFAULT_STREAM_SINK_CONCURRENCY)
 
     # ── Concurrency control ───────────────────────────────────
 
@@ -464,7 +482,11 @@ class TaskManager:
         try:
             async with self._task_gate:
                 if task.sink_plugin:
-                    await self._pipeline_stream_to_sink(task)
+                    # Stream-to-sink is RAM-heavy (3× chunk buffer per task);
+                    # serialise on the dedicated gate first so we never pile
+                    # 50 of them up concurrently and OOM the host.
+                    async with self._stream_sink_gate:
+                        await self._pipeline_stream_to_sink(task)
                 else:
                     await self._pipeline_download_local(task)
 
@@ -577,8 +599,10 @@ class TaskManager:
     async def _pipeline_stream_to_sink(self, task: TransferTask) -> None:
         """Stream from source URL directly to sink via multipart upload.
 
-        Memory usage: ~1 chunk buffer (_CHUNK_SIZE, default 32 MB).
-        Disk usage: zero.
+        Memory usage: ≈ 2-3 × ``_CHUNK_SIZE`` per task (download buffer +
+        request body still held by the sink SDK until its HTTP response).
+        Concurrent tasks are capped by ``_stream_sink_gate`` so total RSS
+        stays bounded.  Disk usage: zero.
 
         Resume: if ``task.sink_session_id`` and ``task.pushed_parts > 0`` are
         set (e.g. restored by :meth:`resume_interrupted`), the pipeline tries
@@ -767,9 +791,15 @@ class TaskManager:
                             push_elapsed = time.monotonic() - t0
                             if push_elapsed > 0:
                                 task.push_speed = len(data) / push_elapsed
+                            # Release the 16 MB body *before* the JSON encode
+                            # in ``_save`` so Python / the SDK can collect it
+                            # while we're writing Redis.
+                            del data
                             parts.append(result)
                             task.pushed_parts = part_num
-                            task.uploaded_parts = [p.model_dump() for p in parts]
+                            # Append-only; avoids the O(n²) list rebuild that
+                            # also transiently doubled RSS on every part.
+                            task.uploaded_parts.append(result.model_dump())
 
                             if total_size > 0:
                                 task.download_progress = downloaded / total_size
@@ -786,15 +816,16 @@ class TaskManager:
                 if buf:
                     part_num += 1
                     final_data = bytes(buf)
+                    buf.clear()
                     t0 = time.monotonic()
                     result = await sink.upload_part(session_id, part_num, final_data)
                     push_elapsed = time.monotonic() - t0
                     if push_elapsed > 0:
                         task.push_speed = len(final_data) / push_elapsed
+                    del final_data
                     parts.append(result)
                     task.pushed_parts = part_num
-                    task.uploaded_parts = [p.model_dump() for p in parts]
-                    buf.clear()
+                    task.uploaded_parts.append(result.model_dump())
 
             result_url = await sink.complete_upload(session_id, parts)
             task.sink_result_url = result_url
