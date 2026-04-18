@@ -22,7 +22,9 @@ class TusMetadata(BaseModel):
     filename: str = Field(..., description="Original filename")
     filetype: str = Field("application/octet-stream", description="MIME type")
     checksum: str = Field("", description="File checksum")
-    retention: str = Field("download_once", description="Retention policy: permanent/download_once/ttl")
+    retention: str = Field(
+        "", description="Retention policy (empty = defer to server default): permanent/download_once/ttl"
+    )
     retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
     relative_path: str = Field("", description="Relative path for folder uploads")
     folder_id: str = Field("", description="Folder group ID for folder uploads")
@@ -66,7 +68,7 @@ class TusMetadata(BaseModel):
             filename=metadata.get("filename", ""),
             filetype=metadata.get("filetype", "application/octet-stream"),
             checksum=metadata.get("checksum", ""),
-            retention=metadata.get("retention", "download_once"),
+            retention=metadata.get("retention", ""),
             retention_ttl=(int(metadata["retention_ttl"]) if metadata.get("retention_ttl") else 0),
             relative_path=metadata.get("relativePath") or metadata.get("relative_path", ""),
             folder_id=metadata.get("folderId") or metadata.get("folder_id", ""),

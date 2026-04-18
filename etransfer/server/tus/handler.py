@@ -206,7 +206,7 @@ def create_tus_router(
                     retention_ttl = _def_ttl
 
         if retention not in ("permanent", "download_once", "ttl"):
-            retention = "permanent"
+            retention = "download_once"
 
         # Enforce server policy: non-privileged callers may be blocked from
         # requesting permanent retention when ``allow_permanent_retention``

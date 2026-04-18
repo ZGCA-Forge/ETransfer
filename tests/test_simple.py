@@ -181,8 +181,9 @@ def test_tus_metadata():
 
     assert metadata.filename == "test.txt"
     assert metadata.filetype == "text/plain"
-    # Default retention is "download_once" when client does not specify one.
-    assert metadata.retention == "download_once"
+    # When the client does not specify retention, the parsed value stays empty
+    # so the handler can apply the server-side default (settings.default_retention).
+    assert metadata.retention == ""
     assert metadata.retention_ttl == 0
 
     # 测试转换回 header
@@ -224,23 +225,40 @@ def test_tus_metadata():
     print("  ✓ TUS 元数据测试通过（含 retention）")
 
 
-def test_instance_traffic_tracker():
+def test_instance_traffic_tracker(monkeypatch):
     """测试实例流量追踪器。"""
     print("测试实例流量追踪器...")
 
+    import psutil
+
     from etransfer.server.services.instance_traffic import InstanceTrafficTracker
+
+    # Stub psutil.net_io_counters so rate deltas are deterministic. The tracker
+    # reads OS counters on each _commit_sample; we simulate a monotonically
+    # growing stream so the second commit produces a positive delta.
+    class _FakeNet:
+        def __init__(self, sent: int, recv: int) -> None:
+            self.bytes_sent = sent
+            self.bytes_recv = recv
+
+    fake_states = iter(
+        [
+            _FakeNet(0, 0),
+            _FakeNet(10_000, 20_000),
+            _FakeNet(30_000, 50_000),
+        ]
+    )
+    monkeypatch.setattr(psutil, "net_io_counters", lambda: next(fake_states))
 
     tracker = InstanceTrafficTracker(host="127.0.0.1", port=8765)
     print(f"  endpoint: {tracker.endpoint}")
     assert tracker.endpoint == "127.0.0.1:8765"
 
-    # 记录流量
     tracker.record_upload(1024)
     tracker.record_download(2048)
     assert tracker.total_bytes_recv == 1024
     assert tracker.total_bytes_sent == 2048
 
-    # 获取快照
     snap = tracker.get_snapshot()
     print(f"  snapshot: {snap}")
     assert snap["endpoint"] == "127.0.0.1:8765"
@@ -248,7 +266,8 @@ def test_instance_traffic_tracker():
     assert snap["bytes_recv"] == 1024
     assert snap["bytes_sent"] == 2048
 
-    # 提交样本后获取速率
+    # First commit establishes the baseline; second commit yields a positive
+    # delta against the stubbed psutil counters, so rates must be non-zero.
     tracker._commit_sample()
     tracker.record_upload(1024)
     tracker.record_download(2048)
