@@ -84,15 +84,26 @@ class BaseSink(ABC):
 
         Priority:
           1. Client explicitly provided ``sink_config`` in metadata.
-          2. User's group-level preset in *server_presets*.
-          3. User's role-level preset.
-          4. Global ``"default"`` preset.
+          2. Client explicitly named a preset via ``sink_preset`` metadata
+             (must exist in *server_presets*; otherwise raises ``KeyError``).
+          3. User's group-level preset in *server_presets*.
+          4. User's role-level preset.
+          5. Global ``"default"`` preset.
 
         Subclasses may override for custom logic.
         """
         explicit = context.client_metadata.get("sink_config")
         if explicit and isinstance(explicit, dict):
             return explicit
+
+        preset_name = context.client_metadata.get("sink_preset")
+        if preset_name:
+            if preset_name not in server_presets:
+                raise KeyError(
+                    f"sink preset '{preset_name}' not found "
+                    f"(available: {sorted(server_presets.keys()) or 'none'})"
+                )
+            return dict(server_presets[preset_name])
 
         if context.user is not None:
             role = getattr(context.user, "role", "user")

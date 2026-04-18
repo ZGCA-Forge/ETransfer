@@ -369,6 +369,11 @@ def upload(
         "--sink-config",
         help="Explicit sink config JSON (overrides server preset)",
     ),
+    sink_preset: Optional[str] = typer.Option(
+        None,
+        "--sink-preset",
+        help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
+    ),
 ) -> None:
     """Upload a file to the server (文件上传).
 
@@ -486,6 +491,7 @@ def upload(
                         "folderId": folder_id, "folderName": folder_name, "relativePath": rel,
                         **({"sink": sink} if sink else {}),
                         **({"sink_config": __import__("base64").b64encode(sink_config_json.encode()).decode()} if sink and sink_config_json else {}),
+                        **({"sink_preset": sink_preset} if sink and sink_preset and not sink_config_json else {}),
                     },
                 )
                 u.ensure_created()
@@ -527,6 +533,8 @@ def upload(
                 if sink_config_json:
                     import base64 as _b64
                     extra_meta["sink_config"] = _b64.b64encode(sink_config_json.encode()).decode()
+                elif sink_preset:
+                    extra_meta["sink_preset"] = sink_preset
             u = c.create_parallel_uploader(
                 str(file_path),
                 chunk_size=chunk_size,
@@ -2233,6 +2241,7 @@ def _submit_remote_download(
     output: Optional[str],
     sink: Optional[str],
     sink_config_json: Optional[str],
+    sink_preset: Optional[str] = None,
     retention: str,
     retention_ttl: Optional[int],
 ) -> dict:
@@ -2243,6 +2252,8 @@ def _submit_remote_download(
         body["sink_plugin"] = sink
     if sink_config_json:
         body["sink_config"] = json.loads(sink_config_json)
+    elif sink_preset:
+        body["sink_preset"] = sink_preset
     if retention_ttl is not None:
         body["retention_ttl"] = retention_ttl
     resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=60)
@@ -2265,6 +2276,10 @@ def remote_download(
     ),
     sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos). Omit = save to server"),
     sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
+    sink_preset: Optional[str] = typer.Option(
+        None, "--sink-preset",
+        help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
+    ),
     retention: str = typer.Option("download_once", "--retention", "-r", help="download_once / permanent / ttl"),
     retention_ttl: Optional[int] = typer.Option(None, "--retention-ttl", help="TTL seconds"),
     wait: bool = typer.Option(False, "--wait", "-w", help="Wait for task to complete and show progress"),
@@ -2330,6 +2345,7 @@ def remote_download(
                     output=None,  # per-URL rename not meaningful in batch
                     sink=sink,
                     sink_config_json=sink_config,
+                    sink_preset=sink_preset,
                     retention=retention,
                     retention_ttl=retention_ttl,
                 )
@@ -2372,6 +2388,7 @@ def remote_download(
             server, headers, url,
             output=output, sink=sink,
             sink_config_json=sink_config,
+            sink_preset=sink_preset,
             retention=retention,
             retention_ttl=retention_ttl,
         )
@@ -2458,6 +2475,7 @@ def _push_file_to_sink(
     file_id: str,
     sink_plugin: str,
     sink_config_str: Optional[str] = None,
+    sink_preset: Optional[str] = None,
 ) -> None:
     """Push an uploaded file to a sink plugin."""
     console.print()
@@ -2471,6 +2489,8 @@ def _push_file_to_sink(
     body: dict = {"sink_plugin": sink_plugin}
     if sink_config_str:
         body["sink_config"] = json.loads(sink_config_str)
+    elif sink_preset:
+        body["sink_preset"] = sink_preset
 
     try:
         resp = httpx.post(
@@ -2502,6 +2522,10 @@ def push(
     sink_config_arg: Optional[str] = typer.Option(
         None, "--sink-config", help="Sink config JSON (overrides preset)"
     ),
+    sink_preset: Optional[str] = typer.Option(
+        None, "--sink-preset",
+        help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
+    ),
 ) -> None:
     """Push an uploaded file to a sink (推送已上传文件).
 
@@ -2510,12 +2534,13 @@ def push(
 
     Examples:
         et push 6a9111db --sink tos
+        et push 6a9111db --sink tos --sink-preset bigdata
         et push 6a9111db --sink tos --sink-config '{"bucket":"my-bucket"}'
     """
     server = _get_server_url()
     token = token or _get_token()
     resolved_id = _resolve_file_id(file_id, server, token)
-    _push_file_to_sink(server, token, resolved_id, sink, sink_config_arg)
+    _push_file_to_sink(server, token, resolved_id, sink, sink_config_arg, sink_preset)
 
 
 # ─────────────────────────────────────────────────────────────

@@ -27,6 +27,7 @@ class TransferTask(BaseModel):
 
     sink_plugin: str = Field("", description="Sink plugin name (empty = local-only)")
     sink_config: dict = Field(default_factory=dict, description="Resolved sink configuration")
+    sink_preset: str = Field("", description="Named server-side preset; recorded for retry/audit")
 
     status: TaskStatus = Field(TaskStatus.PENDING, description="Current task status")
     progress: float = Field(0.0, description="Overall progress 0.0 – 1.0")
@@ -56,6 +57,9 @@ class TransferTask(BaseModel):
     sink_session_id: str = Field("", description="Sink multipart session ID")
     sink_result_url: str = Field("", description="Final URL after sink push")
     superseded_by: str = Field("", description="Task ID that replaced this one via retry")
+    # Parts already uploaded to the sink (persisted so we can resume across restart).
+    # Each item is {"part_number": int, "etag": str, "extra": dict}.
+    uploaded_parts: list[dict] = Field(default_factory=list, description="Persisted PartResult list for resume")
 
 
 class CreateTaskRequest(BaseModel):
@@ -65,6 +69,7 @@ class CreateTaskRequest(BaseModel):
     filename: str = Field("", description="Override filename (empty = auto-detect)")
     sink_plugin: str = Field("", description="Sink plugin name (empty = no push)")
     sink_config: dict = Field(default_factory=dict, description="Explicit sink config (overrides presets)")
+    sink_preset: str = Field("", description="Named server-side preset under sinks.presets.<sink>.<name>")
     retention: str = Field("download_once", description="download_once / permanent / ttl")
     retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
 

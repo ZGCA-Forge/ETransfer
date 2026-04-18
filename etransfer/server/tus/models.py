@@ -29,6 +29,7 @@ class TusMetadata(BaseModel):
     folder_name: str = Field("", description="Original folder name")
     sink: str = Field("", description="Sink plugin name for upload forwarding")
     sink_config: str = Field("", description="Base64-encoded JSON sink config")
+    sink_preset: str = Field("", description="Named server-side preset under sinks.presets.<sink>.<name>")
 
     @classmethod
     def from_header(cls, header_value: str) -> "TusMetadata":
@@ -72,6 +73,7 @@ class TusMetadata(BaseModel):
             folder_name=metadata.get("folderName") or metadata.get("folder_name", ""),
             sink=metadata.get("sink", ""),
             sink_config=metadata.get("sink_config", ""),
+            sink_preset=metadata.get("sink_preset", ""),
         )
 
     def to_header(self) -> str:
@@ -105,6 +107,9 @@ class TusMetadata(BaseModel):
 
         if self.sink_config:
             items.append(f"sink_config {base64.b64encode(self.sink_config.encode()).decode()}")
+
+        if self.sink_preset:
+            items.append(f"sink_preset {base64.b64encode(self.sink_preset.encode()).decode()}")
 
         return ",".join(items)
 

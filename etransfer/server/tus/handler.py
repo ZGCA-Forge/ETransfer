@@ -272,9 +272,14 @@ def create_tus_router(
                     except Exception:
                         sink_config_raw = None
 
+                cm: dict = {}
+                if sink_config_raw:
+                    cm["sink_config"] = sink_config_raw
+                if tus_metadata.sink_preset:
+                    cm["sink_preset"] = tus_metadata.sink_preset
                 ctx = SinkContext(
                     user=user,
-                    client_metadata={"sink_config": sink_config_raw} if sink_config_raw else {},
+                    client_metadata=cm,
                     retention=retention,
                     filename=tus_metadata.filename,
                     file_size=upload_length,

@@ -23,6 +23,7 @@ HOT_RELOADABLE_FIELDS = frozenset(
         "allow_permanent_retention",
         "advertised_endpoints",
         "max_storage_size",
+        "max_concurrent_tasks",
     }
 )
 
@@ -76,6 +77,17 @@ class ServerSettings(BaseSettings):
     default_retention_ttl: Optional[int] = Field(
         None,
         description="Global default TTL in seconds (for ttl retention). " "Env: ETRANSFER_DEFAULT_RETENTION_TTL",
+    )
+
+    # Concurrency cap for offline-download / sink-push tasks.
+    # Global, applies across all users. Hot-reloadable.
+    max_concurrent_tasks: int = Field(
+        50,
+        ge=1,
+        description="Maximum number of remote-download / sink-push tasks "
+        "running concurrently across the whole instance. Tasks above this "
+        "cap stay in PENDING state until a slot frees up. "
+        "Env: ETRANSFER_MAX_CONCURRENT_TASKS",
     )
 
     # Policy flag: whether non-privileged clients may request permanent retention.
@@ -317,6 +329,10 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
             d["token_retention_policies"] = rt["token_policies"]
         if "allow_permanent" in rt:
             d["allow_permanent_retention"] = bool(rt["allow_permanent"])
+    if "tasks" in config:
+        ts = config["tasks"]
+        if "max_concurrent" in ts:
+            d["max_concurrent_tasks"] = int(ts["max_concurrent"])
     if "user_system" in config:
         us = config["user_system"]
         if "enabled" in us:

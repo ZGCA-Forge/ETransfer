@@ -19,6 +19,7 @@ class ResolveConfigRequest(BaseModel):
     filename: str = ""
     file_size: int = 0
     sink_config: dict = {}
+    sink_preset: str = ""
 
 
 def create_plugins_router() -> APIRouter:
@@ -36,16 +37,21 @@ def create_plugins_router() -> APIRouter:
             d = s.to_dict()
             presets = sink_presets.get(d["name"], {})
             d["has_preset"] = bool(presets)
+            schema = plugin_registry.get_sink_class(d["name"]).get_config_schema()
+
+            def _safe_preview(cfg: dict) -> dict:
+                return {k: v for k, v in cfg.items() if not schema.get(k, {}).get("secret")}
+
             if presets:
-                schema = plugin_registry.get_sink_class(d["name"]).get_config_schema()
-                preview = {}
-                default_preset = presets.get("default", {})
-                for k, v in default_preset.items():
-                    field_def = schema.get(k, {})
-                    if field_def.get("secret"):
-                        continue
-                    preview[k] = v
-                d["preset_preview"] = preview
+                # Multi-preset metadata. The frontend uses this to render one
+                # entry per preset and to populate the CLI's --sink-preset arg.
+                d["presets"] = [
+                    {"name": name, "preview": _safe_preview(cfg)}
+                    for name, cfg in presets.items()
+                ]
+                # Back-compat: existing fields that older frontends rely on.
+                default_preset = presets.get("default") or next(iter(presets.values()))
+                d["preset_preview"] = _safe_preview(default_preset)
             results.append(d)
         return results
 
@@ -60,9 +66,14 @@ def create_plugins_router() -> APIRouter:
     @router.post("/sinks/{sink_name}/resolve-config")
     async def resolve_sink_config(sink_name: str, body: ResolveConfigRequest, request: Request) -> dict:
         user = getattr(request.state, "user", None)
+        cm: dict = {}
+        if body.sink_config:
+            cm["sink_config"] = body.sink_config
+        if body.sink_preset:
+            cm["sink_preset"] = body.sink_preset
         ctx = SinkContext(
             user=user,
-            client_metadata={"sink_config": body.sink_config} if body.sink_config else {},
+            client_metadata=cm,
             retention=body.retention,
             filename=body.filename,
             file_size=body.file_size,
@@ -71,7 +82,10 @@ def create_plugins_router() -> APIRouter:
         presets_for_sink = sink_presets.get(sink_name, {})
         try:
             config = plugin_registry.resolve_sink_config(sink_name, ctx, presets_for_sink)
-        except KeyError:
+        except KeyError as ke:
+            # Distinguish "unknown plugin" (404) from "unknown preset" (400)
+            if "preset" in str(ke).lower():
+                raise HTTPException(400, str(ke))
             raise HTTPException(404, f"Unknown sink: {sink_name}")
         schema = plugin_registry.get_sink_class(sink_name).get_config_schema()
         safe = {k: v for k, v in config.items() if not schema.get(k, {}).get("secret")}

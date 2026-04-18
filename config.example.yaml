@@ -42,6 +42,11 @@ retention:
   #     default_retention: ttl
   #     default_ttl: 3600
 
+# Task concurrency (offline downloads + sink pushes)
+# Hard global cap across all users. Hot-reloadable via /api/admin/reload-config.
+tasks:
+  max_concurrent: 50
+
 # Network
 network:
   interfaces: [] # Empty = auto-detect

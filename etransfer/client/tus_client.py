@@ -359,6 +359,7 @@ class EasyTransferClient(TusClient):
         source_url: str,
         sink: Optional[str] = None,
         sink_config: Optional[dict] = None,
+        sink_preset: Optional[str] = None,
         retention: str = "permanent",
         retention_ttl: Optional[int] = None,
     ) -> dict:
@@ -368,6 +369,8 @@ class EasyTransferClient(TusClient):
             body["sink_plugin"] = sink
         if sink_config:
             body["sink_config"] = sink_config
+        elif sink_preset:
+            body["sink_preset"] = sink_preset
         if retention_ttl is not None:
             body["retention_ttl"] = retention_ttl
         resp = self._http.post("/api/tasks", json=body)

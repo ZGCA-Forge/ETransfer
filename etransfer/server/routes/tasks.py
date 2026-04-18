@@ -83,12 +83,16 @@ def create_tasks_router() -> APIRouter:
                 source_url=body.source_url,
                 sink_plugin=body.sink_plugin,
                 sink_config=body.sink_config,
+                sink_preset=body.sink_preset,
                 retention=body.retention,
                 retention_ttl=body.retention_ttl,
                 owner_id=owner_id,
                 user=user,
                 filename=body.filename,
             )
+        except KeyError as e:
+            # e.g. unknown preset name from resolve_config
+            raise HTTPException(400, str(e))
         except ValueError as e:
             raise HTTPException(400, str(e))
         except Exception as e:
@@ -124,6 +128,7 @@ def create_tasks_router() -> APIRouter:
                     source_url=file_url,
                     sink_plugin=body.sink_plugin,
                     sink_config=body.sink_config,
+                    sink_preset=body.sink_preset,
                     retention=body.retention,
                     retention_ttl=body.retention_ttl,
                     owner_id=owner_id,
@@ -269,10 +274,12 @@ def create_tasks_router() -> APIRouter:
             source_url=old.source_url,
             sink_plugin=old.sink_plugin,
             sink_config=old.sink_config if old.sink_config else None,
+            sink_preset=old.sink_preset,
             retention=old.retention,
             retention_ttl=old.retention_ttl,
             owner_id=owner_id,
             user=user,
+            filename=old.filename,
         )
 
         # Mark ALL old tasks with same source_url that are failed/cancelled as superseded

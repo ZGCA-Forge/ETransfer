@@ -55,6 +55,14 @@ def create_info_router(
         if allow_permanent:
             policies.append("permanent")
 
+        # Live concurrency cap. Prefer the running TaskManager's value so a
+        # post-startup hot-reload (or programmatic resize) is reflected here.
+        task_mgr = getattr(request.app.state, "task_manager", None)
+        if task_mgr is not None and hasattr(task_mgr, "max_concurrent_tasks"):
+            max_concurrent = int(task_mgr.max_concurrent_tasks)
+        else:
+            max_concurrent = int(getattr(settings, "max_concurrent_tasks", 0) or 0)
+
         return ServerInfo(
             version=__version__,
             tus_version=TUS_VERSION,
@@ -66,6 +74,7 @@ def create_info_router(
             total_size=total_size,
             retention_policies=policies,
             default_retention=default_retention,
+            max_concurrent_tasks=max_concurrent,
         )
 
     @router.get("/health")

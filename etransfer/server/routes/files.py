@@ -705,16 +705,21 @@ def create_files_router(storage: TusStorage) -> APIRouter:
         user = getattr(request.state, "user", None)
         owner_id = getattr(user, "id", None) if user else None
         sink_config = body.get("sink_config")
+        sink_preset = body.get("sink_preset", "")
 
-        task = await mgr.push_file(
-            file_path=file_path,
-            filename=filename,
-            file_size=file_size,
-            sink_plugin=sink_plugin,
-            sink_config=sink_config,
-            owner_id=owner_id,
-            user=user,
-        )
+        try:
+            task = await mgr.push_file(
+                file_path=file_path,
+                filename=filename,
+                file_size=file_size,
+                sink_plugin=sink_plugin,
+                sink_config=sink_config,
+                sink_preset=sink_preset,
+                owner_id=owner_id,
+                user=user,
+            )
+        except KeyError as e:
+            raise HTTPException(400, str(e))
         return {"task_id": task.task_id, "status": task.status.value}
 
     return router

@@ -24,9 +24,76 @@ logger = logging.getLogger("etransfer.server.tasks")
 
 _STATE_PREFIX = "et:task:"
 _CHUNK_SIZE = 128 * 1024 * 1024  # 128 MB — larger chunks reduce multipart overhead
-_MAX_CONCURRENT_DOWNLOADS = 5
+_DEFAULT_MAX_CONCURRENT_TASKS = 50
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = (5, 15, 30)  # seconds between retries
+
+
+class _RangeNotSupportedError(Exception):
+    """Internal signal: the source ignored our Range header, restart fresh."""
+    pass
+
+
+class _DynamicTaskGate:
+    """Async concurrency gate whose limit can be changed at runtime.
+
+    A plain ``asyncio.Semaphore`` cannot be safely resized while waiters are
+    parked on it.  We instead hand out slots based on an integer ``limit``
+    that is consulted on every acquire/release through a Condition.
+    Increasing the limit immediately wakes parked waiters; decreasing it
+    only blocks future acquires (in-flight tasks finish naturally and then
+    the new lower cap takes effect).
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = max(1, int(limit))
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            await self._cond.wait_for(lambda: self._active < self._limit)
+            self._active += 1
+
+    async def release(self) -> None:
+        async with self._cond:
+            if self._active > 0:
+                self._active -= 1
+            self._cond.notify_all()
+
+    async def __aenter__(self) -> "_DynamicTaskGate":
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.release()
+
+    def set_limit(self, new_limit: int) -> None:
+        new_limit = max(1, int(new_limit))
+        if new_limit == self._limit:
+            return
+        old = self._limit
+        self._limit = new_limit
+        if new_limit > old:
+            # Wake parked waiters so they can re-check the new cap.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+
+            async def _notify() -> None:
+                async with self._cond:
+                    self._cond.notify_all()
+
+            loop.create_task(_notify())
 
 
 class TaskManager:
@@ -47,6 +114,7 @@ class TaskManager:
         registry: Optional[PluginRegistry] = None,
         download_dir: Optional[Path] = None,
         sink_presets: Optional[dict] = None,
+        max_concurrent_tasks: int = _DEFAULT_MAX_CONCURRENT_TASKS,
     ) -> None:
         self._state = state_manager
         self._storage = storage
@@ -60,7 +128,18 @@ class TaskManager:
         self._prev_push: dict[str, int] = {}
         self._prev_time: dict[str, datetime] = {}
         self._shutting_down = False
-        self._download_sem = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+        self._task_gate = _DynamicTaskGate(max_concurrent_tasks)
+
+    # ── Concurrency control ───────────────────────────────────
+
+    @property
+    def max_concurrent_tasks(self) -> int:
+        return self._task_gate.limit
+
+    def set_max_concurrent_tasks(self, limit: int) -> None:
+        """Update the global task concurrency cap on the fly."""
+        self._task_gate.set_limit(limit)
+        logger.info("Task concurrency cap set to %d (active=%d)", self._task_gate.limit, self._task_gate.active)
 
     # ── Persistence helpers ───────────────────────────────────
 
@@ -140,6 +219,7 @@ class TaskManager:
         source_url: str,
         sink_plugin: str = "",
         sink_config: Optional[dict] = None,
+        sink_preset: str = "",
         retention: str = "download_once",
         retention_ttl: int = 0,
         owner_id: Optional[int] = None,
@@ -150,9 +230,14 @@ class TaskManager:
 
         resolved_sink_config: dict = {}
         if sink_plugin:
+            cm: dict = {}
+            if sink_config:
+                cm["sink_config"] = sink_config
+            if sink_preset:
+                cm["sink_preset"] = sink_preset
             ctx = SinkContext(
                 user=user,
-                client_metadata={"sink_config": sink_config} if sink_config else {},
+                client_metadata=cm,
                 retention=retention,
                 filename=filename,
                 file_size=None,
@@ -166,6 +251,7 @@ class TaskManager:
             source_plugin=source.name,
             sink_plugin=sink_plugin,
             sink_config=resolved_sink_config,
+            sink_preset=sink_preset,
             retention=retention,
             retention_ttl=retention_ttl,
             owner_id=owner_id,
@@ -299,6 +385,13 @@ class TaskManager:
         signature, which missed tasks left behind by hard-kill / OOM / crash
         scenarios where ``shutdown()`` never had the chance to rewrite their
         status.
+
+        Resume semantics (sink / stream-to-sink tasks):
+            ``downloaded_bytes``, ``pushed_parts``, ``sink_session_id`` and
+            ``uploaded_parts`` are **preserved** so the pipeline can continue
+            the in-flight multipart upload where it left off instead of
+            re-downloading from zero.  Only transient fields (error, speeds)
+            are cleared.
         """
         all_tasks = await self.list_tasks()
         zombie_states = {TaskStatus.PENDING, TaskStatus.DOWNLOADING, TaskStatus.PUSHING}
@@ -308,16 +401,10 @@ class TaskManager:
 
         for task in zombies:
             task.status = TaskStatus.PENDING
-            task.progress = 0.0
-            task.download_progress = 0.0
-            task.push_progress = 0.0
-            task.downloaded_bytes = 0
-            task.pushed_parts = 0
             task.error = ""
             task.speed = 0.0
             task.download_speed = 0.0
             task.push_speed = 0.0
-            task.sink_session_id = ""
             await self._save(task)
             bg = asyncio.create_task(self._run_pipeline(task))
             self._running[task.task_id] = bg
@@ -332,14 +419,20 @@ class TaskManager:
         file_size: int,
         sink_plugin: str,
         sink_config: Optional[dict] = None,
+        sink_preset: str = "",
         owner_id: Optional[int] = None,
         user: Any = None,
     ) -> TransferTask:
         """Push an already-uploaded local file to a sink."""
         resolved_sink_config: dict = {}
+        cm: dict = {}
+        if sink_config:
+            cm["sink_config"] = sink_config
+        if sink_preset:
+            cm["sink_preset"] = sink_preset
         ctx = SinkContext(
             user=user,
-            client_metadata={"sink_config": sink_config} if sink_config else {},
+            client_metadata=cm,
             retention="permanent",
             filename=filename,
             file_size=file_size,
@@ -353,6 +446,7 @@ class TaskManager:
             source_plugin="upload",
             sink_plugin=sink_plugin,
             sink_config=resolved_sink_config,
+            sink_preset=sink_preset,
             filename=filename,
             file_size=file_size,
             owner_id=owner_id,
@@ -368,7 +462,7 @@ class TaskManager:
 
     async def _run_pipeline(self, task: TransferTask) -> None:
         try:
-            async with self._download_sem:
+            async with self._task_gate:
                 if task.sink_plugin:
                     await self._pipeline_stream_to_sink(task)
                 else:
@@ -485,6 +579,13 @@ class TaskManager:
 
         Memory usage: ~1 chunk buffer (_CHUNK_SIZE, default 32 MB).
         Disk usage: zero.
+
+        Resume: if ``task.sink_session_id`` and ``task.pushed_parts > 0`` are
+        set (e.g. restored by :meth:`resume_interrupted`), the pipeline tries
+        to continue the existing multipart upload at part
+        ``pushed_parts + 1`` using a ranged source GET starting at
+        ``pushed_parts * _CHUNK_SIZE``.  If the source rejects the Range, we
+        abort the stale session and fall back to a fresh upload.
         """
         source = self._registry.get_source(task.source_plugin)
         sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
@@ -499,7 +600,7 @@ class TaskManager:
             task.file_size = info.size
         await self._save(task)
 
-        total_size = info.size or 0
+        total_size = info.size or task.file_size or 0
         total_parts = math.ceil(total_size / _CHUNK_SIZE) if total_size else 0
 
         # Resolve the actual download URL (handle GDrive confirm, HF blob→resolve)
@@ -508,26 +609,82 @@ class TaskManager:
             label=f"resolve_url({task.task_id[:8]})",
         )
 
-        # Initialize sink multipart
-        _user = getattr(task, "_user", None)
-        sink_key = derive_sink_object_key(task.filename or task.task_id, _user)
-        session_id = await sink.initialize_upload(
-            sink_key, {"task_id": task.task_id}
-        )
-        task.sink_session_id = session_id
-        task.status = TaskStatus.PUSHING
-        await self._save(task)
-
-        logger.info(
-            "Streaming %s -> sink '%s' (session %s, ~%d parts)",
-            task.source_url[:60], task.sink_plugin, session_id[:12],
-            total_parts or -1,
-        )
-
+        # ── Decide: fresh start or resume ─────────────────────────
+        resume_possible = bool(task.sink_session_id) and task.pushed_parts > 0
         parts: list[PartResult] = []
         part_num = 0
-        buf = bytearray()
         downloaded = 0
+        resume_offset = 0
+
+        if resume_possible:
+            try:
+                parts = [PartResult(**p) for p in task.uploaded_parts]
+            except Exception:
+                parts = []
+            if len(parts) == task.pushed_parts:
+                session_id = task.sink_session_id
+                part_num = task.pushed_parts
+                resume_offset = part_num * _CHUNK_SIZE
+                downloaded = resume_offset
+                logger.info(
+                    "Resuming stream %s -> sink '%s' (session %s, from byte %d / part %d)",
+                    task.source_url[:60], task.sink_plugin, session_id[:12],
+                    resume_offset, part_num,
+                )
+                task.status = TaskStatus.PUSHING
+                await self._save(task)
+
+                # Fast-path: everything already uploaded, just needs to be
+                # committed on the sink side.
+                if total_size and downloaded >= total_size:
+                    result_url = await sink.complete_upload(session_id, parts)
+                    task.sink_result_url = result_url
+                    task.file_size = total_size
+                    task.progress = 1.0
+                    task.download_progress = 1.0
+                    task.push_progress = 1.0
+                    task.uploaded_parts = []  # freed after completion
+                    await self._save(task)
+                    logger.info(
+                        "Resume completed (all parts pre-uploaded): %s -> %s",
+                        task.filename, result_url[:80] if result_url else "?",
+                    )
+                    return
+            else:
+                # Persisted parts list is inconsistent with counter — safer to
+                # abandon the old session and re-upload.
+                logger.warning(
+                    "Task %s has pushed_parts=%d but %d persisted parts — restarting",
+                    task.task_id[:8], task.pushed_parts, len(parts),
+                )
+                try:
+                    await sink.abort_upload(task.sink_session_id)
+                except Exception:
+                    pass
+                resume_possible = False
+                parts = []
+                task.sink_session_id = ""
+                task.uploaded_parts = []
+                task.pushed_parts = 0
+                task.downloaded_bytes = 0
+
+        if not resume_possible:
+            _user = getattr(task, "_user", None)
+            sink_key = derive_sink_object_key(task.filename or task.task_id, _user)
+            session_id = await sink.initialize_upload(sink_key, {"task_id": task.task_id})
+            task.sink_session_id = session_id
+            task.uploaded_parts = []
+            task.pushed_parts = 0
+            task.downloaded_bytes = 0
+            task.status = TaskStatus.PUSHING
+            await self._save(task)
+            logger.info(
+                "Streaming %s -> sink '%s' (session %s, ~%d parts)",
+                task.source_url[:60], task.sink_plugin, session_id[:12],
+                total_parts or -1,
+            )
+
+        buf = bytearray()
 
         # Google Drive requires a browser-like User-Agent, otherwise it
         # returns a small HTML error page instead of the actual file.
@@ -538,6 +695,8 @@ class TaskManager:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/39.0.2171.95 Safari/537.36"
             )
+        if resume_offset > 0:
+            stream_headers["Range"] = f"bytes={resume_offset}-"
 
         try:
             async with httpx.AsyncClient(
@@ -545,6 +704,24 @@ class TaskManager:
                 cookies=dl_cookies or None, headers=stream_headers or None,
             ) as client:
                 async with client.stream("GET", dl_url) as resp:
+                    # Detect source ignoring our Range header: status 200 + full length
+                    # means resume failed. Abort stale session, restart from zero.
+                    if resume_offset > 0 and resp.status_code == 200:
+                        logger.warning(
+                            "Task %s: source ignored Range (got 200), restarting from scratch",
+                            task.task_id[:8],
+                        )
+                        await resp.aclose()
+                        try:
+                            await sink.abort_upload(session_id)
+                        except Exception:
+                            pass
+                        task.sink_session_id = ""
+                        task.uploaded_parts = []
+                        task.pushed_parts = 0
+                        task.downloaded_bytes = 0
+                        await self._save(task)
+                        raise _RangeNotSupportedError()
                     resp.raise_for_status()
 
                     # Update filename from Content-Disposition if available
@@ -555,14 +732,17 @@ class TaskManager:
                             if p.startswith("filename="):
                                 task.filename = p[len("filename="):].strip().strip('"')
 
-                    if not total_size:
+                    # Only trust Content-Length for total size on a *fresh*
+                    # (non-Range) request.  For 206 responses Content-Length
+                    # is the remaining bytes, which would corrupt total_size.
+                    if not total_size and resume_offset == 0:
                         cl = resp.headers.get("content-length")
                         if cl:
                             total_size = int(cl)
                             task.file_size = total_size
                             total_parts = math.ceil(total_size / _CHUNK_SIZE)
 
-                    _last_save = 0
+                    _last_save = downloaded
                     async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                         buf.extend(chunk)
                         downloaded += len(chunk)
@@ -589,6 +769,7 @@ class TaskManager:
                                 task.push_speed = len(data) / push_elapsed
                             parts.append(result)
                             task.pushed_parts = part_num
+                            task.uploaded_parts = [p.model_dump() for p in parts]
 
                             if total_size > 0:
                                 task.download_progress = downloaded / total_size
@@ -612,6 +793,7 @@ class TaskManager:
                         task.push_speed = len(final_data) / push_elapsed
                     parts.append(result)
                     task.pushed_parts = part_num
+                    task.uploaded_parts = [p.model_dump() for p in parts]
                     buf.clear()
 
             result_url = await sink.complete_upload(session_id, parts)
@@ -620,6 +802,7 @@ class TaskManager:
             task.progress = 1.0
             task.download_progress = 1.0
             task.push_progress = 1.0
+            task.uploaded_parts = []  # freed after successful completion
             await self._save(task)
 
             logger.info(
@@ -628,12 +811,22 @@ class TaskManager:
                 part_num, downloaded,
             )
 
+        except _RangeNotSupportedError:
+            # Source cannot resume — session already aborted and state cleared.
+            # Restart the pipeline so it creates a fresh session.
+            return await self._pipeline_stream_to_sink(task)
+        except asyncio.CancelledError:
+            # Cancelled (shutdown or user cancel): keep the sink session alive
+            # so we can resume on restart. The caller's handler decides status.
+            raise
         except Exception:
-            # Abort sink upload on failure
+            # Real failure: abort sink upload so we do not leak parts.
             try:
                 await sink.abort_upload(session_id)
             except Exception:
                 logger.debug("Failed to abort sink session %s", session_id[:12])
+            task.sink_session_id = ""
+            task.uploaded_parts = []
             raise
 
     async def _retry(self, fn, *args, label: str = "", **kwargs):

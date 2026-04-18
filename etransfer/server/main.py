@@ -100,6 +100,11 @@ def _propagate_hot_changes(
     if "max_storage_size" in changes and _storage:
         _storage.max_storage_size = settings.max_storage_size
 
+    if "max_concurrent_tasks" in changes:
+        task_mgr = getattr(app.state, "task_manager", None)
+        if task_mgr is not None:
+            task_mgr.set_max_concurrent_tasks(settings.max_concurrent_tasks)
+
     if "role_quotas" in changes:
         from etransfer.server.auth.models import RoleQuota
 
@@ -390,8 +395,10 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             registry=plugin_registry,
             download_dir=settings.storage_path / "downloads",
             sink_presets=sink_presets,
+            max_concurrent_tasks=settings.max_concurrent_tasks,
         )
         app.state.task_manager = _task_manager
+        logger.info("Task concurrency cap: %d", _task_manager.max_concurrent_tasks)
 
         # Resume interrupted tasks from previous shutdown
         resumed = await _task_manager.resume_interrupted()
