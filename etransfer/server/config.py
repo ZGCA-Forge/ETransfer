@@ -161,7 +161,12 @@ class ServerSettings(BaseSettings):
         description="OIDC callback URL prefix (scheme + host, no path). "
         "The fixed path /api/users/callback is appended automatically. "
         "Env: ETRANSFER_OIDC_CALLBACK_URL. "
-        "Example: http://localhost:8765",
+        "When empty, login routes derive the callback from the incoming request host. "
+        "Example: https://transfer.example.com",
+    )
+    dingtalk_corp_id: str = Field(
+        "",
+        description="DingTalk corpId for in-app SSO. Env: ETRANSFER_DINGTALK_CORP_ID",
     )
     oidc_scope: str = Field(
         "openid profile email",
@@ -349,6 +354,8 @@ def _parse_yaml_to_settings_dict(config: dict) -> dict:
             d["oidc_client_secret"] = oidc["client_secret"]
         if "callback_url" in oidc:
             d["oidc_callback_url"] = oidc["callback_url"]
+        if "corp_id" in oidc:
+            d["dingtalk_corp_id"] = oidc["corp_id"]
         if "scope" in oidc:
             d["oidc_scope"] = oidc["scope"]
         db = us.get("database", {})

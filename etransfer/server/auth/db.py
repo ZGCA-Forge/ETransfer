@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import Result
+from sqlalchemy import Result, delete
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlmodel import SQLModel, select
 
@@ -369,7 +369,10 @@ class UserDB:
                 return None
 
             if sess.expires_at and sess.expires_at < datetime.utcnow():  # type: ignore[operator]
-                await session.delete(sess)
+                # Multiple expired requests for the same browser session can
+                # race here. Make cleanup idempotent so stale tokens behave as
+                # unauthenticated instead of surfacing a 500.
+                await session.execute(delete(SessionTable).where(SessionTable.token == token))
                 await session.commit()
                 return None
 

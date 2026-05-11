@@ -37,6 +37,7 @@ class OIDCProvider:
         callback_url: str,
         scope: str = "openid profile email",
         provider: str = "oidc",
+        corp_id: str = "",
         authorize_endpoint: Optional[str] = None,
         token_endpoint: Optional[str] = None,
         userinfo_endpoint: Optional[str] = None,
@@ -48,6 +49,7 @@ class OIDCProvider:
         self.callback_url = callback_url
         self.scope = scope
         self.provider = provider
+        self.corp_id = corp_id
 
         self._authorize_endpoint = authorize_endpoint
         self._token_endpoint = token_endpoint
@@ -191,10 +193,10 @@ class OIDCProvider:
                 "_jwt_claims": user_claims,
             }
 
-    async def get_user_info(self, access_token: str) -> dict:
+    async def get_user_info(self, access_token: str, jwt_claims: Optional[dict] = None) -> dict:
         """Fetch user profile from userinfo endpoint."""
         if self.is_dingtalk:
-            return await self._dingtalk_get_user_info(access_token)
+            return await self._dingtalk_get_user_info(access_token, jwt_claims=jwt_claims)
 
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -207,7 +209,7 @@ class OIDCProvider:
             resp.raise_for_status()
             return resp.json()  # type: ignore[no-any-return]
 
-    async def _dingtalk_get_user_info(self, access_token: str) -> dict:
+    async def _dingtalk_get_user_info(self, access_token: str, jwt_claims: Optional[dict] = None) -> dict:
         """DingTalk user info.
 
         Tries /v1.0/contact/users/me first. If 403 (missing permission),
@@ -227,8 +229,8 @@ class OIDCProvider:
             )
 
         # Fallback: use JWT claims from the access token
-        if hasattr(self, "_jwt_claims") and self._jwt_claims:
-            claims = self._jwt_claims
+        if jwt_claims:
+            claims = jwt_claims
             return {
                 "openId": claims.get("openId", claims.get("sub", "")),
                 "unionId": claims.get("unionId", ""),
@@ -244,6 +246,7 @@ class OIDCProvider:
             "issuer": self.issuer_url,
             "authorize_url": self.authorize_endpoint,
             "client_id": self.client_id,
+            "corp_id": self.corp_id,
             "callback_url": self.callback_url,
             "scope": self.scope,
             "end_session_url": self.end_session_endpoint,

@@ -82,19 +82,21 @@ class BaseSink(ABC):
     def resolve_config(cls, context: SinkContext, server_presets: dict) -> dict:
         """Dynamically resolve sink configuration from context.
 
-        Priority:
-          1. Client explicitly provided ``sink_config`` in metadata.
-          2. Client explicitly named a preset via ``sink_preset`` metadata
+        Base config priority:
+          1. Client explicitly named a preset via ``sink_preset`` metadata
              (must exist in *server_presets*; otherwise raises ``KeyError``).
-          3. User's group-level preset in *server_presets*.
-          4. User's role-level preset.
-          5. Global ``"default"`` preset.
+          2. User's group-level preset in *server_presets*.
+          3. User's role-level preset.
+          4. Global ``"default"`` preset.
+
+        Client-provided ``sink_config`` is then merged on top so callers can
+        override just one or two fields (for example bucket or prefix) without
+        repeating credentials.
 
         Subclasses may override for custom logic.
         """
         explicit = context.client_metadata.get("sink_config")
-        if explicit and isinstance(explicit, dict):
-            return explicit
+        base: dict = {}
 
         preset_name = context.client_metadata.get("sink_preset")
         if preset_name:
@@ -102,14 +104,19 @@ class BaseSink(ABC):
                 raise KeyError(
                     f"sink preset '{preset_name}' not found " f"(available: {sorted(server_presets.keys()) or 'none'})"
                 )
-            return dict(server_presets[preset_name])
-
-        if context.user is not None:
+            base = dict(server_presets[preset_name])
+        elif context.user is not None:
             role = getattr(context.user, "role", "user")
             group = getattr(context.user, "group", None)
             if group and group in server_presets:
-                return dict(server_presets[group])
-            if role in server_presets:
-                return dict(server_presets[role])
+                base = dict(server_presets[group])
+            elif role in server_presets:
+                base = dict(server_presets[role])
+            else:
+                base = dict(server_presets.get("default", {}))
+        else:
+            base = dict(server_presets.get("default", {}))
 
-        return dict(server_presets.get("default", {}))
+        if explicit and isinstance(explicit, dict):
+            base.update(explicit)
+        return base

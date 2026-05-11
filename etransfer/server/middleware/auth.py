@@ -2,6 +2,7 @@
 
 import logging
 import time
+from datetime import datetime
 from typing import Any, Callable, Optional
 
 from fastapi import Request
@@ -35,6 +36,10 @@ class _SessionCache:
             return None
         ts, session, user = entry
         if time.monotonic() - ts > self._ttl:
+            del self._store[token]
+            return None
+        expires_at = getattr(session, "expires_at", None)
+        if expires_at is not None and expires_at < datetime.utcnow():
             del self._store[token]
             return None
         return session, user

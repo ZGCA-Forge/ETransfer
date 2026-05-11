@@ -69,7 +69,7 @@ state:
 auth:
   enabled: true
   tokens:
-    - "your-api-token-here"
+    - "<api-token>"
 
 retention:
   default: download_once # permanent / download_once / ttl
@@ -87,8 +87,8 @@ network:
 user_system:
   enabled: false
   oidc:
-    issuer_url: "https://your-oidc-provider.example.com"
-    client_id: "your-client-id"
+    issuer_url: "https://oidc.example.com"
+    client_id: "<client-id>"
     client_secret: "" # 建议用环境变量 ETRANSFER_OIDC_CLIENT_SECRET
     callback_url: "" # 公网 URL 前缀，如 https://transfer.example.com
     scope: "openid profile email"
@@ -178,10 +178,10 @@ my_sink = "myorg.sinks:MySink"
 sink_presets:
   tos:
     default:
-      endpoint: tos-cn-beijing.volces.com
-      bucket: my-team-default
+      endpoint: "<object-storage-endpoint>"
+      bucket: "<default-bucket>"
     admin:
-      bucket: my-team-archive
+      bucket: "<admin-bucket>"
 ```
 
 ## 存储配额

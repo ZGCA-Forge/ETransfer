@@ -25,7 +25,31 @@ from etransfer.server.config import (
     _parse_yaml_to_settings_dict,
     reload_hot_settings,
 )
-from etransfer.server.tasks.manager import _DynamicTaskGate
+from etransfer.server.tasks.manager import (
+    _SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
+    _SHUTDOWN_INTERRUPTED_ERROR,
+    _DynamicTaskGate,
+    TaskManager,
+)
+from etransfer.server.tasks.models import TaskStatus, TransferTask
+
+
+class _DictState:
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+
+    async def set(self, key: str, value: str) -> None:
+        self.data[key] = value
+
+    async def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    async def keys(self, pattern: str) -> list[str]:
+        prefix = pattern.rstrip("*")
+        return [key for key in self.data if key.startswith(prefix)]
+
+    async def delete(self, key: str) -> None:
+        self.data.pop(key, None)
 
 # ── Gate behaviour ──────────────────────────────────────────────
 
@@ -140,3 +164,34 @@ def test_max_concurrent_tasks_is_hot_reloadable(tmp_path: Path) -> None:
 def test_info_endpoint_exposes_max_concurrent(memory_server: dict) -> None:
     body = httpx.get(f"{memory_server['url']}/api/info", timeout=5).json()
     assert body["max_concurrent_tasks"] == memory_server["settings"].max_concurrent_tasks
+
+
+@pytest.mark.asyncio
+async def test_task_shutdown_waits_and_marks_active_task_pending() -> None:
+    manager = TaskManager(state_manager=_DictState(), storage=None)
+    task = TransferTask(
+        task_id="task-shutdown",
+        source_url="https://example.test/file.bin",
+        source_plugin="direct",
+        status=TaskStatus.PUSHING,
+        filename="file.bin",
+        file_size=100,
+        downloaded_bytes=50,
+        pushed_parts=2,
+        progress=0.5,
+    )
+    manager._tasks[task.task_id] = task
+
+    async def worker() -> None:
+        while not manager._shutting_down:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
+
+    manager._running[task.task_id] = asyncio.create_task(worker())
+
+    count = await manager.shutdown()
+
+    assert count == 1
+    assert task.status == TaskStatus.PENDING
+    assert task.error == _SHUTDOWN_INTERRUPTED_ERROR
+    assert _SHUTDOWN_DRAIN_TIMEOUT_SECONDS >= 10 * 60

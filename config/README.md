@@ -107,9 +107,9 @@ user_system:
   enabled: true
 
   oidc:
-    issuer_url: "https://your-oidc-provider.example.com"
-    client_id: "your-client-id"
-    client_secret: "your-client-secret" # 敏感！建议用环境变量
+    issuer_url: "https://oidc.example.com"
+    client_id: "<client-id>"
+    client_secret: "<client-secret>" # 敏感！建议用环境变量
     callback_url: "" # 留空 = 自动从请求推导（推荐）
     scope: "openid profile email"
 ```
@@ -117,7 +117,7 @@ user_system:
 > **安全提示**: `client_secret` 建议通过环境变量传入，而非写在配置文件中：
 >
 > ```bash
-> export ETRANSFER_OIDC_CLIENT_SECRET="your-client-secret"
+> export ETRANSFER_OIDC_CLIENT_SECRET="<client-secret>"
 > ```
 
 > **callback_url 说明**:

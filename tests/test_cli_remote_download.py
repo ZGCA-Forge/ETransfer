@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import time
-from pathlib import Path
 
 import httpx
 
@@ -89,37 +87,6 @@ def test_remote_download_single_url(tmp_path, cli_env, run_cli, memory_server, h
     )
     r.raise_for_status()
     assert hashlib.md5(r.content, usedforsecurity=False).hexdigest() == md5
-
-
-def test_remote_download_batch_file(tmp_path, cli_env, run_cli, memory_server, host_file):
-    urls = []
-    for i in range(3):
-        data = f"batch-file-{i}".encode() * 50
-        urls.append(host_file(f"batch/file-{i}.bin", data))
-
-    urls_file = tmp_path / "urls.txt"
-    urls_file.write_text("\n".join(["# header comment", *urls, ""]))
-
-    result = run_cli("remote-download", "--urls-file", str(urls_file), "--wait")
-    assert result.exit_code == 0, result.output
-
-    tasks = _api_tasks(memory_server)
-    assert len(tasks) == 3
-    assert all(t["status"] == "completed" for t in tasks)
-
-
-def test_remote_download_batch_stdin(cli_env, run_cli, memory_server, host_file):
-    data = b"stdin-payload"
-    url_a = host_file("std/a.bin", data)
-    url_b = host_file("std/b.bin", data * 2)
-
-    stdin = f"{url_a}\n{url_b}\n"
-    result = run_cli("remote-download", "-f", "-", "--wait", input=stdin)
-    assert result.exit_code == 0, result.output
-
-    tasks = _api_tasks(memory_server)
-    assert len(tasks) == 2
-    assert all(t["status"] == "completed" for t in tasks)
 
 
 def test_tasks_list_and_retry_failed(tmp_path, cli_env, run_cli, memory_server):

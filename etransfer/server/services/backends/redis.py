@@ -1,6 +1,7 @@
 """Redis state storage backend."""
 
 import logging
+import os
 from typing import Optional
 
 from etransfer.server.services.backends.interface import StateBackend
@@ -53,16 +54,31 @@ class RedisStateBackend(StateBackend):
 
     async def connect(self) -> None:
         """Connect to Redis."""
-        self._pool = redis.ConnectionPool.from_url(
+        max_connections = int(os.getenv("ETRANSFER_REDIS_MAX_CONNECTIONS", "512"))
+        blocking_timeout = float(os.getenv("ETRANSFER_REDIS_BLOCKING_TIMEOUT", "10"))
+        pool_cls = getattr(redis, "BlockingConnectionPool", redis.ConnectionPool)
+        pool_kwargs = {
+            "decode_responses": True,
+            "max_connections": max_connections,
+        }
+        if pool_cls is not redis.ConnectionPool:
+            pool_kwargs["timeout"] = blocking_timeout
+
+        self._pool = pool_cls.from_url(
             self.redis_url,
-            decode_responses=True,
-            max_connections=20,
+            **pool_kwargs,
         )
         self._client = redis.Redis(connection_pool=self._pool)
 
         # Test connection
         await self._client.ping()  # type: ignore[misc]
-        logger.info("%s: Connected to %s", self.name, self.redis_url)
+        logger.info(
+            "%s: Connected to %s (max_connections=%d blocking_timeout=%.1fs)",
+            self.name,
+            self.redis_url,
+            max_connections,
+            blocking_timeout,
+        )
 
     async def disconnect(self) -> None:
         """Disconnect from Redis."""

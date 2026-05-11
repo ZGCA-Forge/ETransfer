@@ -97,8 +97,19 @@ async def download(
                 except (IndexError, ValueError):
                     pass
 
-    await _read_output()
-    retcode = await proc.wait()
+    try:
+        await _read_output()
+        retcode = await proc.wait()
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            logger.info("Stopping aria2c download for graceful shutdown")
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        raise
 
     if retcode != 0:
         raise RuntimeError(f"aria2c exited with code {retcode}")

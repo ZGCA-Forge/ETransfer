@@ -7,7 +7,7 @@ import threading
 import time
 from datetime import datetime as _dt
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import typer
@@ -159,6 +159,70 @@ def print_error(message: str) -> None:
 def print_info(message: str) -> None:
     """Print info message."""
     console.print(f"[bold blue]ℹ[/bold blue] {message}")
+
+
+def _coerce_sink_param_value(value: str) -> Any:
+    text = value.strip()
+    lowered = text.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none"}:
+        return None
+    return text
+
+
+def _load_sink_config_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise ValueError(f"Sink config file not found: {path}")
+    raw = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        import yaml
+
+        data = yaml.safe_load(raw) or {}
+    else:
+        data = json.loads(raw or "{}")
+    if not isinstance(data, dict):
+        raise ValueError("Sink config file must contain an object/map")
+    return dict(data)
+
+
+def _build_sink_config(
+    sink_config_json: Optional[str] = None,
+    sink_config_file: Optional[Path] = None,
+    sink_params: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Merge explicit sink config sources.
+
+    Precedence: --sink-config JSON < --sink-config-file < repeated
+    --sink-param key=value.  The server then merges this dict over the selected
+    preset, so users can override only bucket/prefix/etc instead of repeating
+    every credential.
+    """
+
+    config: dict[str, Any] = {}
+    if sink_config_json:
+        parsed = json.loads(sink_config_json)
+        if not isinstance(parsed, dict):
+            raise ValueError("--sink-config must be a JSON object")
+        config.update(parsed)
+    if sink_config_file:
+        config.update(_load_sink_config_file(sink_config_file))
+    for item in sink_params or []:
+        if "=" not in item:
+            raise ValueError(f"--sink-param must be KEY=VALUE, got: {item}")
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"--sink-param key is empty: {item}")
+        config[key] = _coerce_sink_param_value(value)
+    return config
+
+
+def _sink_config_metadata(config: dict[str, Any]) -> str:
+    import base64 as _b64
+
+    payload = json.dumps(config, separators=(",", ":"), ensure_ascii=False)
+    return _b64.b64encode(payload.encode()).decode()
 
 
 def print_warning(message: str) -> None:
@@ -362,17 +426,27 @@ def upload(
     sink: Optional[str] = typer.Option(
         None,
         "--sink",
-        help="After upload, push file to this sink (e.g. tos). Uses server preset if no --sink-config",
+        help="After upload, push file to this sink (e.g. tos/zos). Uses server preset plus config overrides",
     ),
     sink_config_json: Optional[str] = typer.Option(
         None,
         "--sink-config",
-        help="Explicit sink config JSON (overrides server preset)",
+        help="Sink config JSON merged over server preset",
+    ),
+    sink_config_file: Optional[Path] = typer.Option(
+        None,
+        "--sink-config-file",
+        help="Sink config file (JSON/YAML) merged over server preset",
+    ),
+    sink_param: Optional[list[str]] = typer.Option(
+        None,
+        "--sink-param",
+        help="Sink config override KEY=VALUE; can be repeated",
     ),
     sink_preset: Optional[str] = typer.Option(
         None,
         "--sink-preset",
-        help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
+        help="Pick a named preset (sinks.presets.<sink>.<name>)",
     ),
 ) -> None:
     """Upload a file to the server (文件上传).
@@ -392,6 +466,9 @@ def upload(
         console.print("  -c, --chunk-size INT     Chunk size in bytes [default: 10MB]")
         console.print("  -j, --threads INT        Parallel upload threads [default: 4]")
         console.print("  -t, --token TEXT         API token (overrides saved session)")
+        console.print("      --sink-config JSON   Sink config JSON merged over server preset")
+        console.print("      --sink-config-file   Sink config file (JSON/YAML)")
+        console.print("      --sink-param K=V     Sink config override; can repeat")
         console.print()
         console.print("[bold]Examples:[/bold]")
         console.print("  [dim]et upload myfile.zip[/dim]                              # download once (default)")
@@ -399,10 +476,20 @@ def upload(
         console.print("  [dim]et upload myfile.zip -r ttl --retention-ttl 3600[/dim]  # expire in 1h")
         console.print("  [dim]et upload largefile.iso -j 8[/dim]                      # 8 threads")
         console.print("  [dim]et upload myfile.zip --sink tos[/dim]                   # upload then push to TOS")
+        console.print("  [dim]et upload model.bin --sink zos --sink-param bucket=my-zos-bucket[/dim]")
         return
 
     server = _get_server_url()
     token = token or _get_token()
+
+    try:
+        sink_config = _build_sink_config(sink_config_json, sink_config_file, sink_param)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+    if sink_config and not sink:
+        print_error("--sink-config/--sink-config-file/--sink-param require --sink")
+        raise typer.Exit(1)
 
     if not file_path.exists():
         print_error(f"File not found: {file_path}")
@@ -494,12 +581,8 @@ def upload(
                         "folderName": folder_name,
                         "relativePath": rel,
                         **({"sink": sink} if sink else {}),
-                        **(
-                            {"sink_config": __import__("base64").b64encode(sink_config_json.encode()).decode()}
-                            if sink and sink_config_json
-                            else {}
-                        ),
-                        **({"sink_preset": sink_preset} if sink and sink_preset and not sink_config_json else {}),
+                        **({"sink_config": _sink_config_metadata(sink_config)} if sink and sink_config else {}),
+                        **({"sink_preset": sink_preset} if sink and sink_preset else {}),
                     },
                 )
                 u.ensure_created()
@@ -538,11 +621,9 @@ def upload(
             extra_meta: dict[str, str] = {}
             if sink:
                 extra_meta["sink"] = sink
-                if sink_config_json:
-                    import base64 as _b64
-
-                    extra_meta["sink_config"] = _b64.b64encode(sink_config_json.encode()).decode()
-                elif sink_preset:
+                if sink_config:
+                    extra_meta["sink_config"] = _sink_config_metadata(sink_config)
+                if sink_preset:
                     extra_meta["sink_preset"] = sink_preset
             u = c.create_parallel_uploader(
                 str(file_path),
@@ -2151,7 +2232,7 @@ state:
 auth:
   enabled: true
   tokens:
-    - "your-api-token-here"
+    - "<api-token>"
 
 # File retention policies: permanent / download_once / ttl
 retention:
@@ -2210,38 +2291,6 @@ cors:
         console.print(Panel(config_content, title="[bold cyan]Sample Config[/bold cyan]", border_style="cyan"))
 
 
-def _read_urls_from_source(urls_file: Optional[Path]) -> list[str]:
-    """Read a list of URLs from a file or stdin.
-
-    - ``urls_file=Path('-')`` or ``None`` with non-TTY stdin → read stdin.
-    - ``urls_file`` otherwise → read that file.
-    Blank lines and ``#`` comments are ignored.
-    """
-    import io
-
-    urls: list[str] = []
-
-    def _consume(stream: "io.TextIOBase") -> None:
-        for raw in stream:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            urls.append(line)
-
-    if urls_file is not None:
-        if str(urls_file) == "-":
-            _consume(sys.stdin)  # type: ignore[arg-type]
-        else:
-            if not urls_file.exists():
-                print_error(f"URLs file not found: {urls_file}")
-                raise typer.Exit(1)
-            with urls_file.open("r", encoding="utf-8") as fh:
-                _consume(fh)  # type: ignore[arg-type]
-    elif not sys.stdin.isatty():
-        _consume(sys.stdin)  # type: ignore[arg-type]
-    return urls
-
-
 def _submit_remote_download(
     server: str,
     headers: dict,
@@ -2249,7 +2298,7 @@ def _submit_remote_download(
     *,
     output: Optional[str],
     sink: Optional[str],
-    sink_config_json: Optional[str],
+    sink_config: Optional[dict[str, Any]],
     sink_preset: Optional[str] = None,
     retention: str,
     retention_ttl: Optional[int],
@@ -2259,9 +2308,9 @@ def _submit_remote_download(
         body["filename"] = output
     if sink:
         body["sink_plugin"] = sink
-    if sink_config_json:
-        body["sink_config"] = json.loads(sink_config_json)
-    elif sink_preset:
+    if sink_config:
+        body["sink_config"] = sink_config
+    if sink_preset:
         body["sink_preset"] = sink_preset
     if retention_ttl is not None:
         body["retention_ttl"] = retention_ttl
@@ -2281,18 +2330,22 @@ def remote_download(
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
-    urls_file: Optional[Path] = typer.Option(
-        None,
-        "--urls-file",
-        "-f",
-        help="Read URLs from file (one per line; '-' for stdin). Overrides URL argument.",
-    ),
     sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos). Omit = save to server"),
-    sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
+    sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON merged over preset"),
+    sink_config_file: Optional[Path] = typer.Option(
+        None,
+        "--sink-config-file",
+        help="Sink config file (JSON/YAML) merged over preset",
+    ),
+    sink_param: Optional[list[str]] = typer.Option(
+        None,
+        "--sink-param",
+        help="Sink config override KEY=VALUE; can be repeated",
+    ),
     sink_preset: Optional[str] = typer.Option(
         None,
         "--sink-preset",
-        help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
+        help="Pick a named preset (sinks.presets.<sink>.<name>)",
     ),
     retention: str = typer.Option("download_once", "--retention", "-r", help="download_once / permanent / ttl"),
     retention_ttl: Optional[int] = typer.Option(None, "--retention-ttl", help="TTL seconds"),
@@ -2303,8 +2356,8 @@ def remote_download(
     Downloads a URL on the server side. Optionally pushes to a sink (e.g. TOS).
     If --sink is provided without --sink-config, the server preset is used.
 
-    Batch mode: pass ``--urls-file <path>`` (or pipe URLs via stdin) to submit
-    many URLs in one go.  Each non-blank, non-comment line is treated as a URL.
+    Repo URLs (HuggingFace repo / GDrive folder) are auto-expanded by the
+    server into one task per file — no client-side batching needed.
 
     Examples:
         et remote-download https://example.com/file.zip
@@ -2312,24 +2365,17 @@ def remote_download(
         et remote-download https://hf-mirror.com/gpt2/resolve/main/config.json
         et remote-download https://example.com/file.zip --sink tos
         et remote-download https://example.com/file.zip --sink tos -w
-        et remote-download --urls-file urls.txt --sink tos
-        cat urls.txt | et remote-download -f - --sink tos
     """
-    batch_urls: list[str] = []
-    if urls_file is not None:
-        batch_urls = _read_urls_from_source(urls_file)
-    elif url is None and not sys.stdin.isatty():
-        batch_urls = _read_urls_from_source(None)
-
-    if url is None and not batch_urls:
+    if url is None:
         console.print()
         console.print("[bold cyan]et remote-download[/bold cyan] — 离线下载 (server-side download)\n")
         console.print("[bold]Usage:[/bold]  et remote-download <URL> [OPTIONS]\n")
         console.print("[bold]Options:[/bold]")
         console.print("  -o, --output TEXT    Override saved filename")
-        console.print("  -f, --urls-file PATH Batch URLs file (one per line; '-' = stdin)")
         console.print("  --sink TEXT          Push to sink plugin (e.g. tos). Omit = save to server")
-        console.print("  --sink-config JSON   Explicit sink config JSON (overrides preset)")
+        console.print("  --sink-config JSON   Sink config JSON merged over preset")
+        console.print("  --sink-config-file   Sink config file (JSON/YAML)")
+        console.print("  --sink-param K=V     Sink config override; can repeat")
         console.print("  -r, --retention TEXT download_once (default) / permanent / ttl")
         console.print("  --retention-ttl INT  TTL seconds (for --retention ttl)")
         console.print("  -w, --wait           Wait for task completion and show progress")
@@ -2337,68 +2383,23 @@ def remote_download(
         console.print("[bold]Examples:[/bold]")
         console.print("  [dim]et remote-download https://example.com/file.zip[/dim]")
         console.print("  [dim]et remote-download https://example.com/file.zip -o model.bin[/dim]")
-        console.print("  [dim]et remote-download --urls-file urls.txt --sink tos[/dim]")
-        console.print("  [dim]cat urls.txt | et remote-download -f - --sink tos[/dim]")
+        console.print("  [dim]et remote-download https://example.com/file.zip --sink tos -w[/dim]")
+        console.print("  [dim]et remote-download https://example.com/file.zip --sink zos --sink-param bucket=my-zos[/dim]")
         return
 
     server = _get_server_url()
     token = token or _get_token()
     headers = _auth_headers(token)
 
-    # ── Batch mode ────────────────────────────────────────────
-    if batch_urls:
-        if url is not None:
-            batch_urls.insert(0, url)
-        print_info(f"Submitting {len(batch_urls)} URL(s)...")
-        created_ids: list[str] = []
-        failed = 0
-        for u in batch_urls:
-            try:
-                data = _submit_remote_download(
-                    server,
-                    headers,
-                    u,
-                    output=None,  # per-URL rename not meaningful in batch
-                    sink=sink,
-                    sink_config_json=sink_config,
-                    sink_preset=sink_preset,
-                    retention=retention,
-                    retention_ttl=retention_ttl,
-                )
-            except httpx.HTTPStatusError as e:
-                print_error(f"  ✗ {u}: {e.response.status_code} {e.response.text}")
-                failed += 1
-                continue
-            except Exception as e:
-                print_error(f"  ✗ {u}: {e}")
-                failed += 1
-                continue
-            if data.get("batch"):
-                for t in data.get("tasks", []):
-                    tid = t.get("task_id", "")
-                    if tid:
-                        created_ids.append(tid)
-                console.print(
-                    f"  [green]✓[/green] {u} → batch "
-                    f"({data.get('created_tasks', 0)}/{data.get('total_files', 0)} tasks)"
-                )
-            else:
-                tid = data.get("task_id", "")
-                if tid:
-                    created_ids.append(tid)
-                console.print(f"  [green]✓[/green] {u} → {tid[:8]}..")
-        print_success(f"Submitted {len(created_ids)} task(s){' (' + str(failed) + ' failed)' if failed else ''}")
-        if wait and created_ids:
-            console.print(f"[dim]Waiting for {len(created_ids)} task(s) to finish...[/dim]")
-            for tid in created_ids:
-                console.print(f"\n  [cyan]Waiting: {tid[:8]}[/cyan]")
-                _wait_for_task(server, headers, tid)
-        if failed:
-            raise typer.Exit(1)
-        return
+    try:
+        sink_config_dict = _build_sink_config(sink_config, sink_config_file, sink_param)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+    if sink_config_dict and not sink:
+        print_error("--sink-config/--sink-config-file/--sink-param require --sink")
+        raise typer.Exit(1)
 
-    # ── Single URL mode ───────────────────────────────────────
-    assert url is not None
     try:
         data = _submit_remote_download(
             server,
@@ -2406,7 +2407,7 @@ def remote_download(
             url,
             output=output,
             sink=sink,
-            sink_config_json=sink_config,
+            sink_config=sink_config_dict,
             sink_preset=sink_preset,
             retention=retention,
             retention_ttl=retention_ttl,
@@ -2497,7 +2498,7 @@ def _push_file_to_sink(
     token: Optional[str],
     file_id: str,
     sink_plugin: str,
-    sink_config_str: Optional[str] = None,
+    sink_config: Optional[dict[str, Any]] = None,
     sink_preset: Optional[str] = None,
 ) -> None:
     """Push an uploaded file to a sink plugin."""
@@ -2510,9 +2511,9 @@ def _push_file_to_sink(
         headers["Authorization"] = f"Bearer {token}"
 
     body: dict = {"sink_plugin": sink_plugin}
-    if sink_config_str:
-        body["sink_config"] = json.loads(sink_config_str)
-    elif sink_preset:
+    if sink_config:
+        body["sink_config"] = sink_config
+    if sink_preset:
         body["sink_preset"] = sink_preset
 
     try:
@@ -2546,11 +2547,21 @@ def push(
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
     ),
-    sink_config_arg: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON (overrides preset)"),
+    sink_config_arg: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON merged over preset"),
+    sink_config_file: Optional[Path] = typer.Option(
+        None,
+        "--sink-config-file",
+        help="Sink config file (JSON/YAML) merged over preset",
+    ),
+    sink_param: Optional[list[str]] = typer.Option(
+        None,
+        "--sink-param",
+        help="Sink config override KEY=VALUE; can be repeated",
+    ),
     sink_preset: Optional[str] = typer.Option(
         None,
         "--sink-preset",
-        help="Pick a named preset (sinks.presets.<sink>.<name>); ignored if --sink-config is given",
+        help="Pick a named preset (sinks.presets.<sink>.<name>)",
     ),
 ) -> None:
     """Push an uploaded file to a sink (推送已上传文件).
@@ -2561,12 +2572,17 @@ def push(
     Examples:
         et push 6a9111db --sink tos
         et push 6a9111db --sink tos --sink-preset bigdata
-        et push 6a9111db --sink tos --sink-config '{"bucket":"my-bucket"}'
+        et push 6a9111db --sink zos --sink-param bucket=my-zos-bucket
     """
     server = _get_server_url()
     token = token or _get_token()
     resolved_id = _resolve_file_id(file_id, server, token)
-    _push_file_to_sink(server, token, resolved_id, sink, sink_config_arg, sink_preset)
+    try:
+        sink_config = _build_sink_config(sink_config_arg, sink_config_file, sink_param)
+    except Exception as e:
+        print_error(str(e))
+        raise typer.Exit(1)
+    _push_file_to_sink(server, token, resolved_id, sink, sink_config, sink_preset)
 
 
 # ─────────────────────────────────────────────────────────────

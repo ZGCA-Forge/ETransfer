@@ -1,6 +1,7 @@
 """User system API routes with OIDC integration."""
 
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -8,15 +9,22 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
 
 from etransfer.server.auth.db import UserDB
 from etransfer.server.auth.models import GroupCreate, GroupPublic, GroupTable, Role, RoleQuota, UserPublic, UserTable
 from etransfer.server.auth.oauth import OIDCProvider
 
+logger = logging.getLogger("etransfer.server.auth")
+
 # Load the login success HTML template once at import time.
 # The template uses {username} and {token} as str.format() placeholders.
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _LOGIN_SUCCESS_TEMPLATE = (_TEMPLATE_DIR / "login_success.html").read_text(encoding="utf-8")
+
+
+class DingTalkSSORequest(BaseModel):
+    code: str
 
 
 def _group_to_public(g: GroupTable, member_count: int = 0) -> GroupPublic:
@@ -94,7 +102,11 @@ def create_user_router(
         if not token:
             return None
 
-        session = await user_db.get_session(token)
+        try:
+            session = await user_db.get_session(token)
+        except Exception as exc:
+            logger.warning("Ignoring invalid session during user lookup: %s", exc)
+            return None
         if not session:
             return None
 
@@ -114,6 +126,83 @@ def create_user_router(
         if user.role != Role.ADMIN and not user.is_admin:
             raise HTTPException(403, "Admin access required")
         return user
+
+    async def _create_session_from_oauth_code(
+        code: str,
+        redirect_uri: Optional[str] = None,
+    ) -> tuple[Any, UserTable]:
+        """Exchange an OAuth code and create a local ETransfer session."""
+        if not oidc:
+            raise HTTPException(501, "OIDC authentication not configured")
+
+        try:
+            token_data = await oidc.exchange_code(code, redirect_uri=redirect_uri)
+        except Exception as e:
+            raise HTTPException(400, f"OIDC token exchange failed: {e}")
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            raise HTTPException(400, "No access_token in OIDC response")
+
+        try:
+            userinfo = await oidc.get_user_info(access_token, jwt_claims=token_data.get("_jwt_claims"))
+        except Exception as e:
+            raise HTTPException(400, f"Failed to fetch user profile: {e}")
+
+        # Extract user claims (compatible with standard OIDC + DingTalk)
+        # DingTalk old API uses lowercase (openid/unionid), new API uses camelCase
+        oidc_sub = str(
+            userinfo.get("sub")
+            or userinfo.get("openId")
+            or userinfo.get("openid")
+            or userinfo.get("unionId")
+            or userinfo.get("unionid")
+            or userinfo.get("id")
+            or "",
+        )
+        if not oidc_sub:
+            raise HTTPException(400, "No user ID in OAuth response")
+
+        username = (
+            userinfo.get("preferred_username")
+            or userinfo.get("nick")
+            or userinfo.get("name")
+            or userinfo.get("displayName")
+            or oidc_sub
+        )
+        display_name = userinfo.get("displayName") or userinfo.get("nick") or userinfo.get("name")
+        email = userinfo.get("email") or userinfo.get("org_email") or userinfo.get("orgEmail") or userinfo.get("mail")
+        avatar_url = (
+            userinfo.get("picture")
+            or userinfo.get("avatar")
+            or userinfo.get("avatarUrl")
+            or userinfo.get("permanentAvatar")
+        )
+        is_admin = bool(userinfo.get("isAdmin", False))
+
+        # Extract groups (provider-specific: array of strings or objects)
+        groups_raw = userinfo.get("groups") or []
+        if isinstance(groups_raw, list):
+            group_names = []
+            for g in groups_raw:
+                if isinstance(g, str):
+                    group_names.append(g)
+                elif isinstance(g, dict):
+                    group_names.append(g.get("name", str(g.get("id", ""))))
+        else:
+            group_names = []
+
+        user = await user_db.upsert_user(
+            oidc_sub=oidc_sub,
+            username=username,
+            display_name=display_name,
+            email=email,
+            avatar_url=avatar_url,
+            is_admin=is_admin,
+            groups=group_names,
+        )
+        session = await user_db.create_session(user.id)  # type: ignore[arg-type]
+        return session, user
 
     # ── Login info (server-driven config for clients) ──────────
 
@@ -227,6 +316,21 @@ def create_user_router(
         url = oidc.get_authorize_url(state=state, redirect_uri=callback)
         return RedirectResponse(url)
 
+    @router.post("/api/users/dingtalk/sso")
+    async def dingtalk_sso(body: DingTalkSSORequest) -> dict[str, Any]:
+        """Login from DingTalk in-app authCode and return an ETransfer session."""
+        if not oidc or not oidc.is_dingtalk:
+            raise HTTPException(501, "DingTalk authentication not configured")
+        if not body.code.strip():
+            raise HTTPException(400, "DingTalk auth code is required")
+
+        session, user = await _create_session_from_oauth_code(body.code.strip())
+        return {
+            "token": session.token,
+            "expires_at": (session.expires_at.isoformat() if session.expires_at else None),
+            "user": (await _user_to_public(user)).model_dump(),
+        }
+
     # ── OAuth callback ─────────────────────────────────────────
 
     @router.get("/api/users/callback")
@@ -256,84 +360,7 @@ def create_user_router(
         if not redirect_uri:
             redirect_uri = _effective_callback_url(request)
 
-        # Exchange code for access token
-        try:
-            token_data = await oidc.exchange_code(code, redirect_uri=redirect_uri)
-        except Exception as e:
-            raise HTTPException(400, f"OIDC token exchange failed: {e}")
-
-        access_token = token_data.get("access_token")
-        if not access_token:
-            raise HTTPException(400, "No access_token in OIDC response")
-
-        # Fetch user profile (DingTalk: pass JWT claims for 403 fallback)
-        jwt_claims = token_data.get("_jwt_claims")
-        if jwt_claims:
-            setattr(oidc, "_jwt_claims", jwt_claims)
-        try:
-            userinfo = await oidc.get_user_info(access_token)
-        except Exception as e:
-            raise HTTPException(400, f"Failed to fetch user profile: {e}")
-        finally:
-            if hasattr(oidc, "_jwt_claims"):
-                delattr(oidc, "_jwt_claims")
-
-        # Extract user claims (compatible with standard OIDC + DingTalk)
-        # DingTalk old API uses lowercase (openid/unionid), new API uses camelCase
-        oidc_sub = str(
-            userinfo.get("sub")
-            or userinfo.get("openId")
-            or userinfo.get("openid")
-            or userinfo.get("unionId")
-            or userinfo.get("unionid")
-            or userinfo.get("id")
-            or "",
-        )
-        if not oidc_sub:
-            raise HTTPException(400, "No user ID in OAuth response")
-
-        username = (
-            userinfo.get("preferred_username")
-            or userinfo.get("nick")
-            or userinfo.get("name")
-            or userinfo.get("displayName")
-            or oidc_sub
-        )
-        display_name = userinfo.get("displayName") or userinfo.get("nick") or userinfo.get("name")
-        email = userinfo.get("email") or userinfo.get("org_email") or userinfo.get("orgEmail") or userinfo.get("mail")
-        avatar_url = (
-            userinfo.get("picture")
-            or userinfo.get("avatar")
-            or userinfo.get("avatarUrl")
-            or userinfo.get("permanentAvatar")
-        )
-        is_admin = bool(userinfo.get("isAdmin", False))
-
-        # Extract groups (provider-specific: array of strings or objects)
-        groups_raw = userinfo.get("groups") or []
-        if isinstance(groups_raw, list):
-            group_names = []
-            for g in groups_raw:
-                if isinstance(g, str):
-                    group_names.append(g)
-                elif isinstance(g, dict):
-                    group_names.append(g.get("name", str(g.get("id", ""))))
-        else:
-            group_names = []
-
-        # Upsert user and sync groups
-        user = await user_db.upsert_user(
-            oidc_sub=oidc_sub,
-            username=username,
-            display_name=display_name,
-            email=email,
-            avatar_url=avatar_url,
-            is_admin=is_admin,
-            groups=group_names,
-        )
-
-        # Create session
-        session = await user_db.create_session(user.id)  # type: ignore[arg-type]
+        session, user = await _create_session_from_oauth_code(code, redirect_uri=redirect_uri)
 
         # If this is a CLI-initiated login, complete the pending login.
         # Re-fetch pending (may have been fetched above for redirect_uri,

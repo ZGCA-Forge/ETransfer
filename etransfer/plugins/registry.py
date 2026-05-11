@@ -77,6 +77,26 @@ class PluginRegistry:
             except Exception:
                 logger.exception("Failed to load sink plugin: %s", ep.name)
 
+        # Built-in sinks should work in source-tree deployments even before
+        # package entry point metadata is refreshed by reinstalling.
+        self._register_builtin_sink("local", "etransfer.plugins.sinks.local", "LocalSink")
+        self._register_builtin_sink("tos", "etransfer.plugins.sinks.tos_multipart", "TosSink")
+        self._register_builtin_sink("zos", "etransfer.plugins.sinks.zos", "ZosSink")
+
+    def _register_builtin_sink(self, name: str, module_name: str, class_name: str) -> None:
+        if name in self._sinks:
+            return
+        try:
+            import importlib
+
+            module = importlib.import_module(module_name)
+            cls = getattr(module, class_name)
+            if isinstance(cls, type) and issubclass(cls, BaseSink):
+                self._sinks[name] = cls
+                logger.info("Registered built-in sink plugin: %s -> %s", name, cls.__name__)
+        except Exception:
+            logger.exception("Failed to register built-in sink plugin: %s", name)
+
     def register_source(self, cls: type[BaseSource]) -> None:
         """Programmatically register a Source plugin (for testing / embedded use)."""
         inst = cls()

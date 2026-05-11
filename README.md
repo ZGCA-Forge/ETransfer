@@ -53,6 +53,8 @@ et upload ./large.iso -j 8 -c $((16*1024*1024))
 
 # 上传到本地，同时流式推送到对象存储 sink
 et upload ./model.bin --sink tos
+et upload ./model.bin --sink zos
+et upload ./model.bin --sink zos --sink-param bucket=my-zos-bucket --sink-param prefix=models
 
 # 下载
 et download <file_id> -p ./output/
@@ -65,8 +67,10 @@ et folders delete <folder_id>
 
 # 离线下载（服务端代下载）
 et remote-download https://example.com/file.zip
-et remote-download --urls-file urls.txt --sink tos
-cat urls.txt | et remote-download -f -          # 从 stdin 批量提交
+et remote-download https://example.com/file.zip --sink tos -w
+et remote-download https://example.com/file.zip --sink zos -w
+et remote-download https://example.com/file.zip --sink zos --sink-config-file zos.yaml -w
+et remote-download https://huggingface.co/gpt2 --sink tos      # 整 repo 自动展开
 
 # 任务管理
 et tasks list

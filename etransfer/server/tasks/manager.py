@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import logging
 import math
@@ -41,6 +42,10 @@ _DEFAULT_MAX_CONCURRENT_TASKS = 50
 _DEFAULT_STREAM_SINK_CONCURRENCY = 4
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = (5, 15, 30)  # seconds between retries
+_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 10 * 60
+_SHUTDOWN_CANCEL_TIMEOUT_SECONDS = 10
+_SHUTDOWN_LOG_INTERVAL_SECONDS = 10
+_SHUTDOWN_INTERRUPTED_ERROR = "interrupted by shutdown"
 
 
 class _RangeNotSupportedError(Exception):
@@ -298,6 +303,30 @@ class TaskManager:
     async def get_task(self, task_id: str) -> Optional[TransferTask]:
         return await self._load(task_id)
 
+    async def delete_task_state(self, task_id: str) -> bool:
+        """Delete persisted state for a terminal task.
+
+        Long-running orchestration jobs can create many short-lived child
+        tasks.  Once a child task reaches a terminal state and the orchestrator
+        has accounted for it, removing its state keeps the backend bounded.
+        Running tasks are never deleted here.
+        """
+        task = await self._load(task_id)
+        if task is None:
+            return False
+        if task.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+            return False
+        bg = self._running.get(task_id)
+        if bg and not bg.done():
+            return False
+        self._running.pop(task_id, None)
+        self._tasks.pop(task_id, None)
+        self._prev_dl.pop(task_id, None)
+        self._prev_push.pop(task_id, None)
+        self._prev_time.pop(task_id, None)
+        await self._state.delete(self._key(task_id))
+        return True
+
     async def list_tasks(self) -> list[TransferTask]:
         pattern = f"{_STATE_PREFIX}*"
         keys = await self._state.keys(pattern)
@@ -345,8 +374,9 @@ class TaskManager:
     async def shutdown(self) -> int:
         """Gracefully stop all running tasks.
 
-        - Downloading tasks: cancel immediately (can restart from scratch)
-        - Pushing tasks: wait for current chunk to finish, then stop
+        - Queued tasks: cancel their coroutine and keep them pending
+        - Downloading / pushing tasks: wait for the current chunk / part to
+          finish so the task can persist a clean resume point
         - All interrupted tasks saved as PENDING for restart recovery
         """
         self._shutting_down = True
@@ -355,49 +385,78 @@ class TaskManager:
         if not count:
             return 0
 
-        # Categorize: which are pushing (need to wait) vs downloading (can cancel now)
-        pushing = []
-        downloading = []
+        queued: list[str] = []
+        draining: list[str] = []
         for tid in running_ids:
             task = self._tasks.get(tid) or await self._load(tid)
-            if task and task.status.value == "pushing":
-                pushing.append(tid)
+            if task and task.status in (TaskStatus.DOWNLOADING, TaskStatus.PUSHING):
+                draining.append(tid)
             else:
-                downloading.append(tid)
+                queued.append(tid)
 
         logger.info(
-            "Shutdown: %d downloading (cancel now), %d pushing (wait for current chunk)",
-            len(downloading),
-            len(pushing),
+            "Shutdown: %d queued task(s), %d active transfer task(s) draining current chunk/part",
+            len(queued),
+            len(draining),
         )
+        for tid in running_ids:
+            task = self._tasks.get(tid) or await self._load(tid)
+            if task:
+                logger.info("Shutdown task detail: %s", self._shutdown_task_detail(task))
 
-        # Cancel downloading tasks immediately
-        for tid in downloading:
+        # Queued tasks are not inside a source/sink chunk yet.
+        for tid in queued:
             bg = self._running.get(tid)
             if bg and not bg.done():
                 bg.cancel()
 
-        # Wait for pushing tasks to notice _shutting_down flag and finish current chunk
-        if pushing:
-            for _ in range(30):  # max 30s wait
-                still_running = [tid for tid in pushing if tid in self._running and not self._running[tid].done()]
-                if not still_running:
-                    break
-                await asyncio.sleep(1)
-            # Force-cancel any stragglers
-            for tid in pushing:
-                bg = self._running.get(tid)
-                if bg and not bg.done():
-                    bg.cancel()
+        deadline = asyncio.get_running_loop().time() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+        next_log_at = 0.0
+        still_running: list[str] = []
+        while draining:
+            still_running = [tid for tid in draining if tid in self._running and not self._running[tid].done()]
+            if not still_running:
+                break
+            now = asyncio.get_running_loop().time()
+            if now >= next_log_at:
+                remaining = max(0, int(deadline - now))
+                logger.info(
+                    "Shutdown waiting for %d active task(s), remaining timeout=%ds",
+                    len(still_running),
+                    remaining,
+                )
+                for tid in still_running:
+                    task = self._tasks.get(tid) or await self._load(tid)
+                    if task:
+                        logger.info("Shutdown waiting task detail: %s", self._shutdown_task_detail(task))
+                next_log_at = now + _SHUTDOWN_LOG_INTERVAL_SECONDS
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning("Shutdown drain timeout; force-cancelling %d active task(s)", len(still_running))
+                break
+            await asyncio.sleep(0.5)
 
-        await asyncio.sleep(1)
+        for tid in still_running:
+            bg = self._running.get(tid)
+            if bg and not bg.done():
+                bg.cancel()
+
+        pending_tasks = [bg for tid in running_ids if (bg := self._running.get(tid)) is not None and not bg.done()]
+        if pending_tasks:
+            _done, pending = await asyncio.wait(pending_tasks, timeout=_SHUTDOWN_CANCEL_TIMEOUT_SECONDS)
+            for bg in _done:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await bg
+            for bg in pending:
+                bg.cancel()
+            if pending:
+                logger.warning("Shutdown: %d task coroutine(s) did not finish cancellation cleanly", len(pending))
 
         # Mark all interrupted tasks as PENDING for restart recovery
         for tid in running_ids:
             task = self._tasks.get(tid) or await self._load(tid)
             if task and task.status.value in ("downloading", "pushing", "pending", "cancelled"):
                 task.status = TaskStatus.PENDING
-                task.error = "interrupted by shutdown"
+                task.error = _SHUTDOWN_INTERRUPTED_ERROR
                 task.speed = 0.0
                 task.download_speed = 0.0
                 task.push_speed = 0.0
@@ -405,6 +464,17 @@ class TaskManager:
 
         logger.info("Shutdown complete: %d task(s) saved for restart recovery", count)
         return count
+
+    @staticmethod
+    def _shutdown_task_detail(task: TransferTask) -> str:
+        return (
+            f"id={task.task_id[:8]} status={task.status.value} "
+            f"source={task.source_plugin or '-'} sink={task.sink_plugin or '-'} "
+            f"filename={task.filename or '-'} downloaded={task.downloaded_bytes}/{task.file_size or 0} "
+            f"pushed_parts={task.pushed_parts} progress={task.progress:.3f} "
+            f"dl={task.download_progress:.3f} push={task.push_progress:.3f} "
+            f"session={(task.sink_session_id or '-')[:12]}"
+        )
 
     # ── Startup recovery ──────────────────────────────────────
 
@@ -796,6 +866,13 @@ class TaskManager:
                         buf.extend(chunk)
                         downloaded += len(chunk)
                         task.downloaded_bytes = downloaded
+                        if self._shutting_down:
+                            logger.info(
+                                "Shutdown: task %s stopping after source chunk at byte %d",
+                                task.task_id[:8],
+                                downloaded,
+                            )
+                            raise asyncio.CancelledError()
 
                         # Update download progress every ~8MB without waiting for push
                         if downloaded - _last_save >= 8 * 1024 * 1024:
@@ -967,6 +1044,9 @@ class TaskManager:
             if total and total > 0:
                 task.download_progress = downloaded / total
                 task.progress = downloaded / total
+            if self._shutting_down:
+                logger.info("Shutdown: task %s stopping after download chunk at byte %d", task.task_id[:8], downloaded)
+                raise asyncio.CancelledError()
 
         file_path = await self._retry(
             source.download, task.source_url, dest_dir, on_progress=_progress, label=f"download({task.task_id[:8]})"

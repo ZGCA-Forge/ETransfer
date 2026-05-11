@@ -26,7 +26,7 @@ state:
 auth:
   enabled: true
   tokens:
-    - "your-api-token-here"
+    - "<api-token>"
 
 # File retention policies
 retention:
@@ -62,14 +62,14 @@ user_system:
   # OIDC configuration (works with any standard OIDC provider)
   # Endpoints are auto-discovered from {issuer_url}/.well-known/openid-configuration
   oidc:
-    issuer_url: "https://your-oidc-provider.example.com"
-    client_id: "your-client-id"
+    issuer_url: "https://oidc.example.com"
+    client_id: "<client-id>"
     client_secret: "" # Keep secret! Use env ETRANSFER_OIDC_CLIENT_SECRET
-    # callback_url: Leave empty or set to your public URL.
-    # When empty/localhost, ETransfer auto-derives the callback from the
-    # incoming request's Host header (works for SSH remote access).
-    # Example: "https://transfer.example.com/api/users/callback"
+    # callback_url: Leave empty to derive it from the incoming request host,
+    # or set it to your public URL prefix.
+    # Example: "https://transfer.example.com"
     callback_url: ""
+    # corp_id: "" # Required by some DingTalk in-app SSO JSAPI versions.
     scope: "openid profile email"
 
   # Database backend for user/group/session storage
@@ -103,6 +103,27 @@ user_system:
       max_upload_size: 536870912 # 512 MB
       upload_speed_limit: 10485760 # 10 MB/s
       download_speed_limit: 10485760 # 10 MB/s
+
+# Sink presets (used by `et upload --sink <name>`, `et push`, and remote-download)
+sinks:
+  presets:
+    tos:
+      default:
+        endpoint: "<tos-endpoint>"
+        region: "<region>"
+        bucket: "<bucket>"
+        ak: "<access-key>"
+        sk: "<secret-key>"
+        prefix: ""
+    zos:
+      default:
+        endpoint: "<zos-endpoint>"
+        region: "<region>"
+        bucket: "<bucket>"
+        ak: "<access-key>"
+        sk: "<secret-key>"
+        prefix: ""
+        secure: true
 
 # CORS
 cors:

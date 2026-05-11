@@ -46,6 +46,7 @@ server = [
     "sqlmodel>=0.0.16",
     "aiosqlite>=0.20.0",
     "greenlet>=3.0.0",
+    "boto3",
 ]
 redis = [
     "redis>=5.0.0",
@@ -87,6 +88,7 @@ huggingface = "etransfer.plugins.sources.huggingface:HuggingFaceSource"
 [project.entry-points."etransfer.sinks"]
 local = "etransfer.plugins.sinks.local:LocalSink"
 tos = "etransfer.plugins.sinks.tos_multipart:TosSink"
+zos = "etransfer.plugins.sinks.zos:ZosSink"
 
 [project.urls]
 Homepage = "https://github.com/ZGCA-Forge/ETransfer"

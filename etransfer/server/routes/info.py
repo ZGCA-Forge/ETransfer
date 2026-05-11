@@ -7,6 +7,7 @@ from fastapi import APIRouter, Request
 from etransfer import __version__
 from etransfer.common.constants import TUS_EXTENSIONS, TUS_VERSION
 from etransfer.common.models import EndpointInfo, ServerInfo
+from etransfer.server.routes.migrations import read_migration_object_log_stats
 from etransfer.server.services.instance_traffic import InstanceTrafficTracker
 from etransfer.server.tus.storage import TusStorage
 
@@ -130,12 +131,17 @@ def create_info_router(
             except Exception:
                 pass
 
+        migration_stats = read_migration_object_log_stats()
+        task_download_bytes += migration_stats["migration_download_bytes"]
+        task_push_bytes += migration_stats["migration_push_bytes"]
+
         return {
             "traffic": {ep["endpoint"]: ep for ep in all_eps},
             "total_upload_bytes": total_up,
             "total_download_bytes": total_down,
             "task_download_bytes": task_download_bytes,
             "task_push_bytes": task_push_bytes,
+            **migration_stats,
             "task_total": task_total,
             "task_completed": task_completed,
             "task_active": task_active,

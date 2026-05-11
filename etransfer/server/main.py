@@ -19,6 +19,7 @@ from etransfer.server.routes.auth import create_auth_router
 from etransfer.server.routes.files import create_files_router
 from etransfer.server.routes.folders import create_folders_router
 from etransfer.server.routes.info import create_info_router
+from etransfer.server.routes.migrations import create_migrations_router
 from etransfer.server.routes.plugins import create_plugins_router
 from etransfer.server.routes.tasks import create_tasks_router
 from etransfer.server.services.instance_traffic import InstanceTrafficTracker
@@ -400,10 +401,24 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         app.state.task_manager = _task_manager
         logger.info("Task concurrency cap: %d", _task_manager.max_concurrent_tasks)
 
+        # Migration controller (page-by-page bucket migrations)
+        from etransfer.server.routes.migrations import BucketMigrationController
+
+        _migration_controller = BucketMigrationController(
+            state_manager=state_manager,
+            task_manager=_task_manager,
+            user_db=_user_db,
+        )
+        app.state.migration_controller = _migration_controller
+
         # Resume interrupted tasks from previous shutdown
         resumed = await _task_manager.resume_interrupted()
         if resumed:
             logger.info("Resumed %d interrupted task(s) from previous shutdown", resumed)
+
+        resumed_migrations = await _migration_controller.resume_interrupted()
+        if resumed_migrations:
+            logger.info("Resumed %d bucket migration job(s)", resumed_migrations)
 
         # Background tasks
         asyncio.create_task(cleanup_loop(settings.cleanup_interval, lambda: _storage, lambda: _user_db))
@@ -433,6 +448,9 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
         # Gracefully stop running tasks (save state for restart recovery)
         task_mgr = getattr(app.state, "task_manager", None)
+        migration_controller = getattr(app.state, "migration_controller", None)
+        if migration_controller:
+            await migration_controller.shutdown()
         if task_mgr:
             count = await task_mgr.shutdown()
             if count:
@@ -470,6 +488,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
 
     app.include_router(create_auth_router(settings.auth_tokens))
     app.include_router(create_tasks_router())
+    app.include_router(create_migrations_router())
     app.include_router(create_plugins_router())
     app.include_router(create_folders_router(storage_proxy))  # type: ignore[arg-type]
 
@@ -489,11 +508,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         from etransfer.server.auth.oauth import OIDCProvider
         from etransfer.server.auth.routes import create_user_router
 
-        callback_prefix = (
-            settings.oidc_callback_url.rstrip("/")
-            if settings.oidc_callback_url
-            else (f"http://{settings.host}:{settings.port}")
-        )
+        callback_prefix = settings.oidc_callback_url.rstrip("/") if settings.oidc_callback_url else "http://localhost:8765"
         callback_url = f"{callback_prefix}/api/users/callback"
         _oidc_provider = OIDCProvider(
             issuer_url=settings.oidc_issuer_url,
@@ -502,6 +517,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
             callback_url=callback_url,
             scope=settings.oidc_scope,
             provider=settings.oidc_provider,
+            corp_id=settings.dingtalk_corp_id,
         )
 
         app.include_router(
