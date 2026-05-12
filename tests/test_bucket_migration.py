@@ -191,7 +191,9 @@ async def test_migration_controller_pages_and_cleans_child_tasks(monkeypatch, tm
     monkeypatch.setattr(migrations, "_build_s3_client", lambda source: fake_s3)
     copied: list[str] = []
 
-    async def fake_copy(source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str) -> None:
+    async def fake_copy(
+        source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str
+    ) -> None:
         copied.append(source_key)
 
     monkeypatch.setattr(controller, "_copy_object_to_sink", fake_copy)
@@ -210,10 +212,7 @@ async def test_migration_controller_pages_and_cleans_child_tasks(monkeypatch, tm
         assert done.active_task_ids == []
         assert set(copied) == {"k1", "k2", "k3"}
         assert fake_s3.calls[1]["Marker"] == "k2"
-        records = [
-            json.loads(line)
-            for line in (tmp_path / "objects.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
+        records = [json.loads(line) for line in (tmp_path / "objects.jsonl").read_text(encoding="utf-8").splitlines()]
         assert {record["source_key"] for record in records} == {"k1", "k2", "k3"}
         assert {record["target_key"] for record in records} == {
             "user-a/k1",
@@ -242,7 +241,9 @@ async def test_migration_controller_pause_and_resume(monkeypatch, tmp_path: Path
     copy_started = asyncio.Event()
     allow_copy = asyncio.Event()
 
-    async def blocking_copy(source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str) -> None:
+    async def blocking_copy(
+        source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str
+    ) -> None:
         copy_started.set()
         await allow_copy.wait()
 
@@ -292,7 +293,9 @@ async def test_migration_controller_shutdown_pauses_and_startup_resumes(monkeypa
     allow_copy = asyncio.Event()
     copied: list[str] = []
 
-    async def blocking_copy(source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str) -> None:
+    async def blocking_copy(
+        source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str
+    ) -> None:
         copy_started.set()
         await allow_copy.wait()
         copied.append(source_key)
@@ -318,7 +321,9 @@ async def test_migration_controller_shutdown_pauses_and_startup_resumes(monkeypa
         object_log_path=tmp_path / "objects.jsonl",
     )
 
-    async def resumed_copy(source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str) -> None:
+    async def resumed_copy(
+        source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str
+    ) -> None:
         copied.append(source_key)
 
     monkeypatch.setattr(resumed_controller, "_copy_object_to_sink", resumed_copy)
@@ -352,7 +357,9 @@ async def test_migration_controller_skips_object_after_retries(monkeypatch, tmp_
     )
     monkeypatch.setattr(migrations, "_build_s3_client", lambda source: fake_s3)
 
-    async def failing_copy(source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str) -> None:
+    async def failing_copy(
+        source_url: str, source_key: str, size: int, sink_config: dict[str, str], owner_user: Any, job_id: str
+    ) -> None:
         raise RuntimeError("copy boom")
 
     monkeypatch.setattr(controller, "_copy_object_to_sink", failing_copy)
@@ -370,8 +377,7 @@ async def test_migration_controller_skips_object_after_retries(monkeypatch, tmp_
         assert done.pages_completed == 2
         assert done.error == ""
         records = [
-            json.loads(line)
-            for line in (tmp_path / "failed_objects.jsonl").read_text(encoding="utf-8").splitlines()
+            json.loads(line) for line in (tmp_path / "failed_objects.jsonl").read_text(encoding="utf-8").splitlines()
         ]
         assert {record["source_key"] for record in records} == {"k1", "k2", "k3"}
         assert all(record["attempts"] == 3 for record in records)

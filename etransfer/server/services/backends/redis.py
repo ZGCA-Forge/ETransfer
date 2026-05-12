@@ -57,7 +57,7 @@ class RedisStateBackend(StateBackend):
         max_connections = int(os.getenv("ETRANSFER_REDIS_MAX_CONNECTIONS", "512"))
         blocking_timeout = float(os.getenv("ETRANSFER_REDIS_BLOCKING_TIMEOUT", "10"))
         pool_cls = getattr(redis, "BlockingConnectionPool", redis.ConnectionPool)
-        pool_kwargs = {
+        pool_kwargs: dict[str, object] = {
             "decode_responses": True,
             "max_connections": max_connections,
         }

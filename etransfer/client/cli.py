@@ -2384,7 +2384,9 @@ def remote_download(
         console.print("  [dim]et remote-download https://example.com/file.zip[/dim]")
         console.print("  [dim]et remote-download https://example.com/file.zip -o model.bin[/dim]")
         console.print("  [dim]et remote-download https://example.com/file.zip --sink tos -w[/dim]")
-        console.print("  [dim]et remote-download https://example.com/file.zip --sink zos --sink-param bucket=my-zos[/dim]")
+        console.print(
+            "  [dim]et remote-download https://example.com/file.zip --sink zos --sink-param bucket=my-zos[/dim]"
+        )
         return
 
     server = _get_server_url()

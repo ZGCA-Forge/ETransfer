@@ -508,7 +508,9 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
         from etransfer.server.auth.oauth import OIDCProvider
         from etransfer.server.auth.routes import create_user_router
 
-        callback_prefix = settings.oidc_callback_url.rstrip("/") if settings.oidc_callback_url else "http://localhost:8765"
+        callback_prefix = (
+            settings.oidc_callback_url.rstrip("/") if settings.oidc_callback_url else "http://localhost:8765"
+        )
         callback_url = f"{callback_prefix}/api/users/callback"
         _oidc_provider = OIDCProvider(
             issuer_url=settings.oidc_issuer_url,

@@ -539,7 +539,9 @@ class BucketMigrationController:
                 owner_id = getattr(owner, "id", None)
                 owner_email = getattr(owner, "email", body.owner_email) or body.owner_email
             else:
-                logger.warning("Migration owner email not found; recording email without owner_id: %s", body.owner_email)
+                logger.warning(
+                    "Migration owner email not found; recording email without owner_id: %s", body.owner_email
+                )
 
         job = MigrationJob(
             job_id=uuid.uuid4().hex,
@@ -559,6 +561,9 @@ class BucketMigrationController:
         return job
 
     async def _resolve_user_by_email(self, email: str) -> Any:
+        if self._user_db is None:
+            return None
+
         users = await self._user_db.list_users()
         target = email.lower()
         for user in users:
@@ -848,11 +853,15 @@ class BucketMigrationController:
                     page_failed_objects += 1
             now = asyncio.get_running_loop().time()
             if now >= next_status_check_at:
-                latest = await self._load(job.job_id)
-                if latest is None or latest.status in (MigrationJobStatus.CANCELLED, MigrationJobStatus.FAILED):
+                loaded_job = await self._load(job.job_id)
+                if loaded_job is None or loaded_job.status in (
+                    MigrationJobStatus.CANCELLED,
+                    MigrationJobStatus.FAILED,
+                ):
                     for task in pending:
                         task.cancel()
                     return
+                latest = loaded_job
                 next_status_check_at = now + _MIGRATION_PROGRESS_LOG_INTERVAL_SECONDS
             if pending and now >= next_progress_log_at:
                 logger.info(
@@ -952,10 +961,7 @@ class BucketMigrationController:
                             completed[part_number] = task.result()
                             del pending[part_number]
 
-                    while (
-                        next_to_schedule <= total_parts
-                        and len(pending) + len(completed) < _SOURCE_RANGE_CONCURRENCY
-                    ):
+                    while next_to_schedule <= total_parts and len(pending) + len(completed) < _SOURCE_RANGE_CONCURRENCY:
                         start = (next_to_schedule - 1) * _COPY_CHUNK_SIZE
                         length = min(_COPY_CHUNK_SIZE, expected_size - start)
                         pending[next_to_schedule] = asyncio.create_task(
@@ -980,9 +986,7 @@ class BucketMigrationController:
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             for done_task in done:
-                                part_number = next(
-                                    number for number, task in pending.items() if task is done_task
-                                )
+                                part_number = next(number for number, task in pending.items() if task is done_task)
                                 completed[part_number] = done_task.result()
                                 del pending[part_number]
                             continue
@@ -1152,7 +1156,9 @@ def create_migrations_router() -> APIRouter:
         return controller
 
     @router.post("/bucket", status_code=201, response_model=CreateBucketMigrationResponse)
-    async def create_bucket_migration(body: CreateBucketMigrationRequest, request: Request) -> CreateBucketMigrationResponse:
+    async def create_bucket_migration(
+        body: CreateBucketMigrationRequest, request: Request
+    ) -> CreateBucketMigrationResponse:
         """Expand a source bucket into existing stream-to-sink transfer tasks."""
 
         mgr = _get_manager(request)
@@ -1195,7 +1201,9 @@ def create_migrations_router() -> APIRouter:
                 truncated=truncated,
                 next_marker=next_marker,
                 tasks=[
-                    MigrationTaskItem(task_id="", key=str(obj["key"]), size=int(obj.get("size") or 0), filename=str(obj["key"]))
+                    MigrationTaskItem(
+                        task_id="", key=str(obj["key"]), size=int(obj.get("size") or 0), filename=str(obj["key"])
+                    )
                     for obj in objects
                 ],
                 errors=[],

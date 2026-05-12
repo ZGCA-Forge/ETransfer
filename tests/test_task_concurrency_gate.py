@@ -28,8 +28,8 @@ from etransfer.server.config import (
 from etransfer.server.tasks.manager import (
     _SHUTDOWN_DRAIN_TIMEOUT_SECONDS,
     _SHUTDOWN_INTERRUPTED_ERROR,
-    _DynamicTaskGate,
     TaskManager,
+    _DynamicTaskGate,
 )
 from etransfer.server.tasks.models import TaskStatus, TransferTask
 
@@ -50,6 +50,7 @@ class _DictState:
 
     async def delete(self, key: str) -> None:
         self.data.pop(key, None)
+
 
 # ── Gate behaviour ──────────────────────────────────────────────
 

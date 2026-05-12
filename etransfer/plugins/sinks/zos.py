@@ -170,8 +170,7 @@ class ZosSink(BaseSink):
         self._ensure_client()
         upload_id, full_key = self._decode_session(session_id)
         sorted_parts = [
-            {"PartNumber": p.part_number, "ETag": p.etag}
-            for p in sorted(parts, key=lambda part: part.part_number)
+            {"PartNumber": p.part_number, "ETag": p.etag} for p in sorted(parts, key=lambda part: part.part_number)
         ]
         loop = asyncio.get_running_loop()
 

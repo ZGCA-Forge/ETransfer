@@ -17,7 +17,7 @@ import logging
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from sqlalchemy import Result, delete
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -372,7 +372,8 @@ class UserDB:
                 # Multiple expired requests for the same browser session can
                 # race here. Make cleanup idempotent so stale tokens behave as
                 # unauthenticated instead of surfacing a 500.
-                await session.execute(delete(SessionTable).where(SessionTable.token == token))
+                token_column = cast(Any, SessionTable.token)
+                await session.execute(delete(SessionTable).where(token_column == token))
                 await session.commit()
                 return None
 
