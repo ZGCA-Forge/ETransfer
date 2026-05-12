@@ -9,7 +9,7 @@ pyyaml>=6.0
 tuspy>=1.0.0
 httpx>=0.25.0
 typer[all]>=0.9.0
-ttkbootstrap>=1.10.0
+ttkbootstrap>=1.18.2
 rich>=13.0.0
 
 # Common
