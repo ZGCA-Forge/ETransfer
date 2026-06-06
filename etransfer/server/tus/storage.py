@@ -1067,7 +1067,7 @@ class TusStorage:
         uploads = await self.list_uploads(include_completed=False)
         for upload in uploads:
             if upload.expires_at and upload.expires_at < now:
-                if user_db and upload.owner_id:
+                if user_db and upload.owner_id and not (upload.sink_plugin and upload.retention == "download_once"):
                     await user_db.update_storage_used(upload.owner_id, -upload.offset)
                 await self.delete_upload(upload.file_id)
                 cleaned += 1
@@ -1083,7 +1083,7 @@ class TusStorage:
                     file_id = f["file_id"]
                     owner_id = f.get("owner_id")
                     file_size = f.get("size", 0)
-                    if user_db and owner_id:
+                    if user_db and owner_id and not (f.get("sink_plugin") and f.get("retention") == "download_once"):
                         await user_db.update_storage_used(owner_id, -file_size)
                     await self.delete_upload(file_id)
                     cleaned += 1

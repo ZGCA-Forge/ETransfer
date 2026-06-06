@@ -32,7 +32,7 @@ _MAX_OBJECTS = 10000
 _DEFAULT_CONTROLLER_PAGE_SIZE = 100
 _MAX_CONTROLLER_PAGE_SIZE = 1000
 _DEFAULT_CONTROLLER_MAX_RUNNING_PER_PAGE = 20
-_MAX_CONTROLLER_MAX_RUNNING_PER_PAGE = 20
+_MAX_CONTROLLER_MAX_RUNNING_PER_PAGE = 40
 _MIGRATION_STATE_PREFIX = "et:migration:"
 _COPY_CHUNK_SIZE = 16 * 1024 * 1024
 _SHUTDOWN_PAUSE_ERROR = "interrupted by shutdown"
@@ -41,6 +41,7 @@ _SHUTDOWN_LOG_INTERVAL_SECONDS = 10
 _MIGRATION_PROGRESS_LOG_INTERVAL_SECONDS = 10
 _MIGRATION_OBJECT_LOG_PATH = Path("local_deploy/bucket_migration_objects.jsonl")
 _MIGRATION_FAILED_OBJECT_LOG_PATH = Path("local_deploy/bucket_migration_failed_objects.jsonl")
+_MIGRATION_STATS_SUMMARY_PATH = Path("local_deploy/bucket_migration_stats_summary.json")
 _MIGRATION_OBJECT_MAX_ATTEMPTS = 3
 _SOURCE_RANGE_MAX_ATTEMPTS = 3
 _SOURCE_RANGE_CONCURRENCY = 4
@@ -76,15 +77,16 @@ def _migration_object_log_paths(log_path: Path = _MIGRATION_OBJECT_LOG_PATH) -> 
     return [path for path in paths if not path.name.startswith(_MIGRATION_FAILED_OBJECT_LOG_PATH.stem)]
 
 
-def _empty_migration_object_log_stats() -> dict[str, int]:
+def _empty_migration_object_log_stats() -> dict[str, Any]:
     return {
         "migration_object_count": 0,
         "migration_download_bytes": 0,
         "migration_push_bytes": 0,
+        "migration_tasks": [],
     }
 
 
-def _scan_migration_object_log_stats(log_path: Path = _MIGRATION_OBJECT_LOG_PATH) -> dict[str, int]:
+def _scan_migration_object_log_stats(log_path: Path = _MIGRATION_OBJECT_LOG_PATH) -> dict[str, Any]:
     """Fully summarize small or test-only completed object-copy logs."""
 
     stats = _empty_migration_object_log_stats()
@@ -111,13 +113,70 @@ def _scan_migration_object_log_stats(log_path: Path = _MIGRATION_OBJECT_LOG_PATH
     return stats
 
 
-def read_migration_object_log_stats(log_path: Path = _MIGRATION_OBJECT_LOG_PATH) -> dict[str, int]:
+def _coerce_non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_migration_stats_summary(summary_path: Optional[Path] = None) -> dict[str, Any]:
+    summary_path = summary_path or _MIGRATION_STATS_SUMMARY_PATH
+    if not summary_path.exists():
+        return _empty_migration_object_log_stats()
+
+    try:
+        with summary_path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        logger.warning("Failed to read migration stats summary: %s", summary_path, exc_info=True)
+        return _empty_migration_object_log_stats()
+
+    tasks: list[dict[str, Any]] = []
+    for task in raw.get("migration_tasks") or raw.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        download_bytes = _coerce_non_negative_int(task.get("download_bytes"))
+        push_bytes = _coerce_non_negative_int(task.get("push_bytes"))
+        tasks.append(
+            {
+                "label": str(task.get("label") or task.get("owner_email") or ""),
+                "owner_email": str(task.get("owner_email") or ""),
+                "source_bucket": str(task.get("source_bucket") or ""),
+                "source_prefix": str(task.get("source_prefix") or ""),
+                "target_bucket": str(task.get("target_bucket") or ""),
+                "target_prefix": str(task.get("target_prefix") or ""),
+                "object_count": _coerce_non_negative_int(task.get("object_count")),
+                "download_bytes": download_bytes,
+                "push_bytes": push_bytes,
+                "remaining_failed_objects": _coerce_non_negative_int(task.get("remaining_failed_objects")),
+            }
+        )
+
+    if tasks:
+        object_count = sum(task["object_count"] for task in tasks)
+        download_bytes = sum(task["download_bytes"] for task in tasks)
+        push_bytes = sum(task["push_bytes"] for task in tasks)
+    else:
+        object_count = _coerce_non_negative_int(raw.get("migration_object_count"))
+        download_bytes = _coerce_non_negative_int(raw.get("migration_download_bytes"))
+        push_bytes = _coerce_non_negative_int(raw.get("migration_push_bytes"))
+
+    return {
+        "migration_object_count": object_count,
+        "migration_download_bytes": download_bytes,
+        "migration_push_bytes": push_bytes,
+        "migration_tasks": tasks,
+    }
+
+
+def read_migration_object_log_stats(log_path: Path = _MIGRATION_OBJECT_LOG_PATH) -> dict[str, Any]:
     """Summarize completed object-copy records from the append-only JSONL log."""
 
     if log_path == _MIGRATION_OBJECT_LOG_PATH:
         # Production stats must stay cheap.  JSONL migration logs are imported
-        # into durable aggregate storage out of band after migrations finish.
-        return _empty_migration_object_log_stats()
+        # into a compact summary out of band after migrations finish.
+        return _read_migration_stats_summary()
     return _scan_migration_object_log_stats(log_path)
 
 

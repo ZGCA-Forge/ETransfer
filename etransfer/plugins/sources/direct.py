@@ -34,12 +34,15 @@ class DirectLinkSource(BaseSource):
         scheme = urlparse(url).scheme.lower()
         return scheme in ("http", "https")
 
-    async def get_file_info(self, url: str) -> RemoteFileInfo:
+    async def get_file_info(self, url: str, *, token: Optional[str] = None) -> RemoteFileInfo:
         """Fetch file metadata via HEAD, falling back to ranged GET.
 
         Some servers (notably S3 pre-signed URLs signed for GET only)
         reject HEAD with 403.  When that happens we fall back to a
         tiny ranged GET and read Content-Range to discover the real size.
+
+        ``token`` is accepted for interface parity but unused — direct links
+        are assumed publicly reachable.
         """
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
             resp = await client.head(url)
@@ -65,6 +68,8 @@ class DirectLinkSource(BaseSource):
         url: str,
         dest: Path,
         on_progress: Optional[Callable[[int, Optional[int]], Any]] = None,
+        *,
+        token: Optional[str] = None,
     ) -> Path:
         dest.mkdir(parents=True, exist_ok=True)
 

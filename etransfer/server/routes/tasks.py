@@ -88,6 +88,7 @@ def create_tasks_router() -> APIRouter:
                 sink_plugin=body.sink_plugin,
                 sink_config=body.sink_config,
                 sink_preset=body.sink_preset,
+                source_config=body.source_config,
                 retention=body.retention,
                 retention_ttl=body.retention_ttl,
                 owner_id=owner_id,
@@ -113,8 +114,11 @@ def create_tasks_router() -> APIRouter:
         user: Any,
     ) -> dict:
         """Expand a repo/folder URL into multiple download tasks."""
+        # Source credentials (e.g. HF gated-repo token) authenticate both the
+        # repo listing and every per-file download task spawned below.
+        source_token = (body.source_config or {}).get("token") or None
         try:
-            files, meta = await source.list_repo_files(body.source_url)
+            files, meta = await source.list_repo_files(body.source_url, token=source_token)
         except ValueError as e:
             raise HTTPException(400, str(e))
         except Exception as e:
@@ -138,6 +142,7 @@ def create_tasks_router() -> APIRouter:
                     sink_plugin=body.sink_plugin,
                     sink_config=body.sink_config,
                     sink_preset=body.sink_preset,
+                    source_config=body.source_config,
                     retention=body.retention,
                     retention_ttl=body.retention_ttl,
                     owner_id=owner_id,
@@ -286,6 +291,7 @@ def create_tasks_router() -> APIRouter:
             sink_plugin=old.sink_plugin,
             sink_config=old.sink_config if old.sink_config else None,
             sink_preset=old.sink_preset,
+            source_config=old.source_config if old.source_config else None,
             retention=old.retention,
             retention_ttl=old.retention_ttl,
             owner_id=owner_id,

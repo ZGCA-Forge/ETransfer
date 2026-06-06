@@ -158,7 +158,7 @@ role_quotas:
     upload_speed_limit: null
     download_speed_limit: null
   user:
-    max_storage_size: 10737418240 # 10 GB
+    max_storage_size: 549755813888 # 512 GB
     max_upload_size: 5368709120 # 5 GB
   guest:
     max_storage_size: 1073741824 # 1 GB

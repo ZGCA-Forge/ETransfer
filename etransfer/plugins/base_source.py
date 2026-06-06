@@ -48,6 +48,15 @@ class BaseSource(ABC):
             return False
         return any(host == h or host.endswith(f".{h}") for h in self.supported_hosts)
 
+    def auth_headers(self, token: Optional[str] = None) -> dict[str, str]:
+        """Build per-request HTTP auth headers from a source credential *token*.
+
+        Default: no auth (public resources only). Sources that support
+        token-based access (e.g. Hugging Face gated/private repos) override
+        this to return e.g. ``{"Authorization": "Bearer <token>"}``.
+        """
+        return {}
+
     @abstractmethod
     async def can_handle(self, url: str) -> bool:
         """Return ``True`` if this source can download *url*.
@@ -57,8 +66,13 @@ class BaseSource(ABC):
         """
 
     @abstractmethod
-    async def get_file_info(self, url: str) -> RemoteFileInfo:
-        """Fetch metadata for the remote resource without downloading it."""
+    async def get_file_info(self, url: str, *, token: Optional[str] = None) -> RemoteFileInfo:
+        """Fetch metadata for the remote resource without downloading it.
+
+        Args:
+            url: Remote resource URL.
+            token: Optional source credential for gated/private resources.
+        """
 
     @abstractmethod
     async def download(
@@ -66,6 +80,8 @@ class BaseSource(ABC):
         url: str,
         dest: Path,
         on_progress: Optional[Callable[[int, Optional[int]], Any]] = None,
+        *,
+        token: Optional[str] = None,
     ) -> Path:
         """Download *url* into *dest* (directory).
 
@@ -73,6 +89,7 @@ class BaseSource(ABC):
             url: Remote resource URL.
             dest: Local directory to write the file into.
             on_progress: ``(downloaded_bytes, total_bytes_or_none)`` callback.
+            token: Optional source credential for gated/private resources.
 
         Returns:
             Full path to the downloaded file.

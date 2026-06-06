@@ -82,6 +82,7 @@ async def _create_test_app(
     default_retention_ttl: int | None = None,
     max_storage_size: int | None = None,
     role_quotas: dict | None = None,
+    sink_presets: dict | None = None,
     auth_token: str = "test-token",
 ) -> tuple:
     """Build a FastAPI app + AsyncClient for testing."""
@@ -95,6 +96,7 @@ async def _create_test_app(
         default_retention_ttl=default_retention_ttl,
         max_storage_size=max_storage_size,
         role_quotas=role_quotas or {},
+        sink_presets=sink_presets or {},
         cleanup_interval=999999,  # disable auto-cleanup
         config_watch=False,
     )
@@ -132,6 +134,8 @@ async def _tus_upload(
     filename: str = "test.bin",
     retention: str | None = None,
     retention_ttl: int | None = None,
+    sink: str | None = None,
+    sink_preset: str | None = None,
     user: UserTable | None = None,
 ) -> str:
     """Perform a full TUS upload (POST create + PATCH chunk). Returns file_id."""
@@ -140,6 +144,10 @@ async def _tus_upload(
         meta_kv["retention"] = retention
     if retention_ttl is not None:
         meta_kv["retention_ttl"] = str(retention_ttl)
+    if sink:
+        meta_kv["sink"] = sink
+    if sink_preset:
+        meta_kv["sink_preset"] = sink_preset
 
     headers = _tus_headers(
         **{
@@ -425,6 +433,102 @@ async def test_quota_full_then_consume_then_resume(tmp_path: Path):
             u = await user_db.get_user(user_id)
             assert u is not None
             assert u.storage_used == 8192, f"Expected 8192, got {u.storage_used}"
+
+        finally:
+            await client.aclose()
+            for handler in app.router.on_shutdown:
+                await handler()
+
+    finally:
+        await user_db.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_sink_upload_bypasses_user_quota_only_for_download_once(tmp_path: Path, fake_bucket_server: dict):
+    """Only download-once sink relay uploads bypass user storage quota."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    from etransfer.plugins.registry import plugin_registry
+    from tests._fake_bucket_sink import FakeBucketSink
+
+    plugin_registry.register_sink(FakeBucketSink)
+
+    tmp_storage = tmp_path / "storage"
+    db_path = tmp_path / "users.db"
+    user_db = UserDB(f"sqlite+aiosqlite:///{db_path}")
+    await user_db.connect()
+
+    try:
+        user = await user_db.upsert_user(
+            oidc_sub="test-sub-sink-quota",
+            username="sinkquota",
+        )
+        assert user is not None
+        user_id = user.id
+
+        app, client, settings = await _create_test_app(
+            tmp_storage,
+            user_db=user_db,
+            role_quotas={
+                "user": {
+                    "max_upload_size": 1,
+                    "max_storage_size": 1,
+                }
+            },
+            sink_presets={
+                "fake_bucket": {
+                    "default": {
+                        "endpoint": fake_bucket_server["url"],
+                        "bucket": "test-bucket",
+                    }
+                }
+            },
+        )
+
+        try:
+
+            class InjectUserMiddleware(BaseHTTPMiddleware):
+                async def dispatch(self, request, call_next):
+                    request.state.user = user
+                    return await call_next(request)
+
+            app.add_middleware(InjectUserMiddleware)
+            transport = ASGITransport(app=app)
+            client = AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+                headers={"X-API-Token": "test-token"},
+            )
+
+            data = b"S" * 4096
+            permanent_meta = _encode_metadata(
+                filename="sink-permanent.bin",
+                filetype="application/octet-stream",
+                sink="fake_bucket",
+            )
+            resp = await client.post(
+                "/tus",
+                headers=_tus_headers(
+                    **{
+                        "Upload-Length": str(len(data)),
+                        "Upload-Metadata": permanent_meta,
+                        "Content-Type": "application/offset+octet-stream",
+                    }
+                ),
+            )
+            assert resp.status_code == 413
+
+            await _tus_upload(
+                client,
+                data,
+                filename="sink-download-once.bin",
+                retention="download_once",
+                sink="fake_bucket",
+            )
+
+            updated_user = await user_db.get_user(user_id)
+            assert updated_user is not None
+            assert updated_user.storage_used == 0
 
         finally:
             await client.aclose()

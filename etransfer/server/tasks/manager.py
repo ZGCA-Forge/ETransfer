@@ -203,6 +203,11 @@ class TaskManager:
         await self._state.set(self._key(task.task_id), data)
 
     @staticmethod
+    def _source_token(task: TransferTask) -> Optional[str]:
+        """Extract the source credential token (e.g. HF access token) if any."""
+        return (task.source_config or {}).get("token") or None
+
+    @staticmethod
     def _sanitize_task_dict(d: dict) -> dict:
         """Convert legacy None values to protocol-standard defaults."""
         _str_defaults = {
@@ -261,6 +266,7 @@ class TaskManager:
         owner_id: Optional[int] = None,
         user: Any = None,
         filename: str = "",
+        source_config: Optional[dict] = None,
     ) -> TransferTask:
         source = await self._registry.resolve_source(source_url)
 
@@ -288,6 +294,7 @@ class TaskManager:
             sink_plugin=sink_plugin,
             sink_config=resolved_sink_config,
             sink_preset=sink_preset,
+            source_config=source_config or {},
             retention=retention,
             retention_ttl=retention_ttl,
             owner_id=owner_id,
@@ -696,11 +703,14 @@ class TaskManager:
         """
         source = self._registry.get_source(task.source_plugin)
         sink = self._registry.create_sink(task.sink_plugin, config=task.sink_config)  # type: ignore[arg-type]
+        token = self._source_token(task)
 
         # Get file info (filename, size) — skip if already pre-set from batch
         task.status = TaskStatus.DOWNLOADING
         await self._save(task)
-        info = await self._retry(source.get_file_info, task.source_url, label=f"get_file_info({task.task_id[:8]})")
+        info = await self._retry(
+            source.get_file_info, task.source_url, token=token, label=f"get_file_info({task.task_id[:8]})"
+        )
         if not task.filename:
             task.filename = info.filename
         if info.size:
@@ -812,6 +822,9 @@ class TaskManager:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/39.0.2171.95 Safari/537.36"
             )
+        # Source credential (e.g. HF gated-repo token). httpx drops the
+        # Authorization header on the cross-origin redirect to the signed CDN.
+        stream_headers.update(source.auth_headers(token))
         if resume_offset > 0:
             stream_headers["Range"] = f"bytes={resume_offset}-"
 
@@ -1029,7 +1042,10 @@ class TaskManager:
         await self._save(task)
 
         source = self._registry.get_source(task.source_plugin)
-        info = await self._retry(source.get_file_info, task.source_url, label=f"get_file_info({task.task_id[:8]})")
+        token = self._source_token(task)
+        info = await self._retry(
+            source.get_file_info, task.source_url, token=token, label=f"get_file_info({task.task_id[:8]})"
+        )
         if not task.filename:
             task.filename = info.filename
         if info.size:
@@ -1049,7 +1065,12 @@ class TaskManager:
                 raise asyncio.CancelledError()
 
         file_path = await self._retry(
-            source.download, task.source_url, dest_dir, on_progress=_progress, label=f"download({task.task_id[:8]})"
+            source.download,
+            task.source_url,
+            dest_dir,
+            on_progress=_progress,
+            token=token,
+            label=f"download({task.task_id[:8]})",
         )
         task.filename = file_path.name
         task.file_size = file_path.stat().st_size

@@ -2270,7 +2270,7 @@ user_system:
       max_storage_size: null
       max_upload_size: null
     user:
-      max_storage_size: 10737418240  # 10GB
+      max_storage_size: 549755813888  # 512GB
       max_upload_size: 5368709120     # 5GB
     guest:
       max_storage_size: 1073741824   # 1GB
@@ -2302,6 +2302,7 @@ def _submit_remote_download(
     sink_preset: Optional[str] = None,
     retention: str,
     retention_ttl: Optional[int],
+    source_config: Optional[dict[str, Any]] = None,
 ) -> dict:
     body: dict = {"source_url": url, "retention": retention}
     if output:
@@ -2312,6 +2313,8 @@ def _submit_remote_download(
         body["sink_config"] = sink_config
     if sink_preset:
         body["sink_preset"] = sink_preset
+    if source_config:
+        body["source_config"] = source_config
     if retention_ttl is not None:
         body["retention_ttl"] = retention_ttl
     resp = httpx.post(f"{server.rstrip('/')}/api/tasks", json=body, headers=headers, timeout=60)
@@ -2329,6 +2332,12 @@ def remote_download(
         "-t",
         help="API token (overrides saved session)",
         envvar="ETRANSFER_TOKEN",
+    ),
+    hf_token: Optional[str] = typer.Option(
+        None,
+        "--hf-token",
+        help="HuggingFace access token (hf_***) for gated/private repos",
+        envvar="HF_TOKEN",
     ),
     sink: Optional[str] = typer.Option(None, "--sink", help="Sink plugin name (e.g. tos). Omit = save to server"),
     sink_config: Optional[str] = typer.Option(None, "--sink-config", help="Sink config JSON merged over preset"),
@@ -2365,6 +2374,7 @@ def remote_download(
         et remote-download https://hf-mirror.com/gpt2/resolve/main/config.json
         et remote-download https://example.com/file.zip --sink tos
         et remote-download https://example.com/file.zip --sink tos -w
+        et remote-download https://hf-mirror.com/meta-llama/Llama-2-7b-hf --hf-token hf_***
     """
     if url is None:
         console.print()
@@ -2372,6 +2382,7 @@ def remote_download(
         console.print("[bold]Usage:[/bold]  et remote-download <URL> [OPTIONS]\n")
         console.print("[bold]Options:[/bold]")
         console.print("  -o, --output TEXT    Override saved filename")
+        console.print("  --hf-token TEXT      HuggingFace access token (hf_***) for gated/private repos")
         console.print("  --sink TEXT          Push to sink plugin (e.g. tos). Omit = save to server")
         console.print("  --sink-config JSON   Sink config JSON merged over preset")
         console.print("  --sink-config-file   Sink config file (JSON/YAML)")
@@ -2386,6 +2397,9 @@ def remote_download(
         console.print("  [dim]et remote-download https://example.com/file.zip --sink tos -w[/dim]")
         console.print(
             "  [dim]et remote-download https://example.com/file.zip --sink zos --sink-param bucket=my-zos[/dim]"
+        )
+        console.print(
+            "  [dim]et remote-download https://hf-mirror.com/meta-llama/Llama-2-7b-hf --hf-token hf_***[/dim]"
         )
         return
 
@@ -2402,6 +2416,8 @@ def remote_download(
         print_error("--sink-config/--sink-config-file/--sink-param require --sink")
         raise typer.Exit(1)
 
+    source_config_dict = {"token": hf_token} if hf_token else None
+
     try:
         data = _submit_remote_download(
             server,
@@ -2413,6 +2429,7 @@ def remote_download(
             sink_preset=sink_preset,
             retention=retention,
             retention_ttl=retention_ttl,
+            source_config=source_config_dict,
         )
     except httpx.HTTPStatusError as e:
         print_error(f"Server error: {e.response.text}")

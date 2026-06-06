@@ -88,13 +88,26 @@ class HuggingFaceSource(BaseSource):
             return True
         return False
 
-    async def get_file_info(self, url: str) -> RemoteFileInfo:
+    def auth_headers(self, token: Optional[str] = None) -> dict[str, str]:
+        """Bearer auth for gated/private repos (``--token hf_***``).
+
+        httpx/aria2 drop this header on the cross-origin redirect to the
+        signed LFS CDN, so it is only ever sent to the HF host itself —
+        matching how ``huggingface-cli`` and ``hfd`` authenticate.
+        """
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+        return {}
+
+    async def get_file_info(self, url: str, *, token: Optional[str] = None) -> RemoteFileInfo:
         parts = _parse_hf_url(url)
         if not parts:
             self._raise_repo_hint(url)
 
         dl_url = _to_resolve_url(parts)
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=30, headers=self.auth_headers(token) or None
+        ) as client:
             resp = await client.head(dl_url)
             resp.raise_for_status()
 
@@ -146,8 +159,12 @@ class HuggingFaceSource(BaseSource):
         """Check if this is a repo/dataset page URL (not a single file)."""
         return _parse_hf_url(url) is None and self._parse_repo_url(url) is not None
 
-    async def list_repo_files(self, url: str) -> tuple[list[dict], dict]:
+    async def list_repo_files(self, url: str, *, token: Optional[str] = None) -> tuple[list[dict], dict]:
         """List all files in a HF repo.
+
+        Args:
+            url: Repo/dataset page URL.
+            token: Optional access token for gated/private repos.
 
         Returns:
             (files, meta) where files is [{path, size, type}, ...]
@@ -163,7 +180,9 @@ class HuggingFaceSource(BaseSource):
             api_url += f"/{info['subdir']}"
 
         all_files: list[dict] = []
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(
+            timeout=30, follow_redirects=True, headers=self.auth_headers(token) or None
+        ) as client:
             resp = await client.get(api_url, params=params)
             resp.raise_for_status()
             entries = resp.json()
@@ -192,6 +211,8 @@ class HuggingFaceSource(BaseSource):
         url: str,
         dest: Path,
         on_progress: Optional[Callable[[int, Optional[int]], Any]] = None,
+        *,
+        token: Optional[str] = None,
     ) -> Path:
         parts = _parse_hf_url(url)
         if not parts:
@@ -201,15 +222,20 @@ class HuggingFaceSource(BaseSource):
         dl_url = _to_resolve_url(parts)
         rel_path = unquote(parts["path"])
         filename = rel_path.rsplit("/", 1)[-1]
+        headers = self.auth_headers(token)
 
         # Prefer aria2c for multi-connection download
         from etransfer.plugins import aria2
 
         if aria2.is_available():
             logger.info("Using aria2c for HF download: %s", dl_url)
-            return await aria2.download(dl_url, dest, filename=filename, on_progress=on_progress)
+            return await aria2.download(
+                dl_url, dest, filename=filename, headers=headers or None, on_progress=on_progress
+            )
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(30, read=600)) as client:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=httpx.Timeout(30, read=600), headers=headers or None
+        ) as client:
             async with client.stream("GET", dl_url) as resp:
                 resp.raise_for_status()
 

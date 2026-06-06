@@ -43,6 +43,11 @@ def test_parse_size_mb():
     assert parse_size("100MB") == 100 * 1024**2
 
 
+def test_default_user_storage_quota_is_512gb():
+    settings = ServerSettings()
+    assert settings.role_quotas["user"]["max_storage_size"] == 512 * 1024**3
+
+
 def test_parse_size_gb():
     assert parse_size("2GB") == 2 * 1024**3
 

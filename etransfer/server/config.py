@@ -204,7 +204,7 @@ class ServerSettings(BaseSettings):
                 "download_speed_limit": None,
             },
             "user": {
-                "max_storage_size": 10 * 1024**3,  # 10 GB
+                "max_storage_size": 512 * 1024**3,  # 512 GB
                 "max_upload_size": 5 * 1024**3,  # 5 GB
                 "upload_speed_limit": None,
                 "download_speed_limit": None,

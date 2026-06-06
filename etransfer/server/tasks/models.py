@@ -29,6 +29,11 @@ class TransferTask(BaseModel):
     sink_config: dict = Field(default_factory=dict, description="Resolved sink configuration")
     sink_preset: str = Field("", description="Named server-side preset; recorded for retry/audit")
 
+    # Source-side credentials (e.g. HuggingFace access token for gated/private
+    # repos). Persisted so download + resume + retry can re-authenticate.
+    # Never exposed via TaskResponse — secrets stay server-side only.
+    source_config: dict = Field(default_factory=dict, description="Source credentials, e.g. {'token': 'hf_***'}")
+
     status: TaskStatus = Field(TaskStatus.PENDING, description="Current task status")
     progress: float = Field(0.0, description="Overall progress 0.0 – 1.0")
     downloaded_bytes: int = Field(0, description="Bytes downloaded so far")
@@ -73,6 +78,10 @@ class CreateTaskRequest(BaseModel):
     sink_plugin: str = Field("", description="Sink plugin name (empty = no push)")
     sink_config: dict = Field(default_factory=dict, description="Explicit sink config (overrides presets)")
     sink_preset: str = Field("", description="Named server-side preset under sinks.presets.<sink>.<name>")
+    source_config: dict = Field(
+        default_factory=dict,
+        description="Source credentials, e.g. {'token': 'hf_***'} for gated/private HuggingFace repos",
+    )
     retention: str = Field("download_once", description="download_once / permanent / ttl")
     retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
 

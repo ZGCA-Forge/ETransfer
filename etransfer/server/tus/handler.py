@@ -122,15 +122,57 @@ def create_tus_router(
         except ValueError:
             raise HTTPException(400, "Invalid Upload-Length header")
 
+        # Parse metadata
+        metadata_header = request.headers.get(TusHeaders.UPLOAD_METADATA, "")
+        try:
+            if metadata_header:
+                tus_metadata = TusMetadata.from_header(metadata_header)
+            else:
+                tus_metadata = TusMetadata(filename=f"upload_{uuid.uuid4().hex[:8]}")  # type: ignore[call-arg]
+        except ValueError as e:
+            raise HTTPException(400, f"Invalid Upload-Metadata: {e}")
+
+        # Determine retention policy: client metadata > token policy > server default
+        retention = tus_metadata.retention
+        retention_ttl = tus_metadata.retention_ttl
+
+        # If client didn't specify, check token-level policy.
+        # Read retention config from app.state.settings (hot-reloadable).
+        if not retention:
+            _settings = getattr(request.app.state, "settings", None)
+            _def_ret = getattr(_settings, "default_retention", "permanent")
+            _def_ttl = getattr(_settings, "default_retention_ttl", None) or 0
+            _tok_pol = getattr(_settings, "token_retention_policies", None) or {}
+
+            token = request.headers.get(AUTH_HEADER, "")
+            if token and token in _tok_pol:
+                tp = _tok_pol[token]
+                retention = tp.get("default_retention", _def_ret)
+                if not retention_ttl:
+                    retention_ttl = tp.get("default_ttl", _def_ttl)
+            else:
+                retention = _def_ret
+                if not retention_ttl:
+                    retention_ttl = _def_ttl
+
+        if retention not in ("permanent", "download_once", "ttl"):
+            retention = "download_once"
+
+        # Enforce server policy: non-privileged callers may be blocked from
+        # requesting permanent retention when ``allow_permanent_retention``
+        # is False.  Falls back silently for privileged callers.
+        enforce_retention_policy(request, retention)
+
         # Check max single file size
         if max_size and upload_length > max_size:
             raise HTTPException(413, "Upload exceeds maximum size")
 
-        # Check user-level quota at CREATE time and reserve space in Redis.
-        # This avoids per-chunk DB queries during PATCH.
+        # Sink uploads are relay-only for user accounting only when they are
+        # download-once. Permanent/TTL sink uploads still count against quota.
         owner_id = getattr(getattr(request.state, "user", None), "id", None)
         user_db = getattr(request.app.state, "user_db", None)
-        if user_db and owner_id:
+        counts_user_quota = not (bool(tus_metadata.sink) and retention == "download_once")
+        if counts_user_quota and user_db and owner_id:
             user = await user_db.get_user(owner_id)
             if user:
                 role_quotas = getattr(request.app.state, "parsed_role_quotas", {})
@@ -163,55 +205,11 @@ def create_tus_router(
                             f"reserved={reserved}, limit={effective.max_storage_size})",
                         )
 
-                # No upfront reservation — quota is reserved incrementally
-                # per PATCH as bytes are actually written to disk.
-
-        # Parse metadata
-        metadata_header = request.headers.get(TusHeaders.UPLOAD_METADATA, "")
-        try:
-            if metadata_header:
-                tus_metadata = TusMetadata.from_header(metadata_header)
-            else:
-                tus_metadata = TusMetadata(filename=f"upload_{uuid.uuid4().hex[:8]}")  # type: ignore[call-arg]
-        except ValueError as e:
-            raise HTTPException(400, f"Invalid Upload-Metadata: {e}")
-
         # Generate file ID
         file_id = uuid.uuid4().hex
 
         # Calculate expiration
         expires_at = datetime.utcnow() + timedelta(seconds=UPLOAD_EXPIRATION_SECONDS)
-
-        # Determine retention policy: client metadata > token policy > server default
-        retention = tus_metadata.retention
-        retention_ttl = tus_metadata.retention_ttl
-
-        # If client didn't specify, check token-level policy.
-        # Read retention config from app.state.settings (hot-reloadable).
-        if not retention:
-            _settings = getattr(request.app.state, "settings", None)
-            _def_ret = getattr(_settings, "default_retention", "permanent")
-            _def_ttl = getattr(_settings, "default_retention_ttl", None) or 0
-            _tok_pol = getattr(_settings, "token_retention_policies", None) or {}
-
-            token = request.headers.get(AUTH_HEADER, "")
-            if token and token in _tok_pol:
-                tp = _tok_pol[token]
-                retention = tp.get("default_retention", _def_ret)
-                if not retention_ttl:
-                    retention_ttl = tp.get("default_ttl", _def_ttl)
-            else:
-                retention = _def_ret
-                if not retention_ttl:
-                    retention_ttl = _def_ttl
-
-        if retention not in ("permanent", "download_once", "ttl"):
-            retention = "download_once"
-
-        # Enforce server policy: non-privileged callers may be blocked from
-        # requesting permanent retention when ``allow_permanent_retention``
-        # is False.  Falls back silently for privileged callers.
-        enforce_retention_policy(request, retention)
 
         # Chunk-based storage for download_once (streaming relay) or sink forwarding
         use_chunked = retention == "download_once" or bool(tus_metadata.sink)
@@ -437,6 +435,12 @@ def create_tus_router(
             _check_upload_ownership(request, upload_record)
         patch_owner_id = upload_record.owner_id if upload_record else None
         upload_speed_limit: Optional[int] = None
+        counts_user_quota = bool(
+            patch_owner_id
+            and upload_record
+            and not (upload_record.sink_plugin and upload_record.retention == "download_once")
+        )
+        reserved_user_quota = False
         if patch_owner_id:
             user_db = getattr(request.app.state, "user_db", None)
             if user_db:
@@ -445,7 +449,7 @@ def create_tus_router(
                     role_quotas = getattr(request.app.state, "parsed_role_quotas", {})
                     effective = await user_db.get_effective_quota(user, role_quotas)
                     upload_speed_limit = effective.upload_speed_limit
-                    if effective.max_storage_size:
+                    if counts_user_quota and effective.max_storage_size:
                         reserved = await quota_svc.get_reserved(patch_owner_id)
                         total_after = user.storage_used + reserved + content_length
                         if total_after > effective.max_storage_size:
@@ -464,8 +468,10 @@ def create_tus_router(
                                 f"reserved={reserved}, chunk={content_length}, "
                                 f"limit={effective.max_storage_size})",
                             )
-            # Reserve upfront — will release on write failure
-            await quota_svc.reserve(patch_owner_id, content_length)
+                    if counts_user_quota:
+                        # Reserve upfront — will release on write failure
+                        await quota_svc.reserve(patch_owner_id, content_length)
+                        reserved_user_quota = True
 
         # Fallback: resolve speed limit when no owner_id (API-token auth)
         if upload_speed_limit is None:
@@ -526,7 +532,7 @@ def create_tus_router(
                     content_length,
                 )
         except Exception:
-            if patch_owner_id:
+            if patch_owner_id and reserved_user_quota:
                 await quota_svc.release(patch_owner_id, content_length)
             if upload_record and upload_record.chunked_storage:
                 chunk_index = offset // upload_record.chunk_size
@@ -538,7 +544,7 @@ def create_tus_router(
             raise
 
         # Adjust reservation if fewer bytes were actually written
-        if patch_owner_id and written < content_length:
+        if patch_owner_id and reserved_user_quota and written < content_length:
             await quota_svc.release(patch_owner_id, content_length - written)
 
         # ── Merge range + compute flushable sink parts ────────
@@ -590,7 +596,7 @@ def create_tus_router(
         # ── Finalize if complete ─────────────────────────────
         if completed:
             user_db = getattr(request.app.state, "user_db", None)
-            if user_db and upload.owner_id:
+            if user_db and upload.owner_id and not (upload.sink_plugin and upload.retention == "download_once"):
                 await user_db.update_storage_used(upload.owner_id, upload.size)
                 await quota_svc.release(upload.owner_id, upload.size)
                 logger.debug(
@@ -602,10 +608,11 @@ def create_tus_router(
                 )
             else:
                 logger.debug(
-                    "TUS FINALIZE %s: no quota update (owner_id=%r user_db=%s)",
+                    "TUS FINALIZE %s: no quota update (owner_id=%r user_db=%s sink=%s)",
                     file_id[:8],
                     upload.owner_id,
                     "yes" if user_db else "no",
+                    upload.sink_plugin or "-",
                 )
             await storage.finalize_upload(file_id)
 
@@ -659,7 +666,7 @@ def create_tus_router(
         _check_upload_ownership(request, upload)
 
         user_db = getattr(request.app.state, "user_db", None)
-        if user_db and upload.owner_id:
+        if user_db and upload.owner_id and not (upload.sink_plugin and upload.retention == "download_once"):
             if upload.is_final:
                 # Already committed to DB — revert storage_used
                 await user_db.update_storage_used(upload.owner_id, -upload.size)

@@ -598,20 +598,88 @@ def test_migration_object_log_stats_counts_completed_records(tmp_path: Path) -> 
         "migration_object_count": 3,
         "migration_download_bytes": 60,
         "migration_push_bytes": 60,
+        "migration_tasks": [],
     }
 
 
-def test_default_migration_object_log_stats_do_not_scan_jsonl(monkeypatch) -> None:
+def test_default_migration_object_log_stats_use_summary_without_scanning_jsonl(monkeypatch, tmp_path: Path) -> None:
+    summary_path = tmp_path / "bucket_migration_stats_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "migration_tasks": [
+                    {
+                        "label": "task-a",
+                        "owner_email": "user-a@example.com",
+                        "source_bucket": "source-a",
+                        "target_bucket": "target-a",
+                        "object_count": 2,
+                        "download_bytes": 30,
+                        "push_bytes": 30,
+                    },
+                    {
+                        "label": "task-b",
+                        "owner_email": "user-b@example.com",
+                        "source_bucket": "source-b",
+                        "target_bucket": "target-b",
+                        "object_count": 3,
+                        "download_bytes": 70,
+                        "push_bytes": 70,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(migrations, "_MIGRATION_STATS_SUMMARY_PATH", summary_path)
     monkeypatch.setattr(
         migrations,
         "_scan_migration_object_log_stats",
         lambda log_path: (_ for _ in ()).throw(AssertionError("should not scan production logs")),
     )
 
+    stats = migrations.read_migration_object_log_stats()
+    assert stats == {
+        "migration_object_count": 5,
+        "migration_download_bytes": 100,
+        "migration_push_bytes": 100,
+        "migration_tasks": [
+            {
+                "label": "task-a",
+                "owner_email": "user-a@example.com",
+                "source_bucket": "source-a",
+                "source_prefix": "",
+                "target_bucket": "target-a",
+                "target_prefix": "",
+                "object_count": 2,
+                "download_bytes": 30,
+                "push_bytes": 30,
+                "remaining_failed_objects": 0,
+            },
+            {
+                "label": "task-b",
+                "owner_email": "user-b@example.com",
+                "source_bucket": "source-b",
+                "source_prefix": "",
+                "target_bucket": "target-b",
+                "target_prefix": "",
+                "object_count": 3,
+                "download_bytes": 70,
+                "push_bytes": 70,
+                "remaining_failed_objects": 0,
+            },
+        ],
+    }
+
+
+def test_default_migration_object_log_stats_empty_when_summary_missing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(migrations, "_MIGRATION_STATS_SUMMARY_PATH", tmp_path / "missing.json")
+
     assert migrations.read_migration_object_log_stats() == {
         "migration_object_count": 0,
         "migration_download_bytes": 0,
         "migration_push_bytes": 0,
+        "migration_tasks": [],
     }
 
 

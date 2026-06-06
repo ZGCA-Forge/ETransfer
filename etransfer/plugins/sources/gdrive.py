@@ -237,11 +237,14 @@ class GoogleDriveSource(BaseSource):
         """Check if this is a folder URL (not a single file)."""
         return _extract_file_id(url) is None and _extract_folder_id(url) is not None
 
-    async def list_repo_files(self, url: str) -> tuple[list[dict], dict]:
+    async def list_repo_files(self, url: str, *, token: Optional[str] = None) -> tuple[list[dict], dict]:
         """List all files in a Google Drive folder.
 
         Uses Google Drive API v3 when an API key is configured; otherwise
         falls back to scraping the folder HTML page (no key required).
+
+        ``token`` is accepted for interface parity but unused — Drive auth
+        is driven by ``google_api_key`` instead.
         """
         folder_id = _extract_folder_id(url)
         if not folder_id:
@@ -359,7 +362,7 @@ class GoogleDriveSource(BaseSource):
             # Fallback: confirm=t bypass (works for current Google Drive)
             return f"{base_url}&confirm=t", cookies
 
-    async def get_file_info(self, url: str) -> RemoteFileInfo:
+    async def get_file_info(self, url: str, *, token: Optional[str] = None) -> RemoteFileInfo:
         """Get filename and size via a Range request to the resolved URL."""
         file_id = _extract_file_id(url)
         if not file_id:
@@ -401,6 +404,8 @@ class GoogleDriveSource(BaseSource):
         url: str,
         dest: Path,
         on_progress: Optional[Callable[[int, Optional[int]], Any]] = None,
+        *,
+        token: Optional[str] = None,
     ) -> Path:
         """Download a Google Drive file to local disk."""
         file_id = _extract_file_id(url)
