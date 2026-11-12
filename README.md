@@ -129,9 +129,34 @@ retention:
 
 ETransfer 自带 _Source_（离线下载源）+ _Sink_（推送目标）两类插件：
 
-- 内置 Source：`direct`、`huggingface`、`gdrive`
-- 内置 Sink：`local`、`tos`（火山引擎 TOS）
+- 内置 Source：`direct`、`huggingface`、`gdrive`、`modelscope`
+- 内置 Sink：`local`、`tos`（火山引擎 TOS）、`zos`
 - 通过 `entry_points` 注册第三方插件，开发请参考 `etransfer/plugins/base_*.py`
+
+### ModelScope（魔搭）
+
+ModelScope 仓库页面 URL 会被自动展开为逐文件任务并推送到指定桶：
+
+```bash
+# 整仓下载并推送（模型 / 数据集均可）
+et remote-download https://modelscope.cn/models/Qwen/Qwen3.5-0.8B --sink tos -w
+et remote-download https://modelscope.cn/datasets/AI-ModelScope/gsm8k --sink tos -w
+```
+
+默认推到 `modelscope/models/{owner}/{name}/{revision}/...` 这类**确定性对象键**下，
+因此重复下载会覆盖同一批对象，不会在桶里留下第二份大文件。
+
+服务端还提供发现接口，供前端渲染"模型广场"并标注哪些已下载过：
+
+```
+GET /api/sources/modelscope/models?search=qwen&sort=downloads
+GET /api/sources/modelscope/datasets
+GET /api/sources/modelscope/collections
+GET /api/sources/modelscope/{kind}/{owner}/{name}/files   # 下载前预览体积
+GET /api/sources/modelscope/downloaded                    # 已推送过的仓库
+```
+
+创建任务时传 `"skip_existing": true`，服务端会 HEAD 桶中已有的确定性键并跳过这些文件。
 
 ## 文档
 
