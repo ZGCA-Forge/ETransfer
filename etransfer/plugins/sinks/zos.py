@@ -197,6 +197,68 @@ class ZosSink(BaseSink):
         )
         logger.info("ZOS multipart aborted: %s", upload_id[:12])
 
+    # ── Bucket introspection ─────────────────────────────────
+
+    async def object_exists(self, object_key: str) -> Optional[bool]:
+        self._ensure_client()
+        full_key = self._object_key(object_key)
+        loop = asyncio.get_running_loop()
+
+        def _head() -> bool:
+            try:
+                self._client.head_object(Bucket=self._bucket, Key=full_key)
+                return True
+            except Exception as exc:
+                # botocore raises ClientError with a 404 code for missing keys.
+                response = getattr(exc, "response", None) or {}
+                code = str(response.get("Error", {}).get("Code", ""))
+                status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+                if code in ("404", "NoSuchKey", "NotFound") or status == 404:
+                    return False
+                raise
+
+        try:
+            return await loop.run_in_executor(None, _head)
+        except Exception:
+            logger.debug("ZOS head_object failed for %s", full_key, exc_info=True)
+            return None
+
+    async def list_objects(self, prefix: str = "", limit: int = 1000) -> Optional[list[dict]]:
+        self._ensure_client()
+        full_prefix = self._object_key(prefix) if prefix else self._object_key("")
+        loop = asyncio.get_running_loop()
+        max_items = max(1, int(limit))
+
+        def _list() -> list[dict]:
+            results: list[dict] = []
+            token = ""
+            while len(results) < max_items:
+                kwargs: dict = {"Bucket": self._bucket, "MaxKeys": min(1000, max_items - len(results))}
+                if full_prefix:
+                    kwargs["Prefix"] = full_prefix
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = self._client.list_objects_v2(**kwargs)
+                for item in resp.get("Contents", []) or []:
+                    key = item.get("Key", "")
+                    if not key:
+                        continue
+                    results.append({"key": key, "size": int(item.get("Size") or 0)})
+                    if len(results) >= max_items:
+                        break
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken", "") or ""
+                if not token:
+                    break
+            return results
+
+        try:
+            return await loop.run_in_executor(None, _list)
+        except Exception:
+            logger.debug("ZOS list_objects failed for prefix %s", full_prefix, exc_info=True)
+            return None
+
     @classmethod
     def get_config_schema(cls) -> dict:
         return {
