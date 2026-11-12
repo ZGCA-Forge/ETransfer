@@ -67,6 +67,32 @@ class LocalSink(BaseSink):
         shutil.rmtree(session_dir, ignore_errors=True)
         logger.info("LocalSink aborted: %s", session_id[:8])
 
+    # ── Bucket introspection ─────────────────────────────────
+
+    def _completed_root(self) -> Path:
+        return self._base_path / "completed"
+
+    async def object_exists(self, object_key: str) -> Optional[bool]:
+        target = self._completed_root() / object_key
+        return target.is_file()
+
+    async def list_objects(self, prefix: str = "", limit: int = 1000) -> Optional[list[dict]]:
+        root = self._completed_root()
+        if not root.is_dir():
+            return []
+        max_items = max(1, int(limit))
+        results: list[dict] = []
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            key = path.relative_to(root).as_posix()
+            if prefix and not key.startswith(prefix):
+                continue
+            results.append({"key": key, "size": path.stat().st_size})
+            if len(results) >= max_items:
+                break
+        return results
+
     @classmethod
     def get_config_schema(cls) -> dict:
         return {

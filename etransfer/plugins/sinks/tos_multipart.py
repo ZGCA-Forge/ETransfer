@@ -112,6 +112,69 @@ class TosSink(BaseSink):
             )
         logger.info("TOS multipart aborted: %s", session_id[:12])
 
+    # ── Bucket introspection ─────────────────────────────────
+
+    async def object_exists(self, object_key: str) -> Optional[bool]:
+        """HEAD the object; 404 means absent, any other error is 'unknown'."""
+        self._ensure_client()
+        full_key = self._object_key(object_key)
+        loop = asyncio.get_running_loop()
+
+        def _head() -> bool:
+            try:
+                self._client.head_object(self._bucket, full_key)
+                return True
+            except Exception as exc:
+                # tos raises TosClientError with status_code 404 when missing.
+                if getattr(exc, "status_code", None) == 404:
+                    return False
+                raise
+
+        try:
+            return await loop.run_in_executor(None, _head)
+        except NotImplementedError:
+            return None
+        except Exception:
+            logger.debug("TOS head_object failed for %s", full_key, exc_info=True)
+            return None
+
+    async def list_objects(self, prefix: str = "", limit: int = 1000) -> Optional[list[dict]]:
+        self._ensure_client()
+        full_prefix = self._object_key(prefix) if prefix else self._object_key("")
+        loop = asyncio.get_running_loop()
+        max_items = max(1, int(limit))
+
+        def _list() -> list[dict]:
+            results: list[dict] = []
+            marker = ""
+            while len(results) < max_items:
+                kwargs: dict = {"max_keys": min(1000, max_items - len(results))}
+                if full_prefix:
+                    kwargs["prefix"] = full_prefix
+                if marker:
+                    kwargs["marker"] = marker
+                resp = self._client.list_objects(self._bucket, **kwargs)
+                contents = getattr(resp, "contents", None) or []
+                for item in contents:
+                    key = getattr(item, "key", "") or ""
+                    if not key:
+                        continue
+                    results.append({"key": key, "size": int(getattr(item, "size", 0) or 0)})
+                    if len(results) >= max_items:
+                        break
+                if not getattr(resp, "is_truncated", False):
+                    break
+                marker = getattr(resp, "next_marker", "") or ""
+                if not marker:
+                    break
+            return results
+
+        try:
+            return await loop.run_in_executor(None, _list)
+        except Exception:
+            logger.debug("TOS list_objects failed for prefix %s", full_prefix, exc_info=True)
+            return None
+
     @classmethod
     def get_config_schema(cls) -> dict:
         return {

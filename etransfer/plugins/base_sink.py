@@ -67,6 +67,30 @@ class BaseSink(ABC):
     async def abort_upload(self, session_id: str) -> None:
         """Cancel an in-progress multipart upload and clean up."""
 
+    # ── Bucket introspection (optional) ───────────────────────
+    #
+    # Used for "have we already pushed this?" checks. Sinks that cannot list
+    # their backing store simply leave the default (unsupported) behaviour in
+    # place; callers must treat NotImplementedError as "unknown", never as
+    # "absent" — guessing wrong there would silently skip real downloads.
+
+    async def object_exists(self, object_key: str) -> Optional[bool]:
+        """Return True/False if known, or ``None`` when unsupported.
+
+        ``object_key`` is the *logical* key (before any configured prefix is
+        applied); implementations must apply their own prefixing.
+        """
+        return None
+
+    async def list_objects(self, prefix: str = "", limit: int = 1000) -> Optional[list[dict]]:
+        """List objects under *prefix* as ``[{"key", "size"}]``, or ``None``."""
+        return None
+
+    @classmethod
+    def supports_introspection(cls) -> bool:
+        """True when this sink overrides the introspection hooks above."""
+        return cls.object_exists is not BaseSink.object_exists or cls.list_objects is not BaseSink.list_objects
+
     # ── Config schema / resolution ────────────────────────────
 
     @classmethod

@@ -84,6 +84,7 @@ et = "etransfer.client.cli:app"
 direct = "etransfer.plugins.sources.direct:DirectLinkSource"
 gdrive = "etransfer.plugins.sources.gdrive:GoogleDriveSource"
 huggingface = "etransfer.plugins.sources.huggingface:HuggingFaceSource"
+modelscope = "etransfer.plugins.sources.modelscope:ModelScopeSource"
 
 [project.entry-points."etransfer.sinks"]
 local = "etransfer.plugins.sinks.local:LocalSink"

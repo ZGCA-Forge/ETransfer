@@ -217,6 +217,7 @@ class TaskManager:
             "file_id": "",
             "sink_session_id": "",
             "sink_result_url": "",
+            "sink_object_key": "",
             "source_plugin": "",
             "superseded_by": "",
         }
@@ -267,6 +268,7 @@ class TaskManager:
         user: Any = None,
         filename: str = "",
         source_config: Optional[dict] = None,
+        sink_object_key: str = "",
     ) -> TransferTask:
         source = await self._registry.resolve_source(source_url)
 
@@ -299,6 +301,7 @@ class TaskManager:
             retention_ttl=retention_ttl,
             owner_id=owner_id,
             filename=filename,
+            sink_object_key=sink_object_key,
         )
         task._user = user  # transient, not serialized
         await self._save(task)
@@ -309,6 +312,41 @@ class TaskManager:
 
     async def get_task(self, task_id: str) -> Optional[TransferTask]:
         return await self._load(task_id)
+
+    async def sink_object_exists(
+        self,
+        sink_plugin: str,
+        sink_config: Optional[dict] = None,
+        object_key: str = "",
+        sink_preset: str = "",
+    ) -> bool:
+        """Return True only when the sink *confirms* the object is present.
+
+        Credentials normally live in a server-side preset, never in the
+        client body, so the config is resolved exactly the way ``create_task``
+        resolves it — using the raw body config here would silently query an
+        unauthenticated sink and always report "absent".
+
+        Sinks without introspection return ``None`` from ``object_exists``;
+        that is treated as "absent" here so a missing capability never blocks
+        a download. Errors during the HEAD are also treated as absent — the
+        worst case is a redundant (idempotent, same-key) re-upload.
+        """
+        if not sink_plugin or not object_key:
+            return False
+        try:
+            cm: dict = {}
+            if sink_config:
+                cm["sink_config"] = sink_config
+            if sink_preset:
+                cm["sink_preset"] = sink_preset
+            ctx = SinkContext(client_metadata=cm)
+            resolved = self._registry.resolve_sink_config(sink_plugin, ctx, self._sink_presets.get(sink_plugin, {}))
+            sink = self._registry.create_sink(sink_plugin, config=resolved)  # type: ignore[arg-type]
+            return await sink.object_exists(object_key) is True
+        except Exception:
+            logger.debug("sink_object_exists failed for %s/%s", sink_plugin, object_key, exc_info=True)
+            return False
 
     async def delete_task_state(self, task_id: str) -> bool:
         """Delete persisted state for a terminal task.
@@ -621,7 +659,9 @@ class TaskManager:
             await self._save(task)
 
             _user = getattr(task, "_user", None)
-            sink_key = derive_sink_object_key(task.filename or file_path.name, _user)
+            # A pre-computed key (repo downloads) is deterministic and shared
+            # across users so a re-run overwrites instead of duplicating.
+            sink_key = task.sink_object_key or derive_sink_object_key(task.filename or file_path.name, _user)
             session_id = await sink.initialize_upload(sink_key, {"task_id": task.task_id})
             task.sink_session_id = session_id
             await self._save(task)
@@ -795,7 +835,7 @@ class TaskManager:
 
         if not resume_possible:
             _user = getattr(task, "_user", None)
-            sink_key = derive_sink_object_key(task.filename or task.task_id, _user)
+            sink_key = task.sink_object_key or derive_sink_object_key(task.filename or task.task_id, _user)
             session_id = await sink.initialize_upload(sink_key, {"task_id": task.task_id})
             task.sink_session_id = session_id
             task.uploaded_parts = []
