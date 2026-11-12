@@ -61,6 +61,13 @@ class TransferTask(BaseModel):
 
     sink_session_id: str = Field("", description="Sink multipart session ID")
     sink_result_url: str = Field("", description="Final URL after sink push")
+    sink_object_key: str = Field(
+        "",
+        description=(
+            "Deterministic object key, e.g. modelscope/models/{owner}/{name}/{rev}/{path}. "
+            "Empty = fall back to derive_sink_object_key() (timestamp/user prefix)."
+        ),
+    )
     superseded_by: str = Field("", description="Task ID that replaced this one via retry")
     # Parts already uploaded to the sink (persisted so we can resume across restart).
     # Each item is {"part_number": int, "etag": str, "extra": dict}.
@@ -84,6 +91,13 @@ class CreateTaskRequest(BaseModel):
     )
     retention: str = Field("download_once", description="download_once / permanent / ttl")
     retention_ttl: int = Field(0, description="TTL in seconds (0 = not applicable)")
+    skip_existing: bool = Field(
+        False,
+        description=(
+            "When expanding a repo URL, skip files whose deterministic sink object key "
+            "already exists in the bucket. Requires a sink and a source that derives keys."
+        ),
+    )
 
 
 class TaskResponse(BaseModel):
@@ -109,6 +123,7 @@ class TaskResponse(BaseModel):
     download_progress: float
     push_progress: float
     sink_result_url: str
+    sink_object_key: str = ""
     superseded_by: str
     created_at: datetime
     updated_at: datetime

@@ -127,7 +127,14 @@ def create_tasks_router() -> APIRouter:
         if not files:
             raise HTTPException(400, "No files found in repository/folder")
 
+        # Sources that know how to derive a deterministic object key
+        # (ModelScope) get one per file, so re-running a download overwrites
+        # the same objects instead of creating timestamped duplicates.
+        derives_keys = hasattr(source, "derive_object_key")
+        sink_prefix = ""
+
         tasks: list[TaskResponse] = []
+        skipped: list[str] = []
         total_size = 0
         for f in files:
             file_url = source.build_file_url(
@@ -136,6 +143,21 @@ def create_tasks_router() -> APIRouter:
                 gdrive_id=f.get("gdrive_id", ""),
             )
             total_size += f.get("size", 0)
+
+            object_key = ""
+            if derives_keys and body.sink_plugin:
+                try:
+                    object_key = source.derive_object_key(meta, f["path"], sink_prefix)
+                except Exception:
+                    logger.debug("Could not derive object key for %s", f["path"], exc_info=True)
+
+            if body.skip_existing and object_key:
+                if await mgr.sink_object_exists(
+                    body.sink_plugin, body.sink_config, object_key, sink_preset=body.sink_preset
+                ):
+                    skipped.append(f["path"])
+                    continue
+
             try:
                 task = await mgr.create_task(
                     source_url=file_url,
@@ -148,6 +170,7 @@ def create_tasks_router() -> APIRouter:
                     owner_id=owner_id,
                     user=user,
                     filename=f["path"],
+                    sink_object_key=object_key,
                 )
                 tasks.append(TaskResponse(**task.model_dump()))
             except Exception as e:
@@ -159,6 +182,8 @@ def create_tasks_router() -> APIRouter:
             "repo": meta.get("repo", meta.get("folder_id", "")),
             "total_files": len(files),
             "created_tasks": len(tasks),
+            "skipped_files": len(skipped),
+            "skipped": skipped[:50],
             "total_size": total_size,
             "tasks": [t.model_dump() for t in tasks],
         }
