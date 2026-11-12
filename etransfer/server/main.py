@@ -20,6 +20,7 @@ from etransfer.server.routes.files import create_files_router
 from etransfer.server.routes.folders import create_folders_router
 from etransfer.server.routes.info import create_info_router
 from etransfer.server.routes.migrations import create_migrations_router
+from etransfer.server.routes.modelscope import create_modelscope_router
 from etransfer.server.routes.plugins import create_plugins_router
 from etransfer.server.routes.tasks import create_tasks_router
 from etransfer.server.services.instance_traffic import InstanceTrafficTracker
@@ -490,6 +491,7 @@ def create_app(settings: Optional[ServerSettings] = None) -> FastAPI:
     app.include_router(create_tasks_router())
     app.include_router(create_migrations_router())
     app.include_router(create_plugins_router())
+    app.include_router(create_modelscope_router())
     app.include_router(create_folders_router(storage_proxy))  # type: ignore[arg-type]
 
     # ── Always parse role quotas (speed limits apply even without user system) ──
